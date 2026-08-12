@@ -1,5 +1,9 @@
 use std::path::Path;
 
+mod session;
+
+pub use session::{CharStatus, Session, TypeResult};
+
 /// 赛文：练习/比赛用的文字内容，来自本地文件或 52dazi.cn。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Text {
@@ -59,7 +63,11 @@ mod tests {
         fs::write(&path, "你好，世界。\n这是第二行。").unwrap();
 
         let text = load_text_from_file(&path).expect("载入应成功");
-        assert!(text.title.ends_with("exists.txt"), "title 应为文件名，得到: {}", text.title);
+        assert!(
+            text.title.ends_with("exists.txt"),
+            "title 应为文件名，得到: {}",
+            text.title
+        );
         assert_eq!(text.content, "你好，世界。\n这是第二行。");
 
         let _ = fs::remove_file(&path);
