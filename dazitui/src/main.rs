@@ -295,9 +295,9 @@ fn ui(frame: &mut Frame, app: &App) {
         let [ref_area, type_area] =
             Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
                 .areas(content);
-        // 上：对照原文区
+        // 上：对照原文区（已跟打部分绿/红着色）
         frame.render_widget(
-            Paragraph::new(app.text.content.as_str())
+            Paragraph::new(original_line(&app.session))
                 .block(Block::bordered().title(format!(" 对照区 — {} ", app.text.title)))
                 .wrap(Wrap { trim: false }),
             ref_area,
@@ -459,6 +459,23 @@ fn render_result_view(frame: &mut Frame, app: &App, stats: &Stats) {
             .wrap(Wrap { trim: false }),
         frame.area(),
     );
+}
+
+/// 将对照区的字符按跟打状态着色：已打对=绿、已打错=红、未打到=默认。
+fn original_line(session: &Session) -> Line<'static> {
+    let spans: Vec<Span<'static>> = session
+        .original_status()
+        .into_iter()
+        .map(|(c, status)| {
+            let style = match status {
+                Some(CharStatus::Correct) => Style::default().fg(Color::Green),
+                Some(CharStatus::Wrong) => Style::default().fg(Color::Red),
+                None => Style::default(),
+            };
+            Span::styled(c.to_string(), style)
+        })
+        .collect();
+    Line::from(spans)
 }
 
 /// 将跟打区的字符按对/错渲染为绿/红一行。
@@ -637,6 +654,17 @@ mod tests {
         assert_eq!(line.spans.len(), 4);
         assert_eq!(line.spans[0].style.fg, Some(Color::Green));
         assert_eq!(line.spans[2].style.fg, Some(Color::Red));
+    }
+
+    #[test]
+    fn original_line_colors_green_red_default() {
+        let mut session = Session::new("你好世界");
+        session.type_text("你好四");
+        let line = original_line(&session);
+        assert_eq!(line.spans.len(), 4);
+        assert_eq!(line.spans[0].style.fg, Some(Color::Green)); // 你 ✓
+        assert_eq!(line.spans[2].style.fg, Some(Color::Red)); // 世 ✗（打成四）
+        assert_eq!(line.spans[3].style.fg, None); // 界：未打到，默认色
     }
 
     #[test]

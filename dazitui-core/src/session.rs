@@ -136,6 +136,27 @@ impl Session {
             .collect()
     }
 
+    /// 原文侧每个字符的跟打状态（TUI 对照区着色用）。
+    ///
+    /// 逐位比较：input 的第 k 个字符对应 original 的第 k 个位置；
+    /// 相同 → `Some(Correct)`，不同 → `Some(Wrong)`，未被 input 覆盖 → `None`。
+    pub fn original_status(&self) -> Vec<(char, Option<CharStatus>)> {
+        self.original
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| {
+                let status = self.input.get(i).map(|&ic| {
+                    if ic == c {
+                        CharStatus::Correct
+                    } else {
+                        CharStatus::Wrong
+                    }
+                });
+                (c, status)
+            })
+            .collect()
+    }
+
     /// 已上屏的字符数。
     pub fn len(&self) -> usize {
         self.input.len()
@@ -317,6 +338,59 @@ mod tests {
         session.type_text("你好");
         let stats = session.finish(Duration::ZERO);
         assert_eq!(stats.wpm, 0.0);
+    }
+
+    #[test]
+    fn original_status_none_when_nothing_typed() {
+        let session = Session::new("你好世界");
+        let statuses = session.original_status();
+        assert_eq!(statuses.len(), 4);
+        assert!(statuses.iter().all(|(_, s)| s.is_none()));
+    }
+
+    #[test]
+    fn original_status_correct_for_matching_prefix() {
+        let mut session = Session::new("你好世界");
+        session.type_text("你好");
+        let statuses = session.original_status();
+        assert_eq!(statuses[0], ('你', Some(CharStatus::Correct)));
+        assert_eq!(statuses[1], ('好', Some(CharStatus::Correct)));
+        assert_eq!(statuses[2], ('世', None));
+        assert_eq!(statuses[3], ('界', None));
+    }
+
+    #[test]
+    fn original_status_wrong_at_mismatched_position() {
+        let mut session = Session::new("你好世界");
+        session.type_text("你好四");
+        let statuses = session.original_status();
+        assert_eq!(statuses[0], ('你', Some(CharStatus::Correct)));
+        assert_eq!(statuses[1], ('好', Some(CharStatus::Correct)));
+        assert_eq!(statuses[2], ('世', Some(CharStatus::Wrong)));
+        assert_eq!(statuses[3], ('界', None));
+    }
+
+    #[test]
+    fn original_status_ignores_extra_input_chars() {
+        let mut session = Session::new("你好世界");
+        session.type_text("你好世界四"); // 多打一个
+        let statuses = session.original_status();
+        assert!(
+            statuses
+                .iter()
+                .all(|(_, s)| *s == Some(CharStatus::Correct))
+        );
+        assert_eq!(statuses.len(), 4);
+    }
+
+    #[test]
+    fn original_status_after_backspace_reverts() {
+        let mut session = Session::new("你好世界");
+        session.type_text("你好四");
+        session.backspace();
+        let statuses = session.original_status();
+        assert_eq!(statuses[2], ('世', None)); // 回改后该位置回到未打到
+        assert_eq!(statuses[0], ('你', Some(CharStatus::Correct)));
     }
 
     #[test]
