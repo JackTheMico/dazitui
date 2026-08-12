@@ -24,8 +24,25 @@ pub enum LoadError {
     ReadFailed,
 }
 
-/// 从本地文件载入赛文。
+/// 载文选项。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LoadOptions {
+    /// 去除所有空白字符（空格/换行/制表符）。
+    pub strip_whitespace: bool,
+    /// 去除中英文标点符号。
+    pub strip_punctuation: bool,
+}
+
+/// 从本地文件载入赛文（默认选项：保留原文）。
 pub fn load_text_from_file(path: &Path) -> Result<Text, LoadError> {
+    load_text_from_file_with_options(path, &LoadOptions::default())
+}
+
+/// 从本地文件载入赛文，按选项处理内容。
+pub fn load_text_from_file_with_options(
+    path: &Path,
+    options: &LoadOptions,
+) -> Result<Text, LoadError> {
     let content = std::fs::read_to_string(path).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             LoadError::NotFound
@@ -33,19 +50,67 @@ pub fn load_text_from_file(path: &Path) -> Result<Text, LoadError> {
             LoadError::ReadFailed
         }
     })?;
-    if content.is_empty() {
+    let content = process_content(content, options)?;
+    let title = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    Ok(Text { title, content })
+}
+
+/// 按选项处理原文：去空格、去标点、去首尾空白；处理为空则报 Empty。
+fn process_content(raw: String, options: &LoadOptions) -> Result<String, LoadError> {
+    if raw.is_empty() {
         return Err(LoadError::Empty);
+    }
+    let mut content = raw;
+    if options.strip_whitespace {
+        content = content.chars().filter(|c| !c.is_whitespace()).collect();
+    }
+    if options.strip_punctuation {
+        content = content.chars().filter(|c| !is_punctuation(*c)).collect();
     }
     // 去掉首尾空白（尤其文件末尾换行）：跟打时用户不会打换行，否则永远无法「完成」
     let content = content.trim().to_string();
     if content.is_empty() {
         return Err(LoadError::Empty);
     }
-    let title = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    Ok(Text { title, content })
+    Ok(content)
+}
+
+/// 判断字符是否为标点：ASCII 标点 + 常见中英文标点。
+fn is_punctuation(c: char) -> bool {
+    c.is_ascii_punctuation()
+        || matches!(
+            c,
+            '，' | '。'
+                | '！'
+                | '？'
+                | '；'
+                | '：'
+                | '、'
+                | '“'
+                | '”'
+                | '‘'
+                | '’'
+                | '（'
+                | '）'
+                | '《'
+                | '》'
+                | '〈'
+                | '〉'
+                | '「'
+                | '」'
+                | '『'
+                | '』'
+                | '—'
+                | '…'
+                | '·'
+                | '～'
+                | '￥'
+                | '×'
+                | '÷'
+        )
 }
 
 #[cfg(test)]
@@ -117,6 +182,72 @@ mod tests {
         let err = load_text_from_file(&path).expect_err("空文件应报错");
         assert_eq!(err, LoadError::Empty);
 
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_options_default_preserves_content() {
+        let opts = LoadOptions::default();
+        assert!(!opts.strip_whitespace);
+        assert!(!opts.strip_punctuation);
+
+        let path = temp_path("default.txt");
+        fs::write(&path, "你好， 世界。\n第二行").unwrap();
+        let text = load_text_from_file_with_options(&path, &opts).unwrap();
+        assert_eq!(text.content, "你好， 世界。\n第二行");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn strip_whitespace_removes_all_whitespace() {
+        let opts = LoadOptions {
+            strip_whitespace: true,
+            ..LoadOptions::default()
+        };
+        let path = temp_path("ws.txt");
+        fs::write(&path, "你好 世界\n第二 行").unwrap();
+        let text = load_text_from_file_with_options(&path, &opts).unwrap();
+        assert_eq!(text.content, "你好世界第二行");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn strip_punctuation_removes_cn_and_ascii_punct() {
+        let opts = LoadOptions {
+            strip_punctuation: true,
+            ..LoadOptions::default()
+        };
+        let path = temp_path("punct.txt");
+        fs::write(&path, "你好，世界！Hello, world! \"ok\"（好）").unwrap();
+        let text = load_text_from_file_with_options(&path, &opts).unwrap();
+        assert_eq!(text.content, "你好世界Hello world ok好");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn strip_both_combines() {
+        let opts = LoadOptions {
+            strip_whitespace: true,
+            strip_punctuation: true,
+        };
+        let path = temp_path("both.txt");
+        fs::write(&path, "你好， 世界！\n第二行。").unwrap();
+        let text = load_text_from_file_with_options(&path, &opts).unwrap();
+        assert_eq!(text.content, "你好世界第二行");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn strip_to_empty_is_empty_error() {
+        let opts = LoadOptions {
+            strip_punctuation: true,
+            ..LoadOptions::default()
+        };
+        let path = temp_path("punctonly.txt");
+        fs::write(&path, "，。！？；：、").unwrap();
+        let err =
+            load_text_from_file_with_options(&path, &opts).expect_err("全符号文件去符号后应报空");
+        assert_eq!(err, LoadError::Empty);
         let _ = fs::remove_file(&path);
     }
 }
