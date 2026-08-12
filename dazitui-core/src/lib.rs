@@ -2,7 +2,7 @@ use std::path::Path;
 
 mod session;
 
-pub use session::{CharStatus, Session, TypeResult};
+pub use session::{CharStatus, Session, Stats, TypeResult};
 
 /// 赛文：练习/比赛用的文字内容，来自本地文件或 52dazi.cn。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +33,11 @@ pub fn load_text_from_file(path: &Path) -> Result<Text, LoadError> {
             LoadError::ReadFailed
         }
     })?;
+    if content.is_empty() {
+        return Err(LoadError::Empty);
+    }
+    // 去掉首尾空白（尤其文件末尾换行）：跟打时用户不会打换行，否则永远无法「完成」
+    let content = content.trim().to_string();
     if content.is_empty() {
         return Err(LoadError::Empty);
     }
@@ -69,6 +74,28 @@ mod tests {
             text.title
         );
         assert_eq!(text.content, "你好，世界。\n这是第二行。");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn trailing_newline_is_trimmed() {
+        let path = temp_path("trailing.txt");
+        fs::write(&path, "你好世界。\n").unwrap();
+
+        let text = load_text_from_file(&path).expect("载入应成功");
+        assert_eq!(text.content, "你好世界。");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn whitespace_only_file_is_empty_error() {
+        let path = temp_path("blank.txt");
+        fs::write(&path, "  \n\t\n").unwrap();
+
+        let err = load_text_from_file(&path).expect_err("纯空白文件应报错");
+        assert_eq!(err, LoadError::Empty);
 
         let _ = fs::remove_file(&path);
     }

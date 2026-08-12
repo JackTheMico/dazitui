@@ -1,5 +1,8 @@
 //! 跟打会话：接收上屏文本，与原文逐字比对并维护回改记录。
 
+use std::collections::HashMap;
+use std::time::Duration;
+
 /// 单个字符的比对状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CharStatus {
@@ -18,6 +21,27 @@ pub struct TypeResult {
     pub edit_count: u32,
 }
 
+/// 跟打统计结果（完成或提前结束时计算）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Stats {
+    /// WPM：每分钟正确字数（正确字数 / 用时分钟）。
+    pub wpm: f64,
+    /// 最终比对一致的字符数（正确字数）。
+    pub correct_chars: usize,
+    /// 最终比对不一致的字符数（不含回改）。
+    pub wrong_chars: usize,
+    /// 回改次数。
+    pub edits: u32,
+    /// 错字 = 最终不一致字符数 + 回改次数。
+    pub wrong_total: u32,
+    /// 已上屏字符数。
+    pub typed_chars: usize,
+    /// 按键频率（按键 → 次数，按次数降序）。
+    pub key_frequency: Vec<(String, u32)>,
+    /// 回改明细：被删除的字符（按删除顺序）。
+    pub edit_details: Vec<char>,
+}
+
 /// 跟打会话状态机。
 ///
 /// 持有原文与当前已上屏的输入，通过 LCS 对齐逐字比对。
@@ -25,6 +49,8 @@ pub struct Session {
     original: Vec<char>,
     input: Vec<char>,
     edits: u32,
+    key_counts: HashMap<String, u32>,
+    edit_details: Vec<char>,
 }
 
 impl Session {
@@ -34,6 +60,8 @@ impl Session {
             original: original.chars().collect(),
             input: Vec::new(),
             edits: 0,
+            key_counts: HashMap::new(),
+            edit_details: Vec::new(),
         }
     }
 
@@ -52,11 +80,50 @@ impl Session {
 
     /// 回改一次：删除最后一个已上屏字符，返回是否成功（输入非空才有效）。
     pub fn backspace(&mut self) -> bool {
-        if self.input.pop().is_some() {
+        if let Some(c) = self.input.pop() {
             self.edits += 1;
+            self.edit_details.push(c);
             true
         } else {
             false
+        }
+    }
+
+    /// 记录一次按键（用于按键频率统计）。
+    ///
+    /// `key` 为按键的字符串表示，如 "a"、"Backspace"、"Enter"。
+    pub fn record_key(&mut self, key: &str) {
+        *self.key_counts.entry(key.to_string()).or_insert(0) += 1;
+    }
+
+    /// 计算跟打统计（完成或提前结束时调用，不消耗会话）。
+    pub fn finish(&self, elapsed: Duration) -> Stats {
+        let statuses = self.align();
+        let correct = statuses
+            .iter()
+            .filter(|s| **s == CharStatus::Correct)
+            .count();
+        let wrong = statuses.len() - correct;
+        let wpm = if elapsed.is_zero() {
+            0.0
+        } else {
+            correct as f64 / elapsed.as_secs_f64() * 60.0
+        };
+        let mut key_frequency: Vec<(String, u32)> = self
+            .key_counts
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        key_frequency.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        Stats {
+            wpm,
+            correct_chars: correct,
+            wrong_chars: wrong,
+            edits: self.edits,
+            wrong_total: (wrong as u32) + self.edits,
+            typed_chars: self.input.len(),
+            key_frequency,
+            edit_details: self.edit_details.clone(),
         }
     }
 
@@ -210,5 +277,62 @@ mod tests {
         assert_eq!(display.len(), 3);
         assert_eq!(display[0], ('你', CharStatus::Correct));
         assert_eq!(display[2], ('四', CharStatus::Wrong));
+    }
+
+    #[test]
+    fn finish_all_correct_gives_correct_wpm() {
+        let mut session = Session::new("你好世界");
+        session.type_text("你好世界");
+        // 10 个正确字 / 60 秒 = 10 WPM
+        let stats = session.finish(Duration::from_secs(60));
+        assert_eq!(stats.correct_chars, 4);
+        assert_eq!(stats.wrong_chars, 0);
+        assert_eq!(stats.wrong_total, 0);
+        assert_eq!(stats.typed_chars, 4);
+        assert!(
+            (stats.wpm - 4.0).abs() < 1e-9,
+            "wpm 应为 4.0，得到 {}",
+            stats.wpm
+        );
+    }
+
+    #[test]
+    fn finish_wrong_plus_edits_is_wrong_total() {
+        let mut session = Session::new("你好世界");
+        session.type_text("你好四"); // 「四」错
+        session.backspace(); // 回改一次
+        session.type_text("世");
+        session.type_text("界");
+        let stats = session.finish(Duration::from_secs(60));
+        // 最终不一致 0（都改对了），回改 1 → 错字 1
+        assert_eq!(stats.wrong_chars, 0);
+        assert_eq!(stats.edits, 1);
+        assert_eq!(stats.wrong_total, 1);
+        assert_eq!(stats.edit_details, vec!['四']);
+    }
+
+    #[test]
+    fn finish_wpm_zero_when_no_elapsed_time() {
+        let mut session = Session::new("你好世界");
+        session.type_text("你好");
+        let stats = session.finish(Duration::ZERO);
+        assert_eq!(stats.wpm, 0.0);
+    }
+
+    #[test]
+    fn key_frequency_reconstructed_sorted() {
+        let mut session = Session::new("你好世界");
+        session.record_key("n");
+        session.record_key("i");
+        session.record_key("n");
+        session.record_key("Backspace");
+        session.record_key("n");
+        let stats = session.finish(Duration::from_secs(60));
+        let freq: Vec<(String, u32)> = stats.key_frequency;
+        assert_eq!(freq[0], ("n".to_string(), 3));
+        assert_eq!(freq[1], ("Backspace".to_string(), 1));
+        assert_eq!(freq[2], ("i".to_string(), 1));
+        // 按次数降序：n(3) > Backspace(1) = i(1)，同次数按键名升序
+        assert_eq!(freq.len(), 3);
     }
 }

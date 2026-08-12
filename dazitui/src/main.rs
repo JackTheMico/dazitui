@@ -1,15 +1,21 @@
 use std::io;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
-use dazitui_core::{CharStatus, LoadError, Session, Text, load_text_from_file};
+use dazitui_core::{CharStatus, LoadError, Session, Stats, Text, load_text_from_file};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::prelude::Stylize;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Wrap};
+
+/// 跟打应用状态：跟打中 / 已出成绩（成绩视图）。
+enum AppState {
+    Typing,
+    Finished(Stats),
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -49,8 +55,10 @@ fn run_tui(text: &Text) -> io::Result<()> {
 
 fn event_loop(terminal: &mut ratatui::DefaultTerminal, text: &Text) -> io::Result<()> {
     let mut session = Session::new(&text.content);
+    let mut start = Instant::now();
+    let mut state = AppState::Typing;
     loop {
-        terminal.draw(|frame| ui(frame, text, &session))?;
+        terminal.draw(|frame| ui(frame, text, &session, &state))?;
         if !event::poll(Duration::from_millis(100))? {
             continue;
         }
@@ -59,23 +67,51 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, text: &Text) -> io::Resul
                 if is_quit(key) {
                     return Ok(());
                 }
-                handle_key(&mut session, key);
+                match &state {
+                    AppState::Typing => {
+                        if is_early_finish(key) {
+                            state = AppState::Finished(session.finish(start.elapsed()));
+                            continue;
+                        }
+                        handle_key(&mut session, key);
+                        // 打到原文末尾自动完成
+                        if session.is_complete() {
+                            state = AppState::Finished(session.finish(start.elapsed()));
+                        }
+                    }
+                    AppState::Finished(_) => {
+                        // 任意键重打同一篇赛文
+                        session = Session::new(&text.content);
+                        start = Instant::now();
+                        state = AppState::Typing;
+                    }
+                }
             }
             Event::Paste(committed) => {
                 session.type_text(&committed);
+                if session.is_complete() {
+                    state = AppState::Finished(session.finish(start.elapsed()));
+                }
             }
             _ => {}
         }
     }
 }
 
-/// 处理跟打键：退格回改，可打印字符上屏。
+/// 提前结束快捷键：Ctrl-S（Stop）。
+fn is_early_finish(key: KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s')
+}
+
+/// 处理跟打键：退格回改，可打印字符上屏；同时记录按键频率。
 fn handle_key(session: &mut Session, key: KeyEvent) {
     match key.code {
         KeyCode::Backspace => {
+            session.record_key("Backspace");
             session.backspace();
         }
         KeyCode::Char(c) => {
+            session.record_key(&c.to_string());
             session.type_text(&c.to_string());
         }
         _ => {}
@@ -88,7 +124,11 @@ fn is_quit(key: KeyEvent) -> bool {
     key.code == KeyCode::Char('q') || key.code == KeyCode::Char('Q') || is_ctrl_c
 }
 
-fn ui(frame: &mut Frame, text: &Text, session: &Session) {
+fn ui(frame: &mut Frame, text: &Text, session: &Session, state: &AppState) {
+    if let AppState::Finished(stats) = state {
+        render_result_view(frame, text, stats);
+        return;
+    }
     // 整体：主区 + 底部快捷键 bar
     let [main, help_bar] =
         Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(frame.area());
@@ -129,9 +169,55 @@ fn ui(frame: &mut Frame, text: &Text, session: &Session) {
     // 底部快捷键提示 bar
     frame.render_widget(
         Paragraph::new(Line::from(
-            " q 退出   |   重打（待实现）   |   载文（待实现）   |   功能栏（待实现）",
+            " q 退出   |   Ctrl-S 提前结束   |   重打（待实现）   |   载文（待实现）",
         )),
         help_bar,
+    );
+}
+
+/// 全屏成绩视图：WPM/错字/回改/按键频率。
+fn render_result_view(frame: &mut Frame, text: &Text, stats: &Stats) {
+    let lines = vec![
+        Line::from(format!(" 成绩 — {} ", text.title)).bold(),
+        Line::from(""),
+        Line::from(format!(" WPM:        {:.1}", stats.wpm)),
+        Line::from(format!(
+            " 正确字数:   {} / {}",
+            stats.correct_chars,
+            text.content.chars().count()
+        )),
+        Line::from(format!(
+            " 错字:       {}（不一致 {} + 回改 {}）",
+            stats.wrong_total, stats.wrong_chars, stats.edits
+        )),
+        Line::from(format!(
+            " 回改明细:   {}",
+            if stats.edit_details.is_empty() {
+                "无".to_string()
+            } else {
+                stats.edit_details.iter().collect::<String>()
+            }
+        )),
+        Line::from(""),
+        Line::from(" 按键频率:").bold(),
+    ];
+    let mut freq_lines = stats
+        .key_frequency
+        .iter()
+        .map(|(k, n)| Line::from(format!("   {k:<12} {n}")))
+        .collect::<Vec<_>>();
+    if freq_lines.is_empty() {
+        freq_lines.push(Line::from("   （无按键记录）"));
+    }
+    let mut all = lines;
+    all.extend(freq_lines);
+    all.push(Line::from(""));
+    all.push(Line::from(" 按任意键重打 | q 退出").gray());
+    frame.render_widget(
+        Paragraph::new(all)
+            .block(Block::bordered().title(" 成绩 "))
+            .wrap(Wrap { trim: false }),
+        frame.area(),
     );
 }
 
@@ -186,6 +272,42 @@ mod tests {
             KeyModifiers::NONE
         )));
         assert!(!is_quit(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+    }
+
+    #[test]
+    fn ctrl_s_early_finishes() {
+        assert!(is_early_finish(KeyEvent::new(
+            KeyCode::Char('s'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(!is_early_finish(KeyEvent::new(
+            KeyCode::Char('s'),
+            KeyModifiers::NONE
+        )));
+        assert!(!is_early_finish(KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::NONE
+        )));
+    }
+
+    #[test]
+    fn handle_key_records_key_frequency() {
+        let mut session = Session::new("你好世界");
+        handle_key(
+            &mut session,
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+        );
+        handle_key(
+            &mut session,
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+        );
+        handle_key(
+            &mut session,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        );
+        let stats = session.finish(Duration::from_secs(60));
+        assert_eq!(stats.key_frequency[0], ("n".to_string(), 2));
+        assert_eq!(stats.key_frequency[1], ("Backspace".to_string(), 1));
     }
 
     #[test]
