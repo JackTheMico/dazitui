@@ -14,7 +14,10 @@ pub use online::client::{ApiClient, ApiError, CompetitionText, LoginResult, Rank
 #[cfg(feature = "online")]
 pub use online::protocol::{ProtocolError, build_request, decrypt, encrypt, parse_json};
 #[cfg(feature = "online")]
-pub use online::share::{UploadStats, format_share_text, to_upload_stats};
+pub use online::share::{
+    UploadStats, build_upload_payload, format_share_text, format_time, osc52_clipboard,
+    to_upload_stats,
+};
 #[cfg(feature = "online")]
 pub use online::token::TokenStore;
 

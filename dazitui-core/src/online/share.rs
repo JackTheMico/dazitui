@@ -2,7 +2,10 @@
 
 use std::time::Duration;
 
-use crate::{Stats, TextSource};
+use base64::Engine;
+use serde_json::Value;
+
+use crate::{Stats, Text, TextSource};
 
 /// 52dazi.cn 上传字段。
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -48,6 +51,55 @@ pub fn format_share_text(source: &TextSource, rank: Option<u32>, stats: &UploadS
         "{name}{rank_part} · WPM {:.1} · 击键 {:.1} · 码长 {:.1}",
         stats.speed, stats.keystrokes, stats.key_length
     )
+}
+
+/// 用时格式化为 `MM:SS.sss`（与前端 `formatTime` 一致，秒保留 3 位小数）。
+pub fn format_time(elapsed: Duration) -> String {
+    let secs = elapsed.as_secs_f64();
+    let minutes = (secs / 60.0).floor() as u64;
+    let seconds = secs - (minutes as f64) * 60.0;
+    format!("{minutes:02}:{seconds:06.3}")
+}
+
+/// 构造 52dazi.cn 上传请求体（业务字段，公共字段由 `client.upload_result` 自动合并）。
+///
+/// 字段名与前端 `resultPostData` 一致；dazitui 无法采集的字段用 0 / 空串兜底。
+pub fn build_upload_payload(
+    text: &Text,
+    stats: &Stats,
+    upload: &UploadStats,
+    elapsed: Duration,
+) -> Value {
+    let total_keys: u32 = stats.key_frequency.iter().map(|(_, n)| n).sum();
+    let backspace: u32 = stats
+        .key_frequency
+        .iter()
+        .find(|(k, _)| k == "Backspace")
+        .map(|(_, n)| *n)
+        .unwrap_or(0);
+    serde_json::json!({
+        "textTitle": text.title,
+        "speed": upload.speed,
+        "keystrokes": upload.keystrokes,
+        "maChang": upload.key_length,
+        "wordNum": text.content.chars().count(),
+        "typingTime": format_time(elapsed),
+        "huiGai": stats.edits,
+        "huiChe": 0,
+        "jianShu": total_keys,
+        "backspace": backspace,
+        "wrongNum": stats.wrong_total,
+        "inputMethod": "",
+        "challengeFlag": 0,
+        "isFirstSubmit": 0,
+        "isGroupText": 0,
+    })
+}
+
+/// 生成 OSC 52 剪贴板写入序列（终端收到后把 `text` 写入系统剪贴板）。
+pub fn osc52_clipboard(text: &str) -> String {
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    format!("\x1b]52;c;{encoded}\x07")
 }
 
 #[cfg(test)]
@@ -125,5 +177,69 @@ mod tests {
         assert_eq!(CompetitionType::Jisu.name(), "极速杯");
         assert_eq!(CompetitionType::Jinbiao.name(), "锦标赛");
         assert_eq!(CompetitionType::Jianshen.name(), "键神杯");
+    }
+
+    #[test]
+    fn format_time_minutes_seconds_millis() {
+        assert_eq!(format_time(Duration::from_secs_f64(85.23)), "01:25.230");
+        assert_eq!(format_time(Duration::from_secs(5)), "00:05.000");
+        assert_eq!(format_time(Duration::ZERO), "00:00.000");
+    }
+
+    #[test]
+    fn build_upload_payload_maps_fields() {
+        let stats = sample_stats();
+        let up = UploadStats {
+            speed: 85.2,
+            keystrokes: 3.5,
+            key_length: 2.8,
+        };
+        let text = Text {
+            title: "锦标赛第3279期".into(),
+            content: "你好世界".into(),
+            source: TextSource::Online {
+                competition_type: CompetitionType::Jinbiao,
+            },
+        };
+        let v = build_upload_payload(&text, &stats, &up, Duration::from_secs_f64(85.23));
+        assert_eq!(v["textTitle"], "锦标赛第3279期");
+        assert_eq!(v["speed"], 85.2);
+        assert_eq!(v["keystrokes"], 3.5);
+        assert_eq!(v["maChang"], 2.8);
+        assert_eq!(v["wordNum"], 4);
+        assert_eq!(v["typingTime"], "01:25.230");
+        assert_eq!(v["huiGai"], 1); // sample_stats edits=1
+        assert_eq!(v["jianShu"], 140); // 100 + 40
+        assert_eq!(v["wrongNum"], 3); // sample_stats wrong_total=3
+        assert_eq!(v["challengeFlag"], 0);
+        assert_eq!(v["isFirstSubmit"], 0);
+    }
+
+    #[test]
+    fn build_upload_payload_backspace_from_key_frequency() {
+        let mut stats = sample_stats();
+        stats.key_frequency.push(("Backspace".to_string(), 7));
+        let up = UploadStats {
+            speed: 1.0,
+            keystrokes: 1.0,
+            key_length: 1.0,
+        };
+        let text = Text {
+            title: "t".into(),
+            content: "c".into(),
+            source: TextSource::File,
+        };
+        let v = build_upload_payload(&text, &stats, &up, Duration::from_secs(1));
+        assert_eq!(v["backspace"], 7);
+        assert_eq!(v["jianShu"], 147); // 140 + 7
+    }
+
+    #[test]
+    fn osc52_clipboard_wraps_base64() {
+        let seq = osc52_clipboard("你好");
+        // base64("你好") = 5L2g5aW9
+        assert_eq!(seq, "\x1b]52;c;5L2g5aW9\x07");
+        // 空文本也是合法序列
+        assert_eq!(osc52_clipboard(""), "\x1b]52;c;\x07");
     }
 }

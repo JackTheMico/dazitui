@@ -6,7 +6,9 @@ use std::time::{Duration, Instant};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use dazitui_core::{
     ApiClient, ApiError, CharStatus, CompetitionType, LoadError, LoadOptions, Session, Stats, Text,
-    TextSource, TokenStore, env_credentials, load_text_from_file, load_text_from_file_with_options,
+    TextSource, TokenStore, build_upload_payload, env_credentials, format_share_text,
+    is_auth_failure, load_text_from_file, load_text_from_file_with_options, osc52_clipboard,
+    to_upload_stats,
 };
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -19,10 +21,26 @@ use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 enum AppState {
     /// 跟打中。
     Typing,
-    /// 已出成绩（成绩视图）。
-    Finished(Stats),
+    /// 已出成绩（成绩视图），携带成绩与上传状态。
+    Finished { stats: Stats, upload: UploadState },
     /// 载文浏览：功能栏显示文件列表，可预览与载入。
     Browsing,
+}
+
+/// 成绩视图里的成绩上传状态（在线赛文完成跟打后自动上传）。
+#[derive(Debug, Clone, PartialEq)]
+enum UploadState {
+    /// 离线赛文：无需上传。
+    NotApplicable,
+    /// 上传中（同步网络请求期间）。
+    Uploading,
+    /// 上传成功：结构化排名（`None` = 服务器未返回）+ 已复制的分享文本。
+    Success {
+        ranking: Option<String>,
+        share_text: String,
+    },
+    /// 上传失败：错误文案 + 是否需要重新登录。
+    Failed { message: String, need_relogin: bool },
 }
 
 /// 应用全部状态（TUI 层）。
@@ -164,6 +182,28 @@ impl App {
         self.browse_error = None;
     }
 
+    /// 完成跟打：计算成绩并进入成绩视图。
+    ///
+    /// 在线赛文置为「上传中」并返回 `Some((成绩, 用时))` 供调用方继续上传；
+    /// 离线赛文直接进入成绩视图，返回 `None`。
+    fn finish_typing(&mut self) -> Option<(Stats, Duration)> {
+        let elapsed = self.start.elapsed();
+        let stats = self.session.finish(elapsed);
+        if self.text.is_online() {
+            self.state = AppState::Finished {
+                stats: stats.clone(),
+                upload: UploadState::Uploading,
+            };
+            Some((stats, elapsed))
+        } else {
+            self.state = AppState::Finished {
+                stats,
+                upload: UploadState::NotApplicable,
+            };
+            None
+        }
+    }
+
     /// 进入载文浏览：扫描当前目录文本文件。
     fn open_browser(&mut self) {
         self.browse_files = list_text_files(&std::env::current_dir().unwrap_or_default());
@@ -218,6 +258,47 @@ impl App {
             Err(e) => {
                 self.online_loading = None;
                 self.online_error = Some(api_error_text(&e));
+            }
+        }
+    }
+
+    /// 上传成绩并更新成绩视图状态（在线赛文完成跟打后调用）。
+    fn do_upload(&mut self, stats: &Stats, elapsed: Duration) {
+        let upload = self.perform_upload(stats, elapsed);
+        self.state = AppState::Finished {
+            stats: stats.clone(),
+            upload,
+        };
+    }
+
+    /// 执行上传：构造 payload → 调网关 → 处理结果（成功则写剪贴板）。纯状态产出，不修改自身。
+    fn perform_upload(&self, stats: &Stats, elapsed: Duration) -> UploadState {
+        let Some(token) = self.token.clone() else {
+            return UploadState::Failed {
+                message: "未登录，无法上传成绩".to_string(),
+                need_relogin: true,
+            };
+        };
+        let upload = to_upload_stats(stats, elapsed);
+        let payload = build_upload_payload(&self.text, stats, &upload, elapsed);
+        match self.api.upload_result(&token, &payload) {
+            Ok(rank) => {
+                let ranking = rank.ranking.clone();
+                let rank_num = ranking.as_deref().and_then(|s| s.parse::<u32>().ok());
+                let share_text = format_share_text(&self.text.source, rank_num, &upload);
+                write_clipboard(&share_text);
+                UploadState::Success {
+                    ranking,
+                    share_text,
+                }
+            }
+            Err(e) => {
+                let need_relogin = is_auth_failure(&e);
+                let message = api_error_text(&e);
+                UploadState::Failed {
+                    message,
+                    need_relogin,
+                }
             }
         }
     }
@@ -292,7 +373,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                 match app.state {
                     AppState::Typing => {
                         if is_early_finish(key) {
-                            app.state = AppState::Finished(app.session.finish(app.start.elapsed()));
+                            finish_and_maybe_upload(&mut app, terminal)?;
                             continue;
                         }
                         if is_open_browser(key) {
@@ -319,10 +400,10 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                         }
                         handle_key(&mut app.session, key);
                         if app.session.is_complete() {
-                            app.state = AppState::Finished(app.session.finish(app.start.elapsed()));
+                            finish_and_maybe_upload(&mut app, terminal)?;
                         }
                     }
-                    AppState::Finished(_) => {
+                    AppState::Finished { .. } => {
                         // 离线赛文：任意键重打同一篇；在线赛文不支持重打。
                         if !app.text.is_online() {
                             app.restart();
@@ -354,13 +435,26 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                 if matches!(app.state, AppState::Typing) {
                     app.session.type_text(&committed);
                     if app.session.is_complete() {
-                        app.state = AppState::Finished(app.session.finish(app.start.elapsed()));
+                        finish_and_maybe_upload(&mut app, terminal)?;
                     }
                 }
             }
             _ => {}
         }
     }
+}
+
+/// 完成跟打：进入成绩视图；在线赛文先渲染「上传中」再同步上传成绩。
+fn finish_and_maybe_upload(
+    app: &mut App,
+    terminal: &mut ratatui::DefaultTerminal,
+) -> io::Result<()> {
+    if let Some((stats, elapsed)) = app.finish_typing() {
+        // 先渲染「上传中」，再同步上传（阻塞）。
+        terminal.draw(|frame| ui(frame, app))?;
+        app.do_upload(&stats, elapsed);
+    }
+    Ok(())
 }
 
 /// 提前结束快捷键：Ctrl-S（Stop）。
@@ -447,6 +541,13 @@ fn api_error_text(err: &ApiError) -> String {
     }
 }
 
+/// 通过 OSC 52 转义序列把文本写入系统剪贴板（终端转发，失败静默忽略）。
+fn write_clipboard(text: &str) {
+    use crossterm::style::Print;
+    let seq = osc52_clipboard(text);
+    let _ = crossterm::execute!(std::io::stdout(), Print(seq));
+}
+
 /// 处理登录模态框按键，返回动作。
 fn login_input(form: &mut LoginForm, key: KeyEvent) -> LoginAction {
     match key.code {
@@ -507,8 +608,8 @@ fn list_text_files(dir: &Path) -> Vec<PathBuf> {
 }
 
 fn ui(frame: &mut Frame, app: &App) {
-    if let AppState::Finished(stats) = &app.state {
-        render_result_view(frame, app, stats);
+    if let AppState::Finished { stats, upload } = &app.state {
+        render_result_view(frame, app, stats, upload);
         return;
     }
     let browsing = matches!(app.state, AppState::Browsing);
@@ -724,8 +825,8 @@ fn render_preview(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     );
 }
 
-/// 全屏成绩视图：WPM/错字/回改/按键频率。
-fn render_result_view(frame: &mut Frame, app: &App, stats: &Stats) {
+/// 全屏成绩视图：WPM/错字/回改/按键频率 + 上传状态（在线赛文）。
+fn render_result_view(frame: &mut Frame, app: &App, stats: &Stats, upload: &UploadState) {
     let lines = vec![
         Line::from(format!(" 成绩 — {} ", app.text.title)).bold(),
         Line::from(""),
@@ -760,6 +861,8 @@ fn render_result_view(frame: &mut Frame, app: &App, stats: &Stats) {
     }
     let mut all = lines;
     all.extend(freq_lines);
+    // 上传状态（在线赛文；离线赛文不显示）。
+    all.extend(upload_lines(upload));
     all.push(Line::from(""));
     if app.text.is_online() {
         // 在线赛文不支持重打，只能退出或载入其他赛文。
@@ -773,6 +876,42 @@ fn render_result_view(frame: &mut Frame, app: &App, stats: &Stats) {
             .wrap(Wrap { trim: false }),
         frame.area(),
     );
+}
+
+/// 成绩视图里的上传状态行（纯函数，供渲染与测试）。
+fn upload_lines(upload: &UploadState) -> Vec<Line<'static>> {
+    match upload {
+        UploadState::NotApplicable => vec![],
+        UploadState::Uploading => vec![Line::from(""), Line::from(" 成绩上传中…").yellow()],
+        UploadState::Success {
+            ranking,
+            share_text,
+        } => {
+            let mut lines = vec![Line::from("")];
+            match ranking {
+                Some(r) => {
+                    lines.push(Line::from(format!(" 排名: 第{r}名 · 已上传")).green());
+                }
+                None => lines.push(Line::from(" 已上传").green()),
+            }
+            lines.push(Line::from(format!(" 分享: {share_text}")).green());
+            lines.push(Line::from(" 已复制到剪贴板").gray());
+            lines
+        }
+        UploadState::Failed {
+            message,
+            need_relogin,
+        } => {
+            let mut lines = vec![
+                Line::from(""),
+                Line::from(format!(" 上传失败: {message}")).red(),
+            ];
+            if *need_relogin {
+                lines.push(Line::from(" 登录已失效，请 Ctrl-O 重新登录").yellow());
+            }
+            lines
+        }
+    }
 }
 
 /// 将对照区的字符按跟打状态着色：已打对=绿、已打错=红、未打到=默认。
@@ -1196,5 +1335,166 @@ mod tests {
             Some("请先登录 52dazi（Ctrl-O）")
         );
         assert!(app.online_loading.is_none());
+    }
+
+    // ---- 成绩上传（T8）----
+
+    fn online_text(content: &str) -> Text {
+        Text {
+            title: "锦标赛第3279期".into(),
+            content: content.into(),
+            source: TextSource::Online {
+                competition_type: CompetitionType::Jinbiao,
+            },
+        }
+    }
+
+    #[test]
+    fn upload_lines_renders_each_state() {
+        // 离线：不显示上传状态。
+        assert!(upload_lines(&UploadState::NotApplicable).is_empty());
+        // 上传中。
+        let lines = upload_lines(&UploadState::Uploading);
+        assert!(lines.iter().any(|l| l.to_string().contains("上传中")));
+        // 成功带排名：排名 + 已上传 + 分享 + 剪贴板。
+        let lines = upload_lines(&UploadState::Success {
+            ranking: Some("5".into()),
+            share_text: "极速杯 第5名 · WPM 85.2".into(),
+        });
+        let text: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+        assert!(
+            text.iter()
+                .any(|s| s.contains("第5名") && s.contains("已上传"))
+        );
+        assert!(text.iter().any(|s| s.contains("极速杯 第5名")));
+        assert!(text.iter().any(|s| s.contains("已复制到剪贴板")));
+        // 成功无排名：仍显示已上传。
+        let lines = upload_lines(&UploadState::Success {
+            ranking: None,
+            share_text: "x".into(),
+        });
+        assert!(lines.iter().any(|l| l.to_string().contains("已上传")));
+        // 失败：显示原因，不提示重新登录。
+        let lines = upload_lines(&UploadState::Failed {
+            message: "网络连接失败".into(),
+            need_relogin: false,
+        });
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.to_string().contains("上传失败: 网络连接失败"))
+        );
+        assert!(lines.iter().all(|l| !l.to_string().contains("重新登录")));
+        // 失败且鉴权失效：提示重新登录。
+        let lines = upload_lines(&UploadState::Failed {
+            message: "用户名不能为空！".into(),
+            need_relogin: true,
+        });
+        assert!(lines.iter().any(|l| l.to_string().contains("重新登录")));
+    }
+
+    #[test]
+    fn perform_upload_without_token_fails_with_relogin() {
+        let mut app = App::new(online_text("你好世界"));
+        app.token = None;
+        let stats = app.session.finish(Duration::from_secs(10));
+        let up = app.perform_upload(&stats, Duration::from_secs(10));
+        assert_eq!(
+            up,
+            UploadState::Failed {
+                message: "未登录，无法上传成绩".to_string(),
+                need_relogin: true,
+            }
+        );
+    }
+
+    #[test]
+    fn perform_upload_network_failure_is_not_relogin() {
+        let mut app = App::new(online_text("你好世界"));
+        app.token = Some("dead-token".into());
+        // 指向必然拒绝连接的地址，验证网络错误被友好化。
+        app.api = ApiClient::with_base_url("http://127.0.0.1:1");
+        let stats = app.session.finish(Duration::from_secs(10));
+        let up = app.perform_upload(&stats, Duration::from_secs(10));
+        assert_eq!(
+            up,
+            UploadState::Failed {
+                message: "网络连接失败".to_string(),
+                need_relogin: false,
+            }
+        );
+    }
+
+    #[test]
+    fn perform_upload_success_parses_rank_and_share() {
+        // 起本地 mock 服务器，返回上传成功响应。
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            use std::io::{BufRead, BufReader, Read, Write};
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            // 读请求头，解析 Content-Length。
+            let mut content_length = 0usize;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" || line == "\n" {
+                    break;
+                }
+                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = v.trim().parse().unwrap_or(0);
+                }
+            }
+            let mut body_buf = vec![0u8; content_length];
+            let _ = reader.read_exact(&mut body_buf);
+            let body = r#"{"error":0,"msg":{"ranking":5,"rankTips":"恭喜获得第5名"}}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(resp.as_bytes());
+        });
+        let mut app = App::new(online_text("你好世界"));
+        app.token = Some("tok".into());
+        app.api = ApiClient::with_base_url(&format!("http://127.0.0.1:{port}"));
+        let stats = app.session.finish(Duration::from_secs(40));
+        let up = app.perform_upload(&stats, Duration::from_secs(40));
+        handle.join().unwrap();
+        assert!(matches!(
+            &up,
+            UploadState::Success { ranking, share_text }
+                if ranking.as_deref() == Some("5") && share_text.contains("第5名")
+        ));
+    }
+
+    #[test]
+    fn finish_typing_offline_no_upload_online_uploading() {
+        // 离线：直接进入成绩视图，无上传。
+        let mut app = App::new(Text {
+            title: "t".into(),
+            content: "你好".into(),
+            source: TextSource::File,
+        });
+        app.session.type_text("你好");
+        assert!(app.finish_typing().is_none());
+        assert!(matches!(
+            &app.state,
+            AppState::Finished {
+                upload: UploadState::NotApplicable,
+                ..
+            }
+        ));
+        // 在线：进入成绩视图并置为「上传中」，返回成绩与用时。
+        let mut app = App::new(online_text("你好"));
+        app.session.type_text("你好");
+        assert!(app.finish_typing().is_some());
+        assert!(matches!(
+            &app.state,
+            AppState::Finished {
+                upload: UploadState::Uploading,
+                ..
+            }
+        ));
     }
 }

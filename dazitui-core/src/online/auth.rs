@@ -17,11 +17,15 @@ pub fn env_credentials(get: impl Fn(&str) -> Option<String>) -> Option<(String, 
 /// 判断 API 错误是否表示登录失效（token 过期/未登录），需要提示重新登录。
 ///
 /// 真实网关 token 失效时返回业务错误，文案通常包含「登录」「过期」「失效」。
+/// 上传成绩时，token 失效后端会因解析不到 username 而报「用户名不能为空！」。
 /// 传输失败、响应格式错误、以及其它业务错误不算登录失效。
 pub fn is_auth_failure(err: &ApiError) -> bool {
     match err {
         ApiError::Server(msg) => {
-            msg.contains("登录") || msg.contains("过期") || msg.contains("失效")
+            msg.contains("登录")
+                || msg.contains("过期")
+                || msg.contains("失效")
+                || msg.contains("用户名不能为空")
         }
         _ => false,
     }
@@ -79,8 +83,15 @@ mod tests {
     }
 
     #[test]
-    fn is_auth_failure_ignores_other_server_errors() {
+    fn is_auth_failure_detects_missing_username_from_dead_token() {
+        // 上传成绩时 token 失效，后端解析不到 username 报此错。
         let err = ApiError::Server("用户名不能为空！".into());
+        assert!(is_auth_failure(&err));
+    }
+
+    #[test]
+    fn is_auth_failure_ignores_other_server_errors() {
+        let err = ApiError::Server("上传速度必须大于0".into());
         assert!(!is_auth_failure(&err));
     }
 
