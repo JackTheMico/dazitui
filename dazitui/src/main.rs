@@ -500,6 +500,7 @@ fn type_line(session: &Session) -> Line<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dazitui_core::TextSource;
     use std::fs;
 
     fn temp_dir(suffix: &str) -> PathBuf {
@@ -675,6 +676,7 @@ mod tests {
         let mut app = App::new(Text {
             title: "old".into(),
             content: "旧赛文".into(),
+            source: TextSource::File,
         });
         app.open_browser();
         // 打开浏览时扫描的是当前工作目录，手动指向临时目录
@@ -700,6 +702,7 @@ mod tests {
         let mut app = App::new(Text {
             title: "old".into(),
             content: "旧赛文".into(),
+            source: TextSource::File,
         });
         app.open_browser();
         app.browse_files = list_text_files(&dir);

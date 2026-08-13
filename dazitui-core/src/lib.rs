@@ -2,7 +2,17 @@ use std::path::Path;
 
 mod session;
 
+#[cfg(feature = "online")]
+mod online;
+
 pub use session::{CharStatus, Session, Stats, TypeResult};
+
+#[cfg(feature = "online")]
+pub use online::protocol::{ProtocolError, build_request, decrypt, encrypt, parse_json};
+#[cfg(feature = "online")]
+pub use online::share::{UploadStats, format_share_text, to_upload_stats};
+#[cfg(feature = "online")]
+pub use online::token::TokenStore;
 
 /// 赛文：练习/比赛用的文字内容，来自本地文件或 52dazi.cn。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -11,6 +21,39 @@ pub struct Text {
     pub title: String,
     /// 赛文内容。
     pub content: String,
+    /// 赛文来源。
+    pub source: TextSource,
+}
+
+/// 赛文来源：本地文件或 52dazi.cn 在线比赛。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextSource {
+    /// 本地文件。
+    File,
+    /// 52dazi.cn 在线赛文。
+    Online { competition_type: CompetitionType },
+}
+
+/// 52dazi.cn 比赛类型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompetitionType {
+    /// 极速杯。
+    Jisu,
+    /// 锦标赛。
+    Jinbiao,
+    /// 键神杯。
+    Jianshen,
+}
+
+impl CompetitionType {
+    /// 比赛类型的中文名。
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Jisu => "极速杯",
+            Self::Jinbiao => "锦标赛",
+            Self::Jianshen => "键神杯",
+        }
+    }
 }
 
 /// 载文失败的分类。
@@ -55,7 +98,11 @@ pub fn load_text_from_file_with_options(
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    Ok(Text { title, content })
+    Ok(Text {
+        title,
+        content,
+        source: TextSource::File,
+    })
 }
 
 /// 按选项处理原文：去空格、去标点、去首尾空白；处理为空则报 Empty。
