@@ -5,5 +5,5 @@ edition = "2024"
 
 [dependencies]
 crossterm = "0.29.0"
-dazitui-core = { version = "0.1.0", path = "../dazitui-core" }
+dazitui-core = { version = "0.1.0", path = "../dazitui-core", features = ["online"] }
 ratatui = "0.30.2"

@@ -5,15 +5,15 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use dazitui_core::{
-    CharStatus, LoadError, LoadOptions, Session, Stats, Text, load_text_from_file,
-    load_text_from_file_with_options,
+    ApiClient, ApiError, CharStatus, LoadError, LoadOptions, Session, Stats, Text, TokenStore,
+    env_credentials, load_text_from_file, load_text_from_file_with_options,
 };
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::prelude::Stylize;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph, Wrap};
+use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 
 /// 跟打应用状态。
 enum AppState {
@@ -42,11 +42,60 @@ struct App {
     options: LoadOptions,
     /// 载文失败时的错误提示。
     browse_error: Option<String>,
+    /// token 持久化存储。
+    token_store: TokenStore,
+    /// 当前登录 token（`None` = 未登录）。
+    token: Option<String>,
+    /// 52dazi 客户端。
+    api: ApiClient,
+    /// 登录模态框（`None` = 未打开）。
+    login_form: Option<LoginForm>,
+    /// 登录相关的临时提示（展示在功能栏）。
+    login_notice: Option<String>,
+}
+
+/// 登录模态框输入状态。
+#[derive(Debug, Default)]
+struct LoginForm {
+    username: String,
+    password: String,
+    /// 焦点字段：0 = 用户名，1 = 密码。
+    focus: usize,
+    /// 提交中（网络请求进行中）。
+    busy: bool,
+    /// 错误提示。
+    error: Option<String>,
+}
+
+/// 登录模态框按键动作。
+#[derive(Debug, PartialEq, Eq)]
+enum LoginAction {
+    None,
+    Submit,
+    Cancel,
 }
 
 impl App {
     fn new(text: Text) -> Self {
         let session = Session::new(&text.content);
+        let token_store = TokenStore::with_default_path();
+        let api = ApiClient::new();
+        // 免登录：加载已保存的 token。
+        let saved_token = token_store.load();
+        // 未保存 token 时，尝试环境变量自动登录。
+        let (token, login_notice) = if saved_token.is_some() {
+            (saved_token, None)
+        } else if let Some((user, pass)) = env_credentials(|k| std::env::var(k).ok()) {
+            match api.login(&user, &pass) {
+                Ok(r) => {
+                    let _ = token_store.save(&r.token);
+                    (Some(r.token), Some("已通过环境变量登录".to_string()))
+                }
+                Err(e) => (None, Some(format!("自动登录失败: {}", api_error_text(&e)))),
+            }
+        } else {
+            (None, None)
+        };
         Self {
             text,
             session,
@@ -57,6 +106,47 @@ impl App {
             browse_selection: 0,
             options: LoadOptions::default(),
             browse_error: None,
+            token_store,
+            token,
+            api,
+            login_form: None,
+            login_notice,
+        }
+    }
+
+    /// 打开登录模态框。
+    fn open_login(&mut self) {
+        self.login_form = Some(LoginForm::default());
+        self.login_notice = None;
+    }
+
+    /// 关闭登录模态框（不改变登录状态）。
+    fn close_login(&mut self) {
+        self.login_form = None;
+    }
+
+    /// 提交登录：调用网关，成功后持久化 token。
+    fn submit_login(&mut self) {
+        let Some(form) = self.login_form.as_mut() else {
+            return;
+        };
+        if form.username.is_empty() || form.password.is_empty() {
+            form.error = Some("用户名和密码不能为空".to_string());
+            return;
+        }
+        form.busy = true;
+        form.error = None;
+        match self.api.login(&form.username, &form.password) {
+            Ok(r) => {
+                let _ = self.token_store.save(&r.token);
+                self.token = Some(r.token);
+                self.login_form = None;
+                self.login_notice = Some("登录成功".to_string());
+            }
+            Err(e) => {
+                form.busy = false;
+                form.error = Some(api_error_text(&e));
+            }
         }
     }
 
@@ -144,8 +234,23 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                 if is_quit(key) {
                     return Ok(());
                 }
+                // 登录模态框打开时优先处理其按键。
+                if app.login_form.is_some() {
+                    let action =
+                        login_input(app.login_form.as_mut().expect("login_form open"), key);
+                    match action {
+                        LoginAction::Cancel => app.close_login(),
+                        LoginAction::Submit => app.submit_login(),
+                        LoginAction::None => {}
+                    }
+                    continue;
+                }
                 if is_toggle_sidebar(key) {
                     app.sidebar_visible = !app.sidebar_visible;
+                    continue;
+                }
+                if is_open_login(key) {
+                    app.open_login();
                     continue;
                 }
                 match app.state {
@@ -247,6 +352,56 @@ fn is_quit(key: KeyEvent) -> bool {
     key.code == KeyCode::Char('q') || key.code == KeyCode::Char('Q') || is_ctrl_c
 }
 
+/// 打开登录模态框快捷键：Ctrl-O。
+fn is_open_login(key: KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('o')
+}
+
+/// 把 API 错误转为友好文案。
+fn api_error_text(err: &ApiError) -> String {
+    match err {
+        ApiError::Transport(_) => "网络连接失败".to_string(),
+        ApiError::Server(msg) => msg.clone(),
+        ApiError::Parse(_) => "服务器响应异常".to_string(),
+    }
+}
+
+/// 处理登录模态框按键，返回动作。
+fn login_input(form: &mut LoginForm, key: KeyEvent) -> LoginAction {
+    match key.code {
+        KeyCode::Esc => LoginAction::Cancel,
+        KeyCode::Tab => {
+            form.focus = 1 - form.focus;
+            LoginAction::None
+        }
+        KeyCode::Enter => LoginAction::Submit,
+        KeyCode::Backspace => {
+            let field = if form.focus == 0 {
+                &mut form.username
+            } else {
+                &mut form.password
+            };
+            field.pop();
+            LoginAction::None
+        }
+        KeyCode::Char(c) => {
+            let field = if form.focus == 0 {
+                &mut form.username
+            } else {
+                &mut form.password
+            };
+            field.push(c);
+            LoginAction::None
+        }
+        _ => LoginAction::None,
+    }
+}
+
+/// 密码遮蔽：每个字符显示为 `*`。
+fn mask_password(password: &str) -> String {
+    "*".repeat(password.chars().count())
+}
+
 /// 列出目录下的文本文件（.txt/.md/.wenz），按名字排序。
 fn list_text_files(dir: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
@@ -319,9 +474,64 @@ fn ui(frame: &mut Frame, app: &App) {
     let hint = if browsing {
         " ↑↓ 选择 | Enter 载入 | Esc 取消 | 1 去空格 | 2 去符号 | q 退出"
     } else {
-        " q 退出 | Ctrl-S 结束 | Ctrl-R 重打 | Ctrl-F 载文 | Tab 收起栏 "
+        " q 退出 | Ctrl-S 结束 | Ctrl-R 重打 | Ctrl-F 载文 | Ctrl-O 登录 | Tab 收起栏 "
     };
     frame.render_widget(Paragraph::new(Line::from(hint)), help_bar);
+
+    // 登录模态框（覆盖层）
+    if let Some(form) = &app.login_form {
+        render_login_modal(frame, form);
+    }
+}
+
+/// 登录模态框：居中弹层，用户名 + 遮蔽密码。
+fn render_login_modal(frame: &mut Frame, form: &LoginForm) {
+    let area = centered_rect(frame.area(), 62, 9);
+    frame.render_widget(Clear, area);
+    let mut lines = vec![Line::from(" 登录 52dazi ").bold(), Line::from("")];
+    let user_label = if form.focus == 0 {
+        "用户名 ▸ "
+    } else {
+        "用户名   "
+    };
+    lines.push(Line::from(format!(" {user_label}{}", form.username)));
+    let pass_label = if form.focus == 1 {
+        "密码   ▸ "
+    } else {
+        "密码     "
+    };
+    lines.push(Line::from(format!(
+        " {pass_label}{}",
+        mask_password(&form.password)
+    )));
+    lines.push(Line::from(""));
+    if form.busy {
+        lines.push(Line::from(" 登录中…").yellow());
+    } else if let Some(err) = &form.error {
+        lines.push(Line::from(format!(" 错误: {err}")).red());
+    } else {
+        lines.push(Line::from(" Enter 登录 | Tab 切换 | Esc 取消").gray());
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::bordered().title(" 登录 "))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+/// 计算居中矩形。
+fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
+    let w = width.min(area.width);
+    let h = height.min(area.height);
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    }
 }
 
 /// 左侧功能栏：文件列表 + 载文选项开关。
@@ -365,6 +575,17 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: ratatui::layout::Rect, bro
     };
     lines.push(Line::from(format!(" {ws} 1 去空格")));
     lines.push(Line::from(format!(" {punct} 2 去符号")));
+    lines.push(Line::from(""));
+    lines.push(Line::from(" 在线:").bold());
+    let login_entry = if app.token.is_some() {
+        Line::from(" 已登录 52dazi").green()
+    } else {
+        Line::from(" 登录 52dazi（Ctrl-O）").yellow()
+    };
+    lines.push(login_entry);
+    if let Some(notice) = &app.login_notice {
+        lines.push(Line::from(format!("  {notice}")).gray());
+    }
     frame.render_widget(
         Paragraph::new(lines)
             .block(Block::bordered().title(" 功能栏 "))
@@ -714,5 +935,107 @@ mod tests {
         assert_eq!(app.text.title, "old"); // 旧赛文保留
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ---- 登录 ----
+
+    #[test]
+    fn ctrl_o_opens_login() {
+        assert!(is_open_login(KeyEvent::new(
+            KeyCode::Char('o'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(!is_open_login(KeyEvent::new(
+            KeyCode::Char('o'),
+            KeyModifiers::NONE
+        )));
+    }
+
+    #[test]
+    fn login_input_appends_chars_to_focused_field() {
+        let mut form = LoginForm::default();
+        login_input(
+            &mut form,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+        );
+        login_input(
+            &mut form,
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE),
+        );
+        assert_eq!(form.username, "ab");
+        // 切到密码字段
+        login_input(&mut form, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        login_input(
+            &mut form,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+        );
+        assert_eq!(form.username, "ab");
+        assert_eq!(form.password, "x");
+    }
+
+    #[test]
+    fn login_input_backspace_pops_focused_field() {
+        let mut form = LoginForm {
+            username: "ab".into(),
+            password: "cd".into(),
+            focus: 1,
+            ..Default::default()
+        };
+        login_input(
+            &mut form,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        );
+        assert_eq!(form.password, "c");
+        assert_eq!(form.username, "ab");
+    }
+
+    #[test]
+    fn login_input_enter_submits_esc_cancels() {
+        let mut form = LoginForm::default();
+        assert_eq!(
+            login_input(&mut form, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            LoginAction::Submit
+        );
+        assert_eq!(
+            login_input(&mut form, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            LoginAction::Cancel
+        );
+    }
+
+    #[test]
+    fn mask_password_hides_every_char() {
+        assert_eq!(mask_password("s3cret"), "******");
+        assert_eq!(mask_password("密码123"), "*****");
+    }
+
+    #[test]
+    fn api_error_text_maps_categories() {
+        assert_eq!(
+            api_error_text(&ApiError::Transport("x".into())),
+            "网络连接失败"
+        );
+        assert_eq!(
+            api_error_text(&ApiError::Server("您的用户名或密码错误！".into())),
+            "您的用户名或密码错误！"
+        );
+        assert_eq!(
+            api_error_text(&ApiError::Parse("x".into())),
+            "服务器响应异常"
+        );
+    }
+
+    #[test]
+    fn submit_login_rejects_empty_fields_without_network() {
+        let mut app = App::new(Text {
+            title: "t".into(),
+            content: "c".into(),
+            source: TextSource::File,
+        });
+        app.open_login();
+        app.submit_login();
+        // 空用户名/密码：提前返回错误，不发起网络请求。
+        let form = app.login_form.as_ref().unwrap();
+        assert_eq!(form.error.as_deref(), Some("用户名和密码不能为空"));
+        assert!(!form.busy);
     }
 }
