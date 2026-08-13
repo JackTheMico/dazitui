@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use dazitui_core::{
-    ApiClient, ApiError, CharStatus, LoadError, LoadOptions, Session, Stats, Text, TokenStore,
-    env_credentials, load_text_from_file, load_text_from_file_with_options,
+    ApiClient, ApiError, CharStatus, CompetitionType, LoadError, LoadOptions, Session, Stats, Text,
+    TextSource, TokenStore, env_credentials, load_text_from_file, load_text_from_file_with_options,
 };
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -52,6 +52,10 @@ struct App {
     login_form: Option<LoginForm>,
     /// 登录相关的临时提示（展示在功能栏）。
     login_notice: Option<String>,
+    /// 在线赛文加载中（`Some(类型)` = 正在下载该比赛赛文）。
+    online_loading: Option<CompetitionType>,
+    /// 在线载文错误提示（展示在功能栏）。
+    online_error: Option<String>,
 }
 
 /// 登录模态框输入状态。
@@ -111,6 +115,8 @@ impl App {
             api,
             login_form: None,
             login_notice,
+            online_loading: None,
+            online_error: None,
         }
     }
 
@@ -182,6 +188,36 @@ impl App {
                     LoadError::Empty => "文件为空或处理后为空".to_string(),
                     LoadError::ReadFailed => "无法读取文件".to_string(),
                 });
+            }
+        }
+    }
+
+    /// 按比赛类型下载在线赛文并进入跟打。
+    ///
+    /// 调用前 `online_loading` 已由事件循环置为 `Some` 并渲染（保证「加载中...」可见）；
+    /// 这里执行同步下载，成功后替换赛文，失败则回填错误提示。
+    fn download_online(&mut self, competition_type: CompetitionType) {
+        let Some(token) = self.token.clone() else {
+            self.online_loading = None;
+            self.online_error = Some("请先登录 52dazi（Ctrl-O）".to_string());
+            return;
+        };
+        match self.api.get_content(&token, competition_type) {
+            Ok(comp) => {
+                self.text = Text {
+                    title: comp.title,
+                    content: comp.content,
+                    source: TextSource::Online { competition_type },
+                };
+                self.session = Session::new(&self.text.content);
+                self.start = Instant::now();
+                self.state = AppState::Typing;
+                self.online_loading = None;
+                self.online_error = None;
+            }
+            Err(e) => {
+                self.online_loading = None;
+                self.online_error = Some(api_error_text(&e));
             }
         }
     }
@@ -265,6 +301,20 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                         }
                         if is_restart(key) {
                             app.restart();
+                            continue;
+                        }
+                        if let Some(competition_type) = online_shortcut(key) {
+                            if app.token.is_none() {
+                                // 未登录：引导先登录。
+                                app.online_error =
+                                    Some("请先登录 52dazi 后再载入在线赛文".to_string());
+                                app.open_login();
+                            } else {
+                                app.online_loading = Some(competition_type);
+                                // 先渲染「加载中...」，再同步下载。
+                                terminal.draw(|frame| ui(frame, &app))?;
+                                app.download_online(competition_type);
+                            }
                             continue;
                         }
                         handle_key(&mut app.session, key);
@@ -355,6 +405,19 @@ fn is_quit(key: KeyEvent) -> bool {
 /// 打开登录模态框快捷键：Ctrl-O。
 fn is_open_login(key: KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('o')
+}
+
+/// 三个比赛入口快捷键：F1=极速杯、F2=锦标赛、F3=键神杯。
+fn online_shortcut(key: KeyEvent) -> Option<CompetitionType> {
+    if !key.modifiers.is_empty() {
+        return None;
+    }
+    match key.code {
+        KeyCode::F(1) => Some(CompetitionType::Jisu),
+        KeyCode::F(2) => Some(CompetitionType::Jinbiao),
+        KeyCode::F(3) => Some(CompetitionType::Jianshen),
+        _ => None,
+    }
 }
 
 /// 把 API 错误转为友好文案。
@@ -585,6 +648,17 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: ratatui::layout::Rect, bro
     lines.push(login_entry);
     if let Some(notice) = &app.login_notice {
         lines.push(Line::from(format!("  {notice}")).gray());
+    }
+    // 三个比赛入口。
+    lines.push(Line::from(" F1 极速杯"));
+    lines.push(Line::from(" F2 锦标赛"));
+    lines.push(Line::from(" F3 键神杯"));
+    // 加载中 / 错误提示。
+    if let Some(ct) = app.online_loading {
+        lines.push(Line::from(format!(" 正在载入{}...", ct.name())).cyan());
+    }
+    if let Some(err) = &app.online_error {
+        lines.push(Line::from(format!(" {err}")).red());
     }
     frame.render_widget(
         Paragraph::new(lines)
@@ -1037,5 +1111,47 @@ mod tests {
         let form = app.login_form.as_ref().unwrap();
         assert_eq!(form.error.as_deref(), Some("用户名和密码不能为空"));
         assert!(!form.busy);
+    }
+
+    #[test]
+    fn online_shortcut_maps_f_keys_to_competitions() {
+        assert_eq!(
+            online_shortcut(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE)),
+            Some(CompetitionType::Jisu)
+        );
+        assert_eq!(
+            online_shortcut(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE)),
+            Some(CompetitionType::Jinbiao)
+        );
+        assert_eq!(
+            online_shortcut(KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE)),
+            Some(CompetitionType::Jianshen)
+        );
+        // 带修饰键（Ctrl-F1 等）不触发，普通字符也不触发。
+        assert_eq!(
+            online_shortcut(KeyEvent::new(KeyCode::F(1), KeyModifiers::CONTROL)),
+            None
+        );
+        assert_eq!(
+            online_shortcut(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+            None
+        );
+    }
+
+    #[test]
+    fn download_online_without_token_guides_login() {
+        let mut app = App::new(Text {
+            title: "t".into(),
+            content: "c".into(),
+            source: TextSource::File,
+        });
+        // 默认未登录（无 token、无环境变量）。
+        assert!(app.token.is_none());
+        app.download_online(CompetitionType::Jisu);
+        assert_eq!(
+            app.online_error.as_deref(),
+            Some("请先登录 52dazi（Ctrl-O）")
+        );
+        assert!(app.online_loading.is_none());
     }
 }

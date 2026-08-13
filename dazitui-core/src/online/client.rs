@@ -37,14 +37,16 @@ pub struct LoginResult {
     pub token: String,
 }
 
-/// 比赛赛文（getContent 响应 `msg` 数组）。
+/// 比赛赛文（getContent 响应 `msg` 对象）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompetitionText {
-    /// 赛文内容。
+    /// 赛文内容（`msg["0"]`）。
     pub content: String,
-    /// 作者。
+    /// 赛文标题（`msg["7"]`，极速杯等类型可能缺失）。
+    pub title: String,
+    /// 作者（`msg["1"]`）。
     pub author: String,
-    /// 字数。
+    /// 字数（`msg["6"]`）。
     pub word_num: usize,
 }
 
@@ -85,17 +87,27 @@ pub fn parse_login_response(body: &str) -> Result<LoginResult, ApiError> {
     Ok(LoginResult { token: m.token })
 }
 
-/// 解析载文响应：`msg` 为数组 `[content, author, …, word_num]`。
+/// 解析载文响应：`msg` 为对象，字段 `"0"`=内容、`"1"`=作者、`"6"`=字数、`"7"`=标题。
+/// 除内容外其余字段可能缺失（极速杯只返回 `"0"`），缺失时用空串/0 兜底。
 pub fn parse_content_response(body: &str) -> Result<CompetitionText, ApiError> {
-    let arr: Vec<Value> = parse_api_response(body)?;
-    let content = arr
-        .first()
+    let obj: Map<String, Value> = parse_api_response(body)?;
+    let content = obj
+        .get("0")
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    let author = arr.get(1).and_then(Value::as_str).unwrap_or("").to_string();
-    let word_num = arr
-        .get(6)
+    let title = obj
+        .get("7")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let author = obj
+        .get("1")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let word_num = obj
+        .get("6")
         .and_then(|v| {
             v.as_u64()
                 .map(|n| n as usize)
@@ -104,9 +116,21 @@ pub fn parse_content_response(body: &str) -> Result<CompetitionText, ApiError> {
         .unwrap_or(0);
     Ok(CompetitionText {
         content,
+        title,
         author,
         word_num,
     })
+}
+
+/// 标题为空时用比赛类型名兜底（极速杯不返回标题字段，验收要求「标题显示比赛类型」）。
+fn with_title_fallback(
+    mut text: CompetitionText,
+    competition_type: CompetitionType,
+) -> CompetitionText {
+    if text.title.is_empty() {
+        text.title = competition_type.name().to_string();
+    }
+    text
 }
 
 /// 解析上传响应：`msg` 为提示文本（字符串）或对象（含 `ranking`/`rankTips`）。
@@ -223,7 +247,10 @@ impl ApiClient {
     ) -> Result<CompetitionText, ApiError> {
         let body = content_payload(token, competition_type);
         let resp = self.post("Api/Text/getContent", &body)?;
-        parse_content_response(&resp)
+        Ok(with_title_fallback(
+            parse_content_response(&resp)?,
+            competition_type,
+        ))
     }
 
     /// 上传成绩（`payload` 为业务字段，公共字段与 token 自动合并）。
@@ -268,22 +295,49 @@ mod tests {
     }
 
     #[test]
-    fn parse_content_extracts_content_author_word_num() {
-        // msg 数组结构来自前端逆向：[0]=内容 [1]=作者 [6]=字数
-        let body = r#"{"error":0,"msg":["你好世界","作者甲",null,"x",null,null,"12"]}"#;
+    fn parse_content_extracts_content_title_author_word_num() {
+        // msg 对象结构（锦标赛/键神杯实测）："0"=内容 "1"=作者 "6"=字数 "7"=标题
+        let body = r#"{"error":0,"msg":{"0":"你好世界","1":"消逝","2":"beiyiwang12","3":"170.91","4":"尊极境七重","6":698,"7":"锦标赛第3279期"}}"#;
         let r = parse_content_response(body).unwrap();
         assert_eq!(r.content, "你好世界");
-        assert_eq!(r.author, "作者甲");
-        assert_eq!(r.word_num, 12);
+        assert_eq!(r.title, "锦标赛第3279期");
+        assert_eq!(r.author, "消逝");
+        assert_eq!(r.word_num, 698);
     }
 
     #[test]
-    fn parse_content_short_array_does_not_panic() {
-        let body = r#"{"error":0,"msg":["只有内容"]}"#;
+    fn parse_content_missing_optional_fields_does_not_panic() {
+        // 极速杯实测：只返回 "0"（内容），其余字段缺失。
+        let body = r#"{"error":0,"msg":{"0":"只有内容"}}"#;
         let r = parse_content_response(body).unwrap();
         assert_eq!(r.content, "只有内容");
+        assert_eq!(r.title, "");
         assert_eq!(r.author, "");
         assert_eq!(r.word_num, 0);
+    }
+
+    #[test]
+    fn with_title_fallback_uses_competition_name_when_empty() {
+        let text = CompetitionText {
+            content: "x".into(),
+            title: "".into(),
+            author: "".into(),
+            word_num: 0,
+        };
+        let filled = with_title_fallback(text, CompetitionType::Jisu);
+        assert_eq!(filled.title, "极速杯");
+    }
+
+    #[test]
+    fn with_title_fallback_keeps_server_title_when_present() {
+        let text = CompetitionText {
+            content: "x".into(),
+            title: "锦标赛第3279期".into(),
+            author: "".into(),
+            word_num: 0,
+        };
+        let filled = with_title_fallback(text, CompetitionType::Jinbiao);
+        assert_eq!(filled.title, "锦标赛第3279期");
     }
 
     #[test]
