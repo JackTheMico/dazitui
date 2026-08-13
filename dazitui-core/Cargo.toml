@@ -9,7 +9,8 @@ base64 = { version = "0.22", optional = true }
 cbc = { version = "0.1", features = ["alloc"], optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
+ureq = { version = "3", default-features = false, features = ["charset"], optional = true }
 
 [features]
 default = []
-online = ["dep:aes", "dep:base64", "dep:cbc", "dep:serde", "dep:serde_json"]
+online = ["dep:aes", "dep:base64", "dep:cbc", "dep:serde", "dep:serde_json", "dep:ureq"]

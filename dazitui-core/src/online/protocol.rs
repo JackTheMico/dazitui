@@ -80,6 +80,11 @@ pub fn build_request(fields: &[(&str, &str)]) -> String {
     encrypt(&json)
 }
 
+/// 把 JSON Value 序列化并加密（用于含数字字段的请求体）。
+pub fn encrypt_value(value: &serde_json::Value) -> String {
+    encrypt(&value.to_string())
+}
+
 /// 把明文 JSON 反序列化为强类型。
 pub fn parse_json<T: DeserializeOwned>(json: &str) -> Result<T, ProtocolError> {
     serde_json::from_str(json).map_err(|e| ProtocolError::Parse(e.to_string()))
@@ -112,6 +117,15 @@ mod tests {
         // 解密回来验证 JSON 结构（键有序，BTreeMap）
         let decrypted = decrypt(&encoded);
         assert_eq!(decrypted, r#"{"password":"secret","username":"alice"}"#);
+    }
+
+    #[test]
+    fn encrypt_value_handles_numeric_and_nested_fields() {
+        let v = serde_json::json!({"speed": 85.2, "wordNum": 100});
+        let encoded = encrypt_value(&v);
+        let decrypted = decrypt(&encoded);
+        // 数字保持数字类型（不字符串化）
+        assert_eq!(decrypted, r#"{"speed":85.2,"wordNum":100}"#);
     }
 
     #[derive(Deserialize, Debug)]

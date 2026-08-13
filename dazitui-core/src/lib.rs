@@ -8,6 +8,8 @@ mod online;
 pub use session::{CharStatus, Session, Stats, TypeResult};
 
 #[cfg(feature = "online")]
+pub use online::client::{ApiClient, ApiError, CompetitionText, LoginResult, RankResult};
+#[cfg(feature = "online")]
 pub use online::protocol::{ProtocolError, build_request, decrypt, encrypt, parse_json};
 #[cfg(feature = "online")]
 pub use online::share::{UploadStats, format_share_text, to_upload_stats};
@@ -52,6 +54,15 @@ impl CompetitionType {
             Self::Jisu => "极速杯",
             Self::Jinbiao => "锦标赛",
             Self::Jianshen => "键神杯",
+        }
+    }
+
+    /// 52dazi.cn API 使用的比赛类型编号（极速杯=0、锦标赛=2、键神杯=4）。
+    pub fn code(&self) -> u8 {
+        match self {
+            Self::Jisu => 0,
+            Self::Jinbiao => 2,
+            Self::Jianshen => 4,
         }
     }
 }
