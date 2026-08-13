@@ -31,6 +31,21 @@ pub fn is_auth_failure(err: &ApiError) -> bool {
     }
 }
 
+/// token 是否有效：由 `getBaseInfo` 探测结果（`isLogin`）判定。
+///
+/// TUI 层启动时与载文前共用此单一判定点，避免两处逻辑漂移。
+pub fn token_is_valid(is_login: bool) -> bool {
+    is_login
+}
+
+/// 是否应自动重新登录：上传失败因登录失效，且环境变量凭据可用。
+///
+/// 纯决策函数：`need_relogin`（`is_auth_failure` 命中）与 `has_env_credentials`
+/// （`DAZITUI_USER`/`DAZITUI_PASS` 均可用）均满足时才重登。
+pub fn should_auto_relogin(need_relogin: bool, has_env_credentials: bool) -> bool {
+    need_relogin && has_env_credentials
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -99,5 +114,23 @@ mod tests {
     fn is_auth_failure_ignores_transport_and_parse() {
         assert!(!is_auth_failure(&ApiError::Transport("连接失败".into())));
         assert!(!is_auth_failure(&ApiError::Parse("无效 JSON".into())));
+    }
+
+    #[test]
+    fn token_is_valid_follows_is_login() {
+        assert!(token_is_valid(true));
+        assert!(!token_is_valid(false));
+    }
+
+    #[test]
+    fn should_auto_relogin_requires_both_conditions() {
+        // 登录失效 + 有凭据 → 重登。
+        assert!(should_auto_relogin(true, true));
+        // 仅登录失效（无 env 凭据）→ 不重登，提示手动。
+        assert!(!should_auto_relogin(true, false));
+        // 有凭据但非登录失效（网络错误等）→ 不重登。
+        assert!(!should_auto_relogin(false, true));
+        // 均不满足 → 不重登。
+        assert!(!should_auto_relogin(false, false));
     }
 }

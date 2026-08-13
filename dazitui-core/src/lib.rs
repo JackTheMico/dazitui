@@ -8,9 +8,11 @@ mod online;
 pub use session::{CharStatus, Session, Stats, TypeResult};
 
 #[cfg(feature = "online")]
-pub use online::auth::{env_credentials, is_auth_failure};
+pub use online::auth::{env_credentials, is_auth_failure, should_auto_relogin, token_is_valid};
 #[cfg(feature = "online")]
-pub use online::client::{ApiClient, ApiError, CompetitionText, LoginResult, RankResult};
+pub use online::client::{
+    ApiClient, ApiError, BaseInfo, CompetitionText, LoginResult, RankResult,
+};
 #[cfg(feature = "online")]
 pub use online::protocol::{ProtocolError, build_request, decrypt, encrypt, parse_json};
 #[cfg(feature = "online")]

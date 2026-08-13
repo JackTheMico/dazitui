@@ -59,6 +59,13 @@ pub struct RankResult {
     pub ranking: Option<String>,
 }
 
+/// 基础信息（getBaseInfo 响应 `msg`），用于探测 token 有效性。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaseInfo {
+    /// 是否已登录（token 有效）。
+    pub is_login: bool,
+}
+
 /// 统一响应外壳：成功 `error == 0` 且 `msg` 为数据，失败 `msg` 为错误文本。
 #[derive(Deserialize)]
 struct RawResponse {
@@ -163,6 +170,26 @@ pub fn parse_upload_response(body: &str) -> Result<RankResult, ApiError> {
     }
 }
 
+/// 解析 getBaseInfo 响应：`msg.isLogin`（数字 1/0、布尔或字符串均可）。
+///
+/// `error != 0`（如 token 缺失）由 `parse_api_response` 统一转为 `Server` 错误；
+/// `isLogin` 缺失或无法识别按未登录处理。
+pub fn parse_base_info_response(body: &str) -> Result<BaseInfo, ApiError> {
+    #[derive(Deserialize)]
+    struct BaseInfoMsg {
+        #[serde(rename = "isLogin")]
+        is_login: Option<Value>,
+    }
+    let m: BaseInfoMsg = parse_api_response(body)?;
+    let is_login = match m.is_login {
+        Some(Value::Bool(b)) => b,
+        Some(Value::Number(n)) => n.as_i64().unwrap_or(0) != 0,
+        Some(Value::String(s)) => s == "1" || s.eq_ignore_ascii_case("true"),
+        _ => false,
+    };
+    Ok(BaseInfo { is_login })
+}
+
 /// 请求体公共字段：`version` + `subversions` + 可选 `token`。
 fn base_fields(token: Option<&str>) -> Map<String, Value> {
     let mut m = Map::new();
@@ -199,6 +226,11 @@ fn upload_payload(token: &str, payload: &Value) -> String {
         }
     }
     encrypt_value(&Value::Object(m))
+}
+
+/// 基础信息请求体（加密后）：仅公共字段 + token。
+fn base_info_payload(token: &str) -> String {
+    encrypt_value(&Value::Object(base_fields(Some(token))))
 }
 
 /// 52dazi 客户端。
@@ -258,6 +290,16 @@ impl ApiClient {
         let body = upload_payload(token, payload);
         let resp = self.post("Api/Rank/uploadResult", &body)?;
         parse_upload_response(&resp)
+    }
+
+    /// 探测 token 有效性：POST Api/System/getBaseInfo，返回 `isLogin`。
+    ///
+    /// 该接口不产生副作用（只读），token 有效返回 `is_login: true`；
+    /// token 缺失/无效时服务器可能返回业务错误（`Server`）。
+    pub fn get_base_info(&self, token: &str) -> Result<BaseInfo, ApiError> {
+        let body = base_info_payload(token);
+        let resp = self.post("Api/System/getBaseInfo", &body)?;
+        parse_base_info_response(&resp)
     }
 
     /// 发送加密请求体，返回响应文本。
@@ -357,6 +399,44 @@ mod tests {
     }
 
     #[test]
+    fn parse_base_info_detects_logged_in_numeric() {
+        let body = r#"{"error":0,"msg":{"isLogin":1}}"#;
+        let r = parse_base_info_response(body).unwrap();
+        assert!(r.is_login);
+    }
+
+    #[test]
+    fn parse_base_info_detects_logged_out_numeric() {
+        let body = r#"{"error":0,"msg":{"isLogin":0}}"#;
+        let r = parse_base_info_response(body).unwrap();
+        assert!(!r.is_login);
+    }
+
+    #[test]
+    fn parse_base_info_accepts_bool_and_string_forms() {
+        assert!(parse_base_info_response(r#"{"error":0,"msg":{"isLogin":true}}"#)
+            .unwrap()
+            .is_login);
+        assert!(!parse_base_info_response(r#"{"error":0,"msg":{"isLogin":"0"}}"#)
+            .unwrap()
+            .is_login);
+    }
+
+    #[test]
+    fn parse_base_info_server_error_propagates() {
+        let body = r#"{"error":1,"msg":"token 失效"}"#;
+        let err = parse_base_info_response(body).unwrap_err();
+        assert_eq!(err, ApiError::Server("token 失效".into()));
+    }
+
+    #[test]
+    fn parse_base_info_missing_is_login_is_logged_out() {
+        let body = r#"{"error":0,"msg":{}}"#;
+        let r = parse_base_info_response(body).unwrap();
+        assert!(!r.is_login);
+    }
+
+    #[test]
     fn parse_invalid_json_is_parse_error() {
         let err = parse_login_response("not json").unwrap_err();
         assert!(matches!(err, ApiError::Parse(_)));
@@ -403,6 +483,16 @@ mod tests {
         assert_eq!(v["textTitle"], "赛文");
         assert_eq!(v["token"], "tok-9");
         assert_eq!(v["version"], VERSION);
+    }
+
+    #[test]
+    fn base_info_payload_contains_common_fields_and_token() {
+        let encoded = base_info_payload("tok-9");
+        let decrypted = super::super::protocol::decrypt(&encoded);
+        let v: Value = serde_json::from_str(&decrypted).unwrap();
+        assert_eq!(v["token"], "tok-9");
+        assert_eq!(v["version"], VERSION);
+        assert_eq!(v["subversions"], SUBVERSIONS);
     }
 
     // ---- HTTP 壳 ----

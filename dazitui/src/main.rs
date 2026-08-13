@@ -8,7 +8,7 @@ use dazitui_core::{
     ApiClient, ApiError, CharStatus, CompetitionType, LoadError, LoadOptions, Session, Stats, Text,
     TextSource, TokenStore, build_upload_payload, env_credentials, format_share_text,
     is_auth_failure, load_text_from_file, load_text_from_file_with_options, osc52_clipboard,
-    to_upload_stats,
+    should_auto_relogin, to_upload_stats, token_is_valid,
 };
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -39,8 +39,12 @@ enum UploadState {
         ranking: Option<String>,
         share_text: String,
     },
-    /// 上传失败：错误文案 + 是否需要重新登录。
-    Failed { message: String, need_relogin: bool },
+    /// 上传失败：友好文案 + 是否需要重新登录 + 原始服务器错误（次要信息）。
+    Failed {
+        message: String,
+        need_relogin: bool,
+        detail: Option<String>,
+    },
 }
 
 /// 应用全部状态（TUI 层）。
@@ -99,14 +103,24 @@ enum LoginAction {
 
 impl App {
     fn new(text: Text) -> Self {
+        Self::new_with(text, TokenStore::with_default_path(), ApiClient::new())
+    }
+
+    /// 指定 token 存储与 API 客户端（测试注入；生产用 `new`）。
+    fn new_with(text: Text, token_store: TokenStore, api: ApiClient) -> Self {
         let session = Session::new(&text.content);
-        let token_store = TokenStore::with_default_path();
-        let api = ApiClient::new();
-        // 免登录：加载已保存的 token。
+        // 免登录：加载已保存的 token，并探测其有效性（getBaseInfo 的 isLogin）。
         let saved_token = token_store.load();
-        // 未保存 token 时，尝试环境变量自动登录。
-        let (token, login_notice) = if saved_token.is_some() {
-            (saved_token, None)
+        // 已保存 token 的启动处理：
+        // - 有效 → 保持登录；
+        // - 失效 → 视为未登录（保留 token 文件，提示重新登录），消除「已登录」假象；
+        // - 探测失败（网络异常）→ 保持现状，不阻塞启动。
+        let (token, login_notice) = if let Some(t) = saved_token {
+            match api.get_base_info(&t) {
+                Ok(info) if token_is_valid(info.is_login) => (Some(t), None),
+                Ok(_) => (None, Some("登录已失效，请重新登录".to_string())),
+                Err(_) => (Some(t), None),
+            }
         } else if let Some((user, pass)) = env_credentials(|k| std::env::var(k).ok()) {
             match api.login(&user, &pass) {
                 Ok(r) => {
@@ -236,12 +250,23 @@ impl App {
     ///
     /// 调用前 `online_loading` 已由事件循环置为 `Some` 并渲染（保证「加载中...」可见）；
     /// 这里执行同步下载，成功后替换赛文，失败则回填错误提示。
+    ///
+    /// 发起 getContent 前先探测 token 有效性：失效引导重新登录（避免「能载文、
+    /// 不能上传」）；探测失败（网络异常）时允许继续，不因探测故障阻断正常载文。
     fn download_online(&mut self, competition_type: CompetitionType) {
         let Some(token) = self.token.clone() else {
             self.online_loading = None;
             self.online_error = Some("请先登录 52dazi（Ctrl-O）".to_string());
             return;
         };
+        match self.api.get_base_info(&token) {
+            Ok(info) if !token_is_valid(info.is_login) => {
+                self.online_loading = None;
+                self.online_error = Some("登录已失效，请重新登录".to_string());
+                return;
+            }
+            _ => {}
+        }
         match self.api.get_content(&token, competition_type) {
             Ok(comp) => {
                 self.text = Text {
@@ -263,12 +288,45 @@ impl App {
     }
 
     /// 上传成绩并更新成绩视图状态（在线赛文完成跟打后调用）。
+    ///
+    /// 若上传失败因登录失效且配置了 `DAZITUI_USER`/`DAZITUI_PASS`，自动重新登录
+    /// 并重试上传一次；重试仍失败按原失败路径提示。
     fn do_upload(&mut self, stats: &Stats, elapsed: Duration) {
-        let upload = self.perform_upload(stats, elapsed);
+        let mut upload = self.perform_upload(stats, elapsed);
+        let need_relogin =
+            matches!(&upload, UploadState::Failed { need_relogin: true, .. });
+        let credentials = env_credentials(|k| std::env::var(k).ok());
+        if should_auto_relogin(need_relogin, credentials.is_some())
+            && let Some((user, pass)) = credentials
+        {
+            upload = self.retry_after_relogin((user, pass), stats, elapsed);
+        }
         self.state = AppState::Finished {
             stats: stats.clone(),
             upload,
         };
+    }
+
+    /// 用环境变量凭据重新登录并重试上传一次；重登失败时保留失败状态并附原始错误。
+    fn retry_after_relogin(
+        &mut self,
+        credentials: (String, String),
+        stats: &Stats,
+        elapsed: Duration,
+    ) -> UploadState {
+        let (user, pass) = credentials;
+        match self.api.login(&user, &pass) {
+            Ok(r) => {
+                let _ = self.token_store.save(&r.token);
+                self.token = Some(r.token);
+                self.perform_upload(stats, elapsed)
+            }
+            Err(e) => UploadState::Failed {
+                message: "自动重登失败，请手动重新登录".to_string(),
+                need_relogin: true,
+                detail: Some(api_error_text(&e)),
+            },
+        }
     }
 
     /// 执行上传：构造 payload → 调网关 → 处理结果（成功则写剪贴板）。纯状态产出，不修改自身。
@@ -277,6 +335,7 @@ impl App {
             return UploadState::Failed {
                 message: "未登录，无法上传成绩".to_string(),
                 need_relogin: true,
+                detail: None,
             };
         };
         let upload = to_upload_stats(stats, elapsed);
@@ -294,10 +353,16 @@ impl App {
             }
             Err(e) => {
                 let need_relogin = is_auth_failure(&e);
-                let message = api_error_text(&e);
+                // 登录失效：主文案用友好提示，原始服务器错误降级为次要信息。
+                let (message, detail) = if need_relogin {
+                    ("登录已失效，请重新登录".to_string(), Some(api_error_text(&e)))
+                } else {
+                    (api_error_text(&e), None)
+                };
                 UploadState::Failed {
                     message,
                     need_relogin,
+                    detail,
                 }
             }
         }
@@ -901,13 +966,17 @@ fn upload_lines(upload: &UploadState) -> Vec<Line<'static>> {
         UploadState::Failed {
             message,
             need_relogin,
+            detail,
         } => {
             let mut lines = vec![
                 Line::from(""),
                 Line::from(format!(" 上传失败: {message}")).red(),
             ];
+            if let Some(d) = detail {
+                lines.push(Line::from(format!(" 原始错误: {d}")).gray());
+            }
             if *need_relogin {
-                lines.push(Line::from(" 登录已失效，请 Ctrl-O 重新登录").yellow());
+                lines.push(Line::from(" 请按 Ctrl-O 重新登录").yellow());
             }
             lines
         }
@@ -964,6 +1033,71 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("dazitui-tui-{stamp}-{suffix}"));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// 临时 token 存储：隔离本机 `~/.config/dazitui/token`（避免测试依赖真实 token 文件）。
+    fn temp_token_store() -> TokenStore {
+        let dir = temp_dir("token");
+        TokenStore::new(dir.join("token"))
+    }
+
+    /// 测试用 App：临时 token 存储 + 不可达 API（无 token 文件时不发网络请求）。
+    fn test_app(text: Text) -> App {
+        App::new_with(
+            text,
+            temp_token_store(),
+            ApiClient::with_base_url("http://127.0.0.1:1"),
+        )
+    }
+
+    /// 起本地 mock HTTP 服务器：按请求路径返回固定响应（按 `responses` 长度 accept 次数）。
+    /// 返回 `(端口, 线程句柄)`，`responses` 为 `(请求路径, 响应体)` 列表。
+    fn mock_server(
+        responses: &[(&str, &str)],
+    ) -> (u16, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let responses: Vec<(String, String)> = responses
+            .iter()
+            .map(|(p, b)| (p.to_string(), b.to_string()))
+            .collect();
+        let n = responses.len();
+        let handle = std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader, Read, Write};
+            for _ in 0..n {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                let _ = reader.read_line(&mut request_line);
+                let path = request_line.split_whitespace().nth(1).unwrap_or("");
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap() == 0
+                        || line == "\r\n"
+                        || line == "\n"
+                    {
+                        break;
+                    }
+                    if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        content_length = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body_buf = vec![0u8; content_length];
+                let _ = reader.read_exact(&mut body_buf);
+                let body = responses
+                    .iter()
+                    .find(|(p, _)| p == path)
+                    .map(|(_, b)| b.clone())
+                    .unwrap_or_else(|| r#"{"error":1,"msg":"unexpected path"}"#.to_string());
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        (port, handle)
     }
 
     #[test]
@@ -1150,7 +1284,7 @@ mod tests {
         let dir = temp_dir("load");
         let path = dir.join("a.txt");
         fs::write(&path, "你好， 世界。\n第二行").unwrap();
-        let mut app = App::new(Text {
+        let mut app = test_app(Text {
             title: "old".into(),
             content: "旧赛文".into(),
             source: TextSource::File,
@@ -1176,7 +1310,7 @@ mod tests {
         let dir = temp_dir("loaderr");
         let path = dir.join("empty.txt");
         fs::write(&path, "").unwrap();
-        let mut app = App::new(Text {
+        let mut app = test_app(Text {
             title: "old".into(),
             content: "旧赛文".into(),
             source: TextSource::File,
@@ -1282,7 +1416,7 @@ mod tests {
 
     #[test]
     fn submit_login_rejects_empty_fields_without_network() {
-        let mut app = App::new(Text {
+        let mut app = test_app(Text {
             title: "t".into(),
             content: "c".into(),
             source: TextSource::File,
@@ -1322,7 +1456,7 @@ mod tests {
 
     #[test]
     fn download_online_without_token_guides_login() {
-        let mut app = App::new(Text {
+        let mut app = test_app(Text {
             title: "t".into(),
             content: "c".into(),
             source: TextSource::File,
@@ -1378,6 +1512,7 @@ mod tests {
         let lines = upload_lines(&UploadState::Failed {
             message: "网络连接失败".into(),
             need_relogin: false,
+            detail: None,
         });
         assert!(
             lines
@@ -1385,17 +1520,19 @@ mod tests {
                 .any(|l| l.to_string().contains("上传失败: 网络连接失败"))
         );
         assert!(lines.iter().all(|l| !l.to_string().contains("重新登录")));
-        // 失败且鉴权失效：提示重新登录。
+        // 失败且鉴权失效：提示重新登录；原始错误降级为次要信息。
         let lines = upload_lines(&UploadState::Failed {
-            message: "用户名不能为空！".into(),
+            message: "登录已失效，请重新登录".into(),
             need_relogin: true,
+            detail: Some("用户名不能为空！".into()),
         });
         assert!(lines.iter().any(|l| l.to_string().contains("重新登录")));
+        assert!(lines.iter().any(|l| l.to_string().contains("原始错误: 用户名不能为空！")));
     }
 
     #[test]
     fn perform_upload_without_token_fails_with_relogin() {
-        let mut app = App::new(online_text("你好世界"));
+        let mut app = test_app(online_text("你好世界"));
         app.token = None;
         let stats = app.session.finish(Duration::from_secs(10));
         let up = app.perform_upload(&stats, Duration::from_secs(10));
@@ -1404,13 +1541,14 @@ mod tests {
             UploadState::Failed {
                 message: "未登录，无法上传成绩".to_string(),
                 need_relogin: true,
+                detail: None,
             }
         );
     }
 
     #[test]
     fn perform_upload_network_failure_is_not_relogin() {
-        let mut app = App::new(online_text("你好世界"));
+        let mut app = test_app(online_text("你好世界"));
         app.token = Some("dead-token".into());
         // 指向必然拒绝连接的地址，验证网络错误被友好化。
         app.api = ApiClient::with_base_url("http://127.0.0.1:1");
@@ -1421,6 +1559,7 @@ mod tests {
             UploadState::Failed {
                 message: "网络连接失败".to_string(),
                 need_relogin: false,
+                detail: None,
             }
         );
     }
@@ -1455,7 +1594,7 @@ mod tests {
             );
             let _ = stream.write_all(resp.as_bytes());
         });
-        let mut app = App::new(online_text("你好世界"));
+        let mut app = test_app(online_text("你好世界"));
         app.token = Some("tok".into());
         app.api = ApiClient::with_base_url(&format!("http://127.0.0.1:{port}"));
         let stats = app.session.finish(Duration::from_secs(40));
@@ -1471,7 +1610,7 @@ mod tests {
     #[test]
     fn finish_typing_offline_no_upload_online_uploading() {
         // 离线：直接进入成绩视图，无上传。
-        let mut app = App::new(Text {
+        let mut app = test_app(Text {
             title: "t".into(),
             content: "你好".into(),
             source: TextSource::File,
@@ -1486,7 +1625,7 @@ mod tests {
             }
         ));
         // 在线：进入成绩视图并置为「上传中」，返回成绩与用时。
-        let mut app = App::new(online_text("你好"));
+        let mut app = test_app(online_text("你好"));
         app.session.type_text("你好");
         assert!(app.finish_typing().is_some());
         assert!(matches!(
@@ -1496,5 +1635,181 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    // ---- T9 成绩上传可靠性：token 校验 + 自动重登 ----
+
+    fn file_text(content: &str) -> Text {
+        Text {
+            title: "t".into(),
+            content: content.into(),
+            source: TextSource::File,
+        }
+    }
+
+    #[test]
+    fn startup_with_stale_token_logs_out() {
+        // 已保存 token 失效（getBaseInfo isLogin:0）→ 视为未登录 + 提示重登。
+        let store = temp_token_store();
+        store.save("stale-token").unwrap();
+        let (port, handle) = mock_server(&[(
+            "/Api/System/getBaseInfo",
+            r#"{"error":0,"msg":{"isLogin":0}}"#,
+        )]);
+        let api = ApiClient::with_base_url(&format!("http://127.0.0.1:{port}"));
+        let app = App::new_with(file_text("你好"), store, api);
+        handle.join().unwrap();
+        assert!(app.token.is_none());
+        assert_eq!(app.login_notice.as_deref(), Some("登录已失效，请重新登录"));
+    }
+
+    #[test]
+    fn startup_with_valid_token_keeps_login() {
+        let store = temp_token_store();
+        store.save("good-token").unwrap();
+        let (port, handle) = mock_server(&[(
+            "/Api/System/getBaseInfo",
+            r#"{"error":0,"msg":{"isLogin":1}}"#,
+        )]);
+        let api = ApiClient::with_base_url(&format!("http://127.0.0.1:{port}"));
+        let app = App::new_with(file_text("你好"), store, api);
+        handle.join().unwrap();
+        assert_eq!(app.token.as_deref(), Some("good-token"));
+        assert!(app.login_notice.is_none());
+    }
+
+    #[test]
+    fn startup_probe_failure_keeps_login() {
+        // 探测失败（网络异常）→ 保持现状，不阻塞启动、不误报未登录。
+        let store = temp_token_store();
+        store.save("tok").unwrap();
+        let app = App::new_with(
+            file_text("你好"),
+            store,
+            ApiClient::with_base_url("http://127.0.0.1:1"),
+        );
+        assert_eq!(app.token.as_deref(), Some("tok"));
+        assert!(app.login_notice.is_none());
+    }
+
+    #[test]
+    fn download_online_with_stale_token_guides_relogin() {
+        // 载文前校验：token 在运行期间失效（启动时有效，载文前已过期）→ 引导重登，
+        // 不发起 getContent（赛文不被替换）。
+        let store = temp_token_store();
+        store.save("stale").unwrap();
+        // 启动时探测失败（网络异常）→ token 保留。
+        let mut app = App::new_with(
+            online_text("你好世界"),
+            store,
+            ApiClient::with_base_url("http://127.0.0.1:1"),
+        );
+        assert_eq!(app.token.as_deref(), Some("stale"));
+        // 载文前换成失效探测的 mock。
+        let (port, handle) = mock_server(&[(
+            "/Api/System/getBaseInfo",
+            r#"{"error":0,"msg":{"isLogin":0}}"#,
+        )]);
+        app.api = ApiClient::with_base_url(&format!("http://127.0.0.1:{port}"));
+        app.online_loading = Some(CompetitionType::Jisu);
+        app.download_online(CompetitionType::Jisu);
+        handle.join().unwrap();
+        assert!(app.online_loading.is_none());
+        assert_eq!(app.online_error.as_deref(), Some("登录已失效，请重新登录"));
+        assert_eq!(app.text.title, "锦标赛第3279期"); // 原赛文保留
+    }
+
+    #[test]
+    fn download_online_probe_failure_allows_continue() {
+        // 探测失败（网络异常）→ 允许继续载文；getContent 也失败时按网络错误提示。
+        let store = temp_token_store();
+        store.save("tok").unwrap();
+        let mut app = App::new_with(
+            online_text("你好世界"),
+            store,
+            ApiClient::with_base_url("http://127.0.0.1:1"),
+        );
+        app.online_loading = Some(CompetitionType::Jisu);
+        app.download_online(CompetitionType::Jisu);
+        assert!(app.online_loading.is_none());
+        assert_eq!(app.online_error.as_deref(), Some("网络连接失败"));
+    }
+
+    #[test]
+    fn perform_upload_auth_failure_shows_friendly_message() {
+        // 服务器返回「用户名不能为空！」→ 主文案友好化，原始错误降级为 detail。
+        let (port, handle) = mock_server(&[(
+            "/Api/Rank/uploadResult",
+            r#"{"error":1,"msg":"用户名不能为空！"}"#,
+        )]);
+        let mut app = test_app(online_text("你好世界"));
+        app.token = Some("dead-token".into());
+        app.api = ApiClient::with_base_url(&format!("http://127.0.0.1:{port}"));
+        let stats = app.session.finish(Duration::from_secs(10));
+        let up = app.perform_upload(&stats, Duration::from_secs(10));
+        handle.join().unwrap();
+        assert_eq!(
+            up,
+            UploadState::Failed {
+                message: "登录已失效，请重新登录".to_string(),
+                need_relogin: true,
+                detail: Some("用户名不能为空！".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn retry_after_relogin_relogins_and_uploads() {
+        // 自动重登成功：token 更新为新值，并重试上传成功。
+        let (port, handle) = mock_server(&[
+            ("/Api/User/login", r#"{"error":0,"msg":{"token":"new-tok"}}"#),
+            (
+                "/Api/Rank/uploadResult",
+                r#"{"error":0,"msg":{"ranking":5,"rankTips":"恭喜获得第5名"}}"#,
+            ),
+        ]);
+        let mut app = test_app(online_text("你好世界"));
+        app.token = Some("old-tok".into());
+        app.api = ApiClient::with_base_url(&format!("http://127.0.0.1:{port}"));
+        let stats = app.session.finish(Duration::from_secs(40));
+        let up = app.retry_after_relogin(
+            ("user".into(), "pass".into()),
+            &stats,
+            Duration::from_secs(40),
+        );
+        handle.join().unwrap();
+        assert_eq!(app.token.as_deref(), Some("new-tok"));
+        assert!(matches!(
+            &up,
+            UploadState::Success { ranking, .. } if ranking.as_deref() == Some("5")
+        ));
+    }
+
+    #[test]
+    fn retry_after_relogin_failed_login_keeps_failure() {
+        // 自动重登失败：保留失败状态、附重登原始错误，token 不变。
+        let (port, handle) = mock_server(&[(
+            "/Api/User/login",
+            r#"{"error":1,"msg":"您的用户名或密码错误！"}"#,
+        )]);
+        let mut app = test_app(online_text("你好世界"));
+        app.token = Some("old-tok".into());
+        app.api = ApiClient::with_base_url(&format!("http://127.0.0.1:{port}"));
+        let stats = app.session.finish(Duration::from_secs(10));
+        let up = app.retry_after_relogin(
+            ("user".into(), "pass".into()),
+            &stats,
+            Duration::from_secs(10),
+        );
+        handle.join().unwrap();
+        assert_eq!(app.token.as_deref(), Some("old-tok"));
+        assert_eq!(
+            up,
+            UploadState::Failed {
+                message: "自动重登失败，请手动重新登录".to_string(),
+                need_relogin: true,
+                detail: Some("您的用户名或密码错误！".to_string()),
+            }
+        );
     }
 }
