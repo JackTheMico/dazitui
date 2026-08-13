@@ -69,6 +69,13 @@ impl CompetitionType {
     }
 }
 
+impl Text {
+    /// 是否在线赛文（来自 52dazi.cn）。在线赛文跟打时禁用重打。
+    pub fn is_online(&self) -> bool {
+        matches!(self.source, TextSource::Online { .. })
+    }
+}
+
 /// 载文失败的分类。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LoadError {
@@ -309,5 +316,23 @@ mod tests {
             load_text_from_file_with_options(&path, &opts).expect_err("全符号文件去符号后应报空");
         assert_eq!(err, LoadError::Empty);
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn text_is_online_distinguishes_source() {
+        let file_text = Text {
+            title: "f".into(),
+            content: "c".into(),
+            source: TextSource::File,
+        };
+        let online_text = Text {
+            title: "o".into(),
+            content: "c".into(),
+            source: TextSource::Online {
+                competition_type: CompetitionType::Jisu,
+            },
+        };
+        assert!(!file_text.is_online());
+        assert!(online_text.is_online());
     }
 }

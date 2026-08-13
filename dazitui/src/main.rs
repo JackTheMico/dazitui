@@ -299,7 +299,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                             app.open_browser();
                             continue;
                         }
-                        if is_restart(key) {
+                        if restart_allowed(key, app.text.is_online()) {
                             app.restart();
                             continue;
                         }
@@ -323,8 +323,10 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                         }
                     }
                     AppState::Finished(_) => {
-                        // 任意键重打同一篇赛文
-                        app.restart();
+                        // 离线赛文：任意键重打同一篇；在线赛文不支持重打。
+                        if !app.text.is_online() {
+                            app.restart();
+                        }
                     }
                     AppState::Browsing => match key.code {
                         KeyCode::Up => {
@@ -369,6 +371,22 @@ fn is_early_finish(key: KeyEvent) -> bool {
 /// 重打快捷键：Ctrl-R（Restart）。
 fn is_restart(key: KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('r')
+}
+
+/// 是否允许重打：离线赛文按 Ctrl-R 重打；在线赛文禁用重打。
+fn restart_allowed(key: KeyEvent, is_online: bool) -> bool {
+    is_restart(key) && !is_online
+}
+
+/// 底部快捷键提示栏文案：按浏览状态与赛文来源动态切换（在线赛文不显示重打）。
+fn hint_text(browsing: bool, is_online: bool) -> &'static str {
+    if browsing {
+        " ↑↓ 选择 | Enter 载入 | Esc 取消 | 1 去空格 | 2 去符号 | q 退出"
+    } else if is_online {
+        " q 退出 | Ctrl-S 结束 | Ctrl-F 载文 | Ctrl-O 登录 | Tab 收起栏 "
+    } else {
+        " q 退出 | Ctrl-S 结束 | Ctrl-R 重打 | Ctrl-F 载文 | Ctrl-O 登录 | Tab 收起栏 "
+    }
 }
 
 /// 进入载文浏览快捷键：Ctrl-F（File）。
@@ -534,11 +552,7 @@ fn ui(frame: &mut Frame, app: &App) {
     }
 
     // 底部快捷键提示 bar
-    let hint = if browsing {
-        " ↑↓ 选择 | Enter 载入 | Esc 取消 | 1 去空格 | 2 去符号 | q 退出"
-    } else {
-        " q 退出 | Ctrl-S 结束 | Ctrl-R 重打 | Ctrl-F 载文 | Ctrl-O 登录 | Tab 收起栏 "
-    };
+    let hint = hint_text(browsing, app.text.is_online());
     frame.render_widget(Paragraph::new(Line::from(hint)), help_bar);
 
     // 登录模态框（覆盖层）
@@ -747,7 +761,12 @@ fn render_result_view(frame: &mut Frame, app: &App, stats: &Stats) {
     let mut all = lines;
     all.extend(freq_lines);
     all.push(Line::from(""));
-    all.push(Line::from(" 按任意键重打 | q 退出").gray());
+    if app.text.is_online() {
+        // 在线赛文不支持重打，只能退出或载入其他赛文。
+        all.push(Line::from(" q 退出 | Ctrl-F 载文").gray());
+    } else {
+        all.push(Line::from(" 按任意键重打 | q 退出").gray());
+    }
     frame.render_widget(
         Paragraph::new(all)
             .block(Block::bordered().title(" 成绩 "))
@@ -863,6 +882,30 @@ mod tests {
             KeyCode::Char('r'),
             KeyModifiers::NONE
         )));
+    }
+
+    #[test]
+    fn restart_allowed_only_when_offline() {
+        let ctrl_r = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
+        // 离线赛文：Ctrl-R 允许重打。
+        assert!(restart_allowed(ctrl_r, false));
+        // 在线赛文：Ctrl-R 被禁用。
+        assert!(!restart_allowed(ctrl_r, true));
+        // 非重打键：无论在线与否都不触发。
+        let other = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        assert!(!restart_allowed(other, false));
+        assert!(!restart_allowed(other, true));
+    }
+
+    #[test]
+    fn hint_text_hides_restart_when_online() {
+        // 离线跟打：显示重打提示。
+        assert!(hint_text(false, false).contains("重打"));
+        // 在线跟打：不显示重打提示。
+        assert!(!hint_text(false, true).contains("重打"));
+        // 浏览态（载文选择）与来源无关，也不显示重打。
+        assert!(!hint_text(true, false).contains("重打"));
+        assert!(!hint_text(true, true).contains("重打"));
     }
 
     #[test]
