@@ -9,7 +9,7 @@ use dazitui_core::{
     Session, Settings, SettingsStore, Stats, Text, TextSource, Theme, TokenStore,
     build_upload_payload, env_credentials, format_share_text, is_auth_failure, load_text_from_file,
     load_text_from_file_with_options, osc_font_size_sequence, osc52_clipboard, should_auto_relogin,
-    to_upload_stats, token_is_valid,
+    to_upload_stats,
 };
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -137,18 +137,12 @@ impl App {
     ) -> Self {
         let session = Session::new(&text.content);
         let settings = settings_store.load();
-        // 免登录：加载已保存的 token，并探测其有效性（getBaseInfo 的 isLogin）。
+        // 免登录：加载已保存的 token，直接保持登录（与 52dazi 前端一致：本地有 token 即视为已登录）。
+        // token 有效性不做实时探测——服务器不提供可靠的只读校验接口（getBaseInfo 的 isLogin 恒为 0），
+        // 唯一真实校验发生在上传时（uploadResult），失败会走「登录已失效」提示与自动重登。
         let saved_token = token_store.load();
-        // 已保存 token 的启动处理：
-        // - 有效 → 保持登录；
-        // - 失效 → 视为未登录（保留 token 文件，提示重新登录），消除「已登录」假象；
-        // - 探测失败（网络异常）→ 保持现状，不阻塞启动。
         let (token, login_notice) = if let Some(t) = saved_token {
-            match api.get_base_info(&t) {
-                Ok(info) if token_is_valid(info.is_login) => (Some(t), None),
-                Ok(_) => (None, Some("登录已失效，请重新登录".to_string())),
-                Err(_) => (Some(t), None),
-            }
+            (Some(t), None)
         } else if let Some((user, pass)) = env_credentials(|k| std::env::var(k).ok()) {
             match api.login(&user, &pass) {
                 Ok(r) => {
@@ -317,22 +311,14 @@ impl App {
     /// 调用前 `online_loading` 已由事件循环置为 `Some` 并渲染（保证「加载中...」可见）；
     /// 这里执行同步下载，成功后替换赛文，失败则回填错误提示。
     ///
-    /// 发起 getContent 前先探测 token 有效性：失效引导重新登录（避免「能载文、
-    /// 不能上传」）；探测失败（网络异常）时允许继续，不因探测故障阻断正常载文。
+    /// 不做 token 有效性预探测：getBaseInfo 的 isLogin 恒为 0、无法反映登录态，
+    /// token 有效性唯一由上传接口（uploadResult）真实校验，失败走「登录已失效」提示。
     fn download_online(&mut self, competition_type: CompetitionType) {
         let Some(token) = self.token.clone() else {
             self.online_loading = None;
             self.online_error = Some("请先登录 52dazi（Ctrl-O）".to_string());
             return;
         };
-        match self.api.get_base_info(&token) {
-            Ok(info) if !token_is_valid(info.is_login) => {
-                self.online_loading = None;
-                self.online_error = Some("登录已失效，请重新登录".to_string());
-                return;
-            }
-            _ => {}
-        }
         match self.api.get_content(&token, competition_type) {
             Ok(comp) => {
                 self.text = Text {
@@ -2052,82 +2038,49 @@ mod tests {
     }
 
     #[test]
-    fn startup_with_stale_token_logs_out() {
-        // 已保存 token 失效（getBaseInfo isLogin:0）→ 视为未登录 + 提示重登。
+    fn startup_with_saved_token_keeps_login() {
+        // 本地有已保存 token → 直接保持登录，不做实时探测（getBaseInfo 的 isLogin 恒为 0，不可靠）。
         let store = temp_token_store();
-        store.save("stale-token").unwrap();
-        let (port, handle) = mock_server(&[(
-            "/Api/System/getBaseInfo",
-            r#"{"error":0,"msg":{"isLogin":0}}"#,
-        )]);
-        let api = ApiClient::with_base_url(&format!("http://127.0.0.1:{port}"));
-        let app = App::new_with(file_text("你好"), store, api, temp_settings_store());
-        handle.join().unwrap();
-        assert!(app.token.is_none());
-        assert_eq!(app.login_notice.as_deref(), Some("登录已失效，请重新登录"));
-    }
-
-    #[test]
-    fn startup_with_valid_token_keeps_login() {
-        let store = temp_token_store();
-        store.save("good-token").unwrap();
-        let (port, handle) = mock_server(&[(
-            "/Api/System/getBaseInfo",
-            r#"{"error":0,"msg":{"isLogin":1}}"#,
-        )]);
-        let api = ApiClient::with_base_url(&format!("http://127.0.0.1:{port}"));
-        let app = App::new_with(file_text("你好"), store, api, temp_settings_store());
-        handle.join().unwrap();
-        assert_eq!(app.token.as_deref(), Some("good-token"));
-        assert!(app.login_notice.is_none());
-    }
-
-    #[test]
-    fn startup_probe_failure_keeps_login() {
-        // 探测失败（网络异常）→ 保持现状，不阻塞启动、不误报未登录。
-        let store = temp_token_store();
-        store.save("tok").unwrap();
+        store.save("saved-token").unwrap();
         let app = App::new_with(
             file_text("你好"),
             store,
-            ApiClient::with_base_url("http://127.0.0.1:1"),
+            ApiClient::with_base_url("http://127.0.0.1:1"), // 不发网络请求
             temp_settings_store(),
         );
-        assert_eq!(app.token.as_deref(), Some("tok"));
+        assert_eq!(app.token.as_deref(), Some("saved-token"));
         assert!(app.login_notice.is_none());
     }
 
     #[test]
-    fn download_online_with_stale_token_guides_relogin() {
-        // 载文前校验：token 在运行期间失效（启动时有效，载文前已过期）→ 引导重登，
-        // 不发起 getContent（赛文不被替换）。
+    fn download_online_with_token_loads_content() {
+        // 有 token → 直接载文（不做 isLogin 预探测），getContent 成功后替换赛文进入跟打。
         let store = temp_token_store();
-        store.save("stale").unwrap();
-        // 启动时探测失败（网络异常）→ token 保留。
+        store.save("tok").unwrap();
+        let (port, handle) = mock_server(&[(
+            "/Api/Text/getContent",
+            r#"{"error":0,"msg":{"0":"你好世界内容","7":"极速杯第3280期"}}"#,
+        )]);
         let mut app = App::new_with(
-            online_text("你好世界"),
+            online_text("旧赛文"),
             store,
-            ApiClient::with_base_url("http://127.0.0.1:1"),
+            ApiClient::with_base_url(&format!("http://127.0.0.1:{port}")),
             temp_settings_store(),
         );
-        assert_eq!(app.token.as_deref(), Some("stale"));
-        // 载文前换成失效探测的 mock。
-        let (port, handle) = mock_server(&[(
-            "/Api/System/getBaseInfo",
-            r#"{"error":0,"msg":{"isLogin":0}}"#,
-        )]);
-        app.api = ApiClient::with_base_url(&format!("http://127.0.0.1:{port}"));
         app.online_loading = Some(CompetitionType::Jisu);
         app.download_online(CompetitionType::Jisu);
         handle.join().unwrap();
         assert!(app.online_loading.is_none());
-        assert_eq!(app.online_error.as_deref(), Some("登录已失效，请重新登录"));
-        assert_eq!(app.text.title, "锦标赛第3279期"); // 原赛文保留
+        assert!(app.online_error.is_none());
+        assert_eq!(app.text.title, "极速杯第3280期");
+        assert_eq!(app.text.content, "你好世界内容");
+        assert!(matches!(app.text.source, TextSource::Online { .. }));
+        assert!(matches!(app.state, AppState::Typing));
     }
 
     #[test]
-    fn download_online_probe_failure_allows_continue() {
-        // 探测失败（网络异常）→ 允许继续载文；getContent 也失败时按网络错误提示。
+    fn download_online_network_error_shows_error() {
+        // getContent 网络失败 → 按网络错误提示，不误报「登录已失效」。
         let store = temp_token_store();
         store.save("tok").unwrap();
         let mut app = App::new_with(

@@ -31,13 +31,6 @@ pub fn is_auth_failure(err: &ApiError) -> bool {
     }
 }
 
-/// token 是否有效：由 `getBaseInfo` 探测结果（`isLogin`）判定。
-///
-/// TUI 层启动时与载文前共用此单一判定点，避免两处逻辑漂移。
-pub fn token_is_valid(is_login: bool) -> bool {
-    is_login
-}
-
 /// 是否应自动重新登录：上传失败因登录失效，且环境变量凭据可用。
 ///
 /// 纯决策函数：`need_relogin`（`is_auth_failure` 命中）与 `has_env_credentials`
@@ -114,12 +107,6 @@ mod tests {
     fn is_auth_failure_ignores_transport_and_parse() {
         assert!(!is_auth_failure(&ApiError::Transport("连接失败".into())));
         assert!(!is_auth_failure(&ApiError::Parse("无效 JSON".into())));
-    }
-
-    #[test]
-    fn token_is_valid_follows_is_login() {
-        assert!(token_is_valid(true));
-        assert!(!token_is_valid(false));
     }
 
     #[test]

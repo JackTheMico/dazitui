@@ -12,9 +12,9 @@ pub use settings::{
 };
 
 #[cfg(feature = "online")]
-pub use online::auth::{env_credentials, is_auth_failure, should_auto_relogin, token_is_valid};
+pub use online::auth::{env_credentials, is_auth_failure, should_auto_relogin};
 #[cfg(feature = "online")]
-pub use online::client::{ApiClient, ApiError, BaseInfo, CompetitionText, LoginResult, RankResult};
+pub use online::client::{ApiClient, ApiError, CompetitionText, LoginResult, RankResult};
 #[cfg(feature = "online")]
 pub use online::protocol::{ProtocolError, build_request, decrypt, encrypt, parse_json};
 #[cfg(feature = "online")]
