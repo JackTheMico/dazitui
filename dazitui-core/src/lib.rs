@@ -1,11 +1,13 @@
 use std::path::Path;
 
 mod session;
+mod settings;
 
 #[cfg(feature = "online")]
 mod online;
 
 pub use session::{CharStatus, Session, Stats, TypeResult};
+pub use settings::{Rgb, Settings, SettingsStore, Theme, ThemePreset};
 
 #[cfg(feature = "online")]
 pub use online::auth::{env_credentials, is_auth_failure, should_auto_relogin, token_is_valid};

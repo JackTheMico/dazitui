@@ -5,10 +5,11 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use dazitui_core::{
-    ApiClient, ApiError, CharStatus, CompetitionType, LoadError, LoadOptions, Session, Stats, Text,
-    TextSource, TokenStore, build_upload_payload, env_credentials, format_share_text,
-    is_auth_failure, load_text_from_file, load_text_from_file_with_options, osc52_clipboard,
-    should_auto_relogin, to_upload_stats, token_is_valid,
+    ApiClient, ApiError, CharStatus, CompetitionType, LoadError, LoadOptions, Rgb, Session,
+    Settings, SettingsStore, Stats, Text, TextSource, Theme, ThemePreset, TokenStore,
+    build_upload_payload, env_credentials, format_share_text, is_auth_failure,
+    load_text_from_file, load_text_from_file_with_options, osc52_clipboard, should_auto_relogin,
+    to_upload_stats, token_is_valid,
 };
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -25,6 +26,8 @@ enum AppState {
     Finished { stats: Stats, upload: UploadState },
     /// 载文浏览：功能栏显示文件列表，可预览与载入。
     Browsing,
+    /// 设置视图：切换主题等外观设置。
+    Settings,
 }
 
 /// 成绩视图里的成绩上传状态（在线赛文完成跟打后自动上传）。
@@ -78,6 +81,10 @@ struct App {
     online_loading: Option<CompetitionType>,
     /// 在线载文错误提示（展示在功能栏）。
     online_error: Option<String>,
+    /// 外观设置。
+    settings: Settings,
+    /// 设置持久化存储。
+    settings_store: SettingsStore,
 }
 
 /// 登录模态框输入状态。
@@ -103,12 +110,23 @@ enum LoginAction {
 
 impl App {
     fn new(text: Text) -> Self {
-        Self::new_with(text, TokenStore::with_default_path(), ApiClient::new())
+        Self::new_with(
+            text,
+            TokenStore::with_default_path(),
+            ApiClient::new(),
+            SettingsStore::with_default_path(),
+        )
     }
 
-    /// 指定 token 存储与 API 客户端（测试注入；生产用 `new`）。
-    fn new_with(text: Text, token_store: TokenStore, api: ApiClient) -> Self {
+    /// 指定 token 存储、API 客户端与设置存储（测试注入；生产用 `new`）。
+    fn new_with(
+        text: Text,
+        token_store: TokenStore,
+        api: ApiClient,
+        settings_store: SettingsStore,
+    ) -> Self {
         let session = Session::new(&text.content);
+        let settings = settings_store.load();
         // 免登录：加载已保存的 token，并探测其有效性（getBaseInfo 的 isLogin）。
         let saved_token = token_store.load();
         // 已保存 token 的启动处理：
@@ -149,7 +167,26 @@ impl App {
             login_notice,
             online_loading: None,
             online_error: None,
+            settings,
+            settings_store,
         }
+    }
+
+    /// 当前主题的语义色板。
+    fn theme(&self) -> Theme {
+        Theme::preset(self.settings.theme)
+    }
+
+    /// 切换到下一主题并即时持久化。
+    fn next_theme(&mut self) {
+        self.settings.theme = self.settings.theme.next();
+        let _ = self.settings_store.save(&self.settings);
+    }
+
+    /// 切换到上一主题并即时持久化。
+    fn prev_theme(&mut self) {
+        self.settings.theme = self.settings.theme.prev();
+        let _ = self.settings_store.save(&self.settings);
     }
 
     /// 打开登录模态框。
@@ -445,6 +482,10 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                             app.open_browser();
                             continue;
                         }
+                        if is_open_settings(key) {
+                            app.state = AppState::Settings;
+                            continue;
+                        }
                         if restart_allowed(key, app.text.is_online()) {
                             app.restart();
                             continue;
@@ -494,6 +535,12 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                         }
                         _ => {}
                     },
+                    AppState::Settings => match key.code {
+                        KeyCode::Up | KeyCode::Left => app.prev_theme(),
+                        KeyCode::Down | KeyCode::Right => app.next_theme(),
+                        KeyCode::Esc => app.state = AppState::Typing,
+                        _ => {}
+                    },
                 }
             }
             Event::Paste(committed) => {
@@ -540,11 +587,11 @@ fn restart_allowed(key: KeyEvent, is_online: bool) -> bool {
 /// 底部快捷键提示栏文案：按浏览状态与赛文来源动态切换（在线赛文不显示重打）。
 fn hint_text(browsing: bool, is_online: bool) -> &'static str {
     if browsing {
-        " ↑↓ 选择 | Enter 载入 | Esc 取消 | 1 去空格 | 2 去符号 | q 退出"
+        " ↑↓ 选择 | Enter 载入 | Esc 取消 | 1 去空格 | 2 去符号 | Ctrl-E 设置 | q 退出"
     } else if is_online {
-        " q 退出 | Ctrl-S 结束 | Ctrl-F 载文 | Ctrl-O 登录 | Tab 收起栏 "
+        " q 退出 | Ctrl-S 结束 | Ctrl-F 载文 | Ctrl-O 登录 | Ctrl-E 设置 | Tab 收起栏 "
     } else {
-        " q 退出 | Ctrl-S 结束 | Ctrl-R 重打 | Ctrl-F 载文 | Ctrl-O 登录 | Tab 收起栏 "
+        " q 退出 | Ctrl-S 结束 | Ctrl-R 重打 | Ctrl-F 载文 | Ctrl-O 登录 | Ctrl-E 设置 | Tab 收起栏 "
     }
 }
 
@@ -584,6 +631,11 @@ fn is_open_login(key: KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('o')
 }
 
+/// 打开设置视图快捷键：Ctrl-E（Edit settings）。
+fn is_open_settings(key: KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('e')
+}
+
 /// 三个比赛入口快捷键：F1=极速杯、F2=锦标赛、F3=键神杯。
 fn online_shortcut(key: KeyEvent) -> Option<CompetitionType> {
     if !key.modifiers.is_empty() {
@@ -611,6 +663,16 @@ fn write_clipboard(text: &str) {
     use crossterm::style::Print;
     let seq = osc52_clipboard(text);
     let _ = crossterm::execute!(std::io::stdout(), Print(seq));
+}
+
+/// core 的 `Rgb` 转 ratatui `Color`。
+fn color(rgb: Rgb) -> Color {
+    Color::Rgb(rgb.0, rgb.1, rgb.2)
+}
+
+/// 带主题边框色（text 槽位）的边框块。
+fn themed_block(theme: Theme) -> Block<'static> {
+    Block::bordered().border_style(Style::default().fg(color(theme.text)))
 }
 
 /// 处理登录模态框按键，返回动作。
@@ -677,6 +739,10 @@ fn ui(frame: &mut Frame, app: &App) {
         render_result_view(frame, app, stats, upload);
         return;
     }
+    if matches!(app.state, AppState::Settings) {
+        render_settings(frame, app);
+        return;
+    }
     let browsing = matches!(app.state, AppState::Browsing);
     // 整体：主区 + 底部快捷键 bar
     let [main, help_bar] =
@@ -699,15 +765,15 @@ fn ui(frame: &mut Frame, app: &App) {
                 .areas(content);
         // 上：对照原文区（已跟打部分绿/红着色）
         frame.render_widget(
-            Paragraph::new(original_line(&app.session))
-                .block(Block::bordered().title(format!(" 对照区 — {} ", app.text.title)))
+            Paragraph::new(original_line(&app.session, app.theme()))
+                .block(themed_block(app.theme()).title(format!(" 对照区 — {} ", app.text.title)))
                 .wrap(Wrap { trim: false }),
             ref_area,
         );
         // 下：跟打区（实时绿/红渲染）
         frame.render_widget(
-            Paragraph::new(type_line(&app.session))
-                .block(Block::bordered().title(format!(
+            Paragraph::new(type_line(&app.session, app.theme()))
+                .block(themed_block(app.theme()).title(format!(
                     " 跟打区 — {}/{} 字符 ",
                     app.session.len(),
                     app.text.content.chars().count()
@@ -723,12 +789,12 @@ fn ui(frame: &mut Frame, app: &App) {
 
     // 登录模态框（覆盖层）
     if let Some(form) = &app.login_form {
-        render_login_modal(frame, form);
+        render_login_modal(frame, form, app.theme());
     }
 }
 
 /// 登录模态框：居中弹层，用户名 + 遮蔽密码。
-fn render_login_modal(frame: &mut Frame, form: &LoginForm) {
+fn render_login_modal(frame: &mut Frame, form: &LoginForm, theme: Theme) {
     let area = centered_rect(frame.area(), 62, 9);
     frame.render_widget(Clear, area);
     let mut lines = vec![Line::from(" 登录 52dazi ").bold(), Line::from("")];
@@ -749,15 +815,15 @@ fn render_login_modal(frame: &mut Frame, form: &LoginForm) {
     )));
     lines.push(Line::from(""));
     if form.busy {
-        lines.push(Line::from(" 登录中…").yellow());
+        lines.push(Line::from(" 登录中…").fg(color(theme.warn)));
     } else if let Some(err) = &form.error {
-        lines.push(Line::from(format!(" 错误: {err}")).red());
+        lines.push(Line::from(format!(" 错误: {err}")).fg(color(theme.wrong)));
     } else {
-        lines.push(Line::from(" Enter 登录 | Tab 切换 | Esc 取消").gray());
+        lines.push(Line::from(" Enter 登录 | Tab 切换 | Esc 取消").fg(color(theme.muted)));
     }
     frame.render_widget(
         Paragraph::new(lines)
-            .block(Block::bordered().title(" 登录 "))
+            .block(themed_block(theme).title(" 登录 "))
             .wrap(Wrap { trim: false }),
         area,
     );
@@ -779,11 +845,12 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
 
 /// 左侧功能栏：文件列表 + 载文选项开关。
 fn render_sidebar(frame: &mut Frame, app: &App, area: ratatui::layout::Rect, browsing: bool) {
+    let theme = app.theme();
     let mut lines: Vec<Line> = Vec::new();
     if browsing {
         lines.push(Line::from(" 载入文件:").bold());
         if app.browse_files.is_empty() {
-            lines.push(Line::from("   （无文本文件）").gray());
+            lines.push(Line::from("   （无文本文件）").fg(color(theme.muted)));
         } else {
             for (i, path) in app.browse_files.iter().enumerate() {
                 let name = path
@@ -799,10 +866,10 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: ratatui::layout::Rect, bro
             }
         }
         if let Some(err) = &app.browse_error {
-            lines.push(Line::from(format!(" 错误: {err}")).red());
+            lines.push(Line::from(format!(" 错误: {err}")).fg(color(theme.wrong)));
         }
     } else {
-        lines.push(Line::from(" 载入文件（Ctrl-F）").gray());
+        lines.push(Line::from(" 载入文件（Ctrl-F）").fg(color(theme.muted)));
     }
     lines.push(Line::from(""));
     lines.push(Line::from(" 载文选项:").bold());
@@ -821,13 +888,13 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: ratatui::layout::Rect, bro
     lines.push(Line::from(""));
     lines.push(Line::from(" 在线:").bold());
     let login_entry = if app.token.is_some() {
-        Line::from(" 已登录 52dazi").green()
+        Line::from(" 已登录 52dazi").fg(color(theme.accent))
     } else {
-        Line::from(" 登录 52dazi（Ctrl-O）").yellow()
+        Line::from(" 登录 52dazi（Ctrl-O）").fg(color(theme.warn))
     };
     lines.push(login_entry);
     if let Some(notice) = &app.login_notice {
-        lines.push(Line::from(format!("  {notice}")).gray());
+        lines.push(Line::from(format!("  {notice}")).fg(color(theme.muted)));
     }
     // 三个比赛入口。
     lines.push(Line::from(" F1 极速杯"));
@@ -835,14 +902,14 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: ratatui::layout::Rect, bro
     lines.push(Line::from(" F3 键神杯"));
     // 加载中 / 错误提示。
     if let Some(ct) = app.online_loading {
-        lines.push(Line::from(format!(" 正在载入{}...", ct.name())).cyan());
+        lines.push(Line::from(format!(" 正在载入{}...", ct.name())).fg(color(theme.accent)));
     }
     if let Some(err) = &app.online_error {
-        lines.push(Line::from(format!(" {err}")).red());
+        lines.push(Line::from(format!(" {err}")).fg(color(theme.wrong)));
     }
     frame.render_widget(
         Paragraph::new(lines)
-            .block(Block::bordered().title(" 功能栏 "))
+            .block(themed_block(theme).title(" 功能栏 "))
             .wrap(Wrap { trim: false }),
         area,
     );
@@ -850,6 +917,7 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: ratatui::layout::Rect, bro
 
 /// 载文预览：右侧内容区显示选中文件的内容（前 400 字符）。
 fn render_preview(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let theme = app.theme();
     let (title, body, style) = match app.browse_files.get(app.browse_selection) {
         Some(path) => {
             let name = path
@@ -865,7 +933,7 @@ fn render_preview(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
                 Err(_) => (
                     name,
                     "（无法读取预览）".to_string(),
-                    Style::default().fg(Color::Red),
+                    Style::default().fg(color(theme.wrong)),
                 ),
             }
         }
@@ -880,18 +948,50 @@ fn render_preview(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         Line::from(""),
         Line::styled(body, style),
         Line::from(""),
-        Line::from(" Enter 载入 | Esc 取消 ").gray(),
+        Line::from(" Enter 载入 | Esc 取消 ").fg(color(theme.muted)),
     ];
     frame.render_widget(
         Paragraph::new(lines)
-            .block(Block::bordered().title(" 预览 "))
+            .block(themed_block(theme).title(" 预览 "))
             .wrap(Wrap { trim: false }),
         area,
     );
 }
 
+/// 设置视图：切换主题（占比/粗体/字体由后续 ticket 加入）。
+fn render_settings(frame: &mut Frame, app: &App) {
+    let theme = app.theme();
+    let mut lines = vec![Line::from(" 设置 ").bold(), Line::from("")];
+    lines.push(Line::from(" 主题:").bold());
+    for preset in ThemePreset::ALL {
+        let is_current = preset == app.settings.theme;
+        let marker = if is_current { " > " } else { "   " };
+        let line = Line::from(format!("{marker}{}", preset.name()));
+        let line = if is_current {
+            line.fg(color(theme.accent))
+        } else {
+            line
+        };
+        lines.push(line);
+    }
+    lines.push(Line::from(""));
+    // 主题预览：用当前主题的对/错/强调色渲染示意文字。
+    lines.push(Line::from(" 预览:").bold());
+    lines.push(Line::from("  对正确对正确").fg(color(theme.correct)));
+    lines.push(Line::from("  错错误错错误").fg(color(theme.wrong)));
+    lines.push(Line::from(""));
+    lines.push(Line::from(" ↑↓ / ←→ 切换主题 | Esc 返回").fg(color(theme.muted)));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(themed_block(theme).title(" 设置 "))
+            .wrap(Wrap { trim: false }),
+        centered_rect(frame.area(), 60, 14),
+    );
+}
+
 /// 全屏成绩视图：WPM/错字/回改/按键频率 + 上传状态（在线赛文）。
 fn render_result_view(frame: &mut Frame, app: &App, stats: &Stats, upload: &UploadState) {
+    let theme = app.theme();
     let lines = vec![
         Line::from(format!(" 成绩 — {} ", app.text.title)).bold(),
         Line::from(""),
@@ -927,27 +1027,30 @@ fn render_result_view(frame: &mut Frame, app: &App, stats: &Stats, upload: &Uplo
     let mut all = lines;
     all.extend(freq_lines);
     // 上传状态（在线赛文；离线赛文不显示）。
-    all.extend(upload_lines(upload));
+    all.extend(upload_lines(upload, theme));
     all.push(Line::from(""));
     if app.text.is_online() {
         // 在线赛文不支持重打，只能退出或载入其他赛文。
-        all.push(Line::from(" q 退出 | Ctrl-F 载文").gray());
+        all.push(Line::from(" q 退出 | Ctrl-F 载文").fg(color(theme.muted)));
     } else {
-        all.push(Line::from(" 按任意键重打 | q 退出").gray());
+        all.push(Line::from(" 按任意键重打 | q 退出").fg(color(theme.muted)));
     }
     frame.render_widget(
         Paragraph::new(all)
-            .block(Block::bordered().title(" 成绩 "))
+            .block(themed_block(theme).title(" 成绩 "))
             .wrap(Wrap { trim: false }),
         frame.area(),
     );
 }
 
 /// 成绩视图里的上传状态行（纯函数，供渲染与测试）。
-fn upload_lines(upload: &UploadState) -> Vec<Line<'static>> {
+fn upload_lines(upload: &UploadState, theme: Theme) -> Vec<Line<'static>> {
     match upload {
         UploadState::NotApplicable => vec![],
-        UploadState::Uploading => vec![Line::from(""), Line::from(" 成绩上传中…").yellow()],
+        UploadState::Uploading => vec![
+            Line::from(""),
+            Line::from(" 成绩上传中…").fg(color(theme.warn)),
+        ],
         UploadState::Success {
             ranking,
             share_text,
@@ -955,12 +1058,14 @@ fn upload_lines(upload: &UploadState) -> Vec<Line<'static>> {
             let mut lines = vec![Line::from("")];
             match ranking {
                 Some(r) => {
-                    lines.push(Line::from(format!(" 排名: 第{r}名 · 已上传")).green());
+                    lines.push(
+                        Line::from(format!(" 排名: 第{r}名 · 已上传")).fg(color(theme.accent)),
+                    );
                 }
-                None => lines.push(Line::from(" 已上传").green()),
+                None => lines.push(Line::from(" 已上传").fg(color(theme.accent))),
             }
-            lines.push(Line::from(format!(" 分享: {share_text}")).green());
-            lines.push(Line::from(" 已复制到剪贴板").gray());
+            lines.push(Line::from(format!(" 分享: {share_text}")).fg(color(theme.accent)));
+            lines.push(Line::from(" 已复制到剪贴板").fg(color(theme.muted)));
             lines
         }
         UploadState::Failed {
@@ -970,28 +1075,28 @@ fn upload_lines(upload: &UploadState) -> Vec<Line<'static>> {
         } => {
             let mut lines = vec![
                 Line::from(""),
-                Line::from(format!(" 上传失败: {message}")).red(),
+                Line::from(format!(" 上传失败: {message}")).fg(color(theme.wrong)),
             ];
             if let Some(d) = detail {
-                lines.push(Line::from(format!(" 原始错误: {d}")).gray());
+                lines.push(Line::from(format!(" 原始错误: {d}")).fg(color(theme.muted)));
             }
             if *need_relogin {
-                lines.push(Line::from(" 请按 Ctrl-O 重新登录").yellow());
+                lines.push(Line::from(" 请按 Ctrl-O 重新登录").fg(color(theme.warn)));
             }
             lines
         }
     }
 }
 
-/// 将对照区的字符按跟打状态着色：已打对=绿、已打错=红、未打到=默认。
-fn original_line(session: &Session) -> Line<'static> {
+/// 将对照区的字符按跟打状态着色：已打对=correct、已打错=wrong、未打到=默认。
+fn original_line(session: &Session, theme: Theme) -> Line<'static> {
     let spans: Vec<Span<'static>> = session
         .original_status()
         .into_iter()
         .map(|(c, status)| {
             let style = match status {
-                Some(CharStatus::Correct) => Style::default().fg(Color::Green),
-                Some(CharStatus::Wrong) => Style::default().fg(Color::Red),
+                Some(CharStatus::Correct) => Style::default().fg(color(theme.correct)),
+                Some(CharStatus::Wrong) => Style::default().fg(color(theme.wrong)),
                 None => Style::default(),
             };
             Span::styled(c.to_string(), style)
@@ -1000,18 +1105,18 @@ fn original_line(session: &Session) -> Line<'static> {
     Line::from(spans)
 }
 
-/// 将跟打区的字符按对/错渲染为绿/红一行。
-fn type_line(session: &Session) -> Line<'static> {
+/// 将跟打区的字符按对/错渲染为 correct/wrong 一行。
+fn type_line(session: &Session, theme: Theme) -> Line<'static> {
     let display = session.display();
     if display.is_empty() {
-        return Line::from("（跟打区 — 输入法上屏文字将显示在这里）").gray();
+        return Line::from("（跟打区 — 输入法上屏文字将显示在这里）").fg(color(theme.muted));
     }
     let spans: Vec<Span<'static>> = display
         .into_iter()
         .map(|(c, status)| {
             let style = match status {
-                CharStatus::Correct => Style::default().fg(Color::Green),
-                CharStatus::Wrong => Style::default().fg(Color::Red),
+                CharStatus::Correct => Style::default().fg(color(theme.correct)),
+                CharStatus::Wrong => Style::default().fg(color(theme.wrong)),
             };
             Span::styled(c.to_string(), style)
         })
@@ -1041,12 +1146,19 @@ mod tests {
         TokenStore::new(dir.join("token"))
     }
 
-    /// 测试用 App：临时 token 存储 + 不可达 API（无 token 文件时不发网络请求）。
+    /// 临时设置存储：隔离本机 `~/.config/dazitui/settings`。
+    fn temp_settings_store() -> SettingsStore {
+        let dir = temp_dir("settings");
+        SettingsStore::new(dir.join("settings"))
+    }
+
+    /// 测试用 App：临时 token/设置存储 + 不可达 API（无 token 文件时不发网络请求）。
     fn test_app(text: Text) -> App {
         App::new_with(
             text,
             temp_token_store(),
             ApiClient::with_base_url("http://127.0.0.1:1"),
+            temp_settings_store(),
         )
     }
 
@@ -1260,22 +1372,24 @@ mod tests {
 
     #[test]
     fn type_line_colors_correct_green_wrong_red() {
+        let theme = Theme::preset(ThemePreset::Default);
         let mut session = Session::new("你好世界");
         session.type_text("你好四界");
-        let line = type_line(&session);
+        let line = type_line(&session, theme);
         assert_eq!(line.spans.len(), 4);
-        assert_eq!(line.spans[0].style.fg, Some(Color::Green));
-        assert_eq!(line.spans[2].style.fg, Some(Color::Red));
+        assert_eq!(line.spans[0].style.fg, Some(color(theme.correct)));
+        assert_eq!(line.spans[2].style.fg, Some(color(theme.wrong)));
     }
 
     #[test]
     fn original_line_colors_green_red_default() {
+        let theme = Theme::preset(ThemePreset::Default);
         let mut session = Session::new("你好世界");
         session.type_text("你好四");
-        let line = original_line(&session);
+        let line = original_line(&session, theme);
         assert_eq!(line.spans.len(), 4);
-        assert_eq!(line.spans[0].style.fg, Some(Color::Green)); // 你 ✓
-        assert_eq!(line.spans[2].style.fg, Some(Color::Red)); // 世 ✗（打成四）
+        assert_eq!(line.spans[0].style.fg, Some(color(theme.correct))); // 你 ✓
+        assert_eq!(line.spans[2].style.fg, Some(color(theme.wrong))); // 世 ✗（打成四）
         assert_eq!(line.spans[3].style.fg, None); // 界：未打到，默认色
     }
 
@@ -1339,6 +1453,57 @@ mod tests {
             KeyCode::Char('o'),
             KeyModifiers::NONE
         )));
+    }
+
+    #[test]
+    fn ctrl_e_opens_settings() {
+        assert!(is_open_settings(KeyEvent::new(
+            KeyCode::Char('e'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(!is_open_settings(KeyEvent::new(
+            KeyCode::Char('e'),
+            KeyModifiers::NONE
+        )));
+        assert!(!is_open_settings(KeyEvent::new(
+            KeyCode::Char('s'),
+            KeyModifiers::CONTROL
+        )));
+    }
+
+    #[test]
+    fn next_prev_theme_cycles_and_persists() {
+        let mut app = test_app(file_text("你好"));
+        // 默认从 Default 开始。
+        assert_eq!(app.settings.theme, ThemePreset::Default);
+        // 切下一主题并持久化。
+        app.next_theme();
+        assert_eq!(app.settings.theme, ThemePreset::Catppuccin);
+        assert_eq!(app.settings_store.load().theme, ThemePreset::Catppuccin);
+        // 循环回绕：往前退回到 Default。
+        app.prev_theme();
+        assert_eq!(app.settings.theme, ThemePreset::Default);
+        assert_eq!(app.settings_store.load().theme, ThemePreset::Default);
+        // 从 Default 往上退绕到 Gruvbox。
+        app.prev_theme();
+        assert_eq!(app.settings.theme, ThemePreset::Gruvbox);
+    }
+
+    #[test]
+    fn theme_switch_changes_correct_wrong_colors() {
+        // 对/错颜色随主题切换改变（外部可观察行为：不是固定绿/红）。
+        let default_theme = Theme::preset(ThemePreset::Default);
+        let dracula_theme = Theme::preset(ThemePreset::Dracula);
+        let mut session = Session::new("你好");
+        session.type_text("你四");
+        let default_line = original_line(&session, default_theme);
+        let dracula_line = original_line(&session, dracula_theme);
+        assert_eq!(default_line.spans[0].style.fg, Some(color(default_theme.correct)));
+        assert_eq!(default_line.spans[1].style.fg, Some(color(default_theme.wrong)));
+        assert_eq!(dracula_line.spans[0].style.fg, Some(color(dracula_theme.correct)));
+        assert_eq!(dracula_line.spans[1].style.fg, Some(color(dracula_theme.wrong)));
+        assert_ne!(default_line.spans[0].style.fg, dracula_line.spans[0].style.fg);
+        assert_ne!(default_line.spans[1].style.fg, dracula_line.spans[1].style.fg);
     }
 
     #[test]
@@ -1485,16 +1650,20 @@ mod tests {
 
     #[test]
     fn upload_lines_renders_each_state() {
+        let theme = Theme::preset(ThemePreset::Default);
         // 离线：不显示上传状态。
-        assert!(upload_lines(&UploadState::NotApplicable).is_empty());
+        assert!(upload_lines(&UploadState::NotApplicable, theme).is_empty());
         // 上传中。
-        let lines = upload_lines(&UploadState::Uploading);
+        let lines = upload_lines(&UploadState::Uploading, theme);
         assert!(lines.iter().any(|l| l.to_string().contains("上传中")));
         // 成功带排名：排名 + 已上传 + 分享 + 剪贴板。
-        let lines = upload_lines(&UploadState::Success {
-            ranking: Some("5".into()),
-            share_text: "极速杯 第5名 · WPM 85.2".into(),
-        });
+        let lines = upload_lines(
+            &UploadState::Success {
+                ranking: Some("5".into()),
+                share_text: "极速杯 第5名 · WPM 85.2".into(),
+            },
+            theme,
+        );
         let text: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
         assert!(
             text.iter()
@@ -1503,17 +1672,23 @@ mod tests {
         assert!(text.iter().any(|s| s.contains("极速杯 第5名")));
         assert!(text.iter().any(|s| s.contains("已复制到剪贴板")));
         // 成功无排名：仍显示已上传。
-        let lines = upload_lines(&UploadState::Success {
-            ranking: None,
-            share_text: "x".into(),
-        });
+        let lines = upload_lines(
+            &UploadState::Success {
+                ranking: None,
+                share_text: "x".into(),
+            },
+            theme,
+        );
         assert!(lines.iter().any(|l| l.to_string().contains("已上传")));
         // 失败：显示原因，不提示重新登录。
-        let lines = upload_lines(&UploadState::Failed {
-            message: "网络连接失败".into(),
-            need_relogin: false,
-            detail: None,
-        });
+        let lines = upload_lines(
+            &UploadState::Failed {
+                message: "网络连接失败".into(),
+                need_relogin: false,
+                detail: None,
+            },
+            theme,
+        );
         assert!(
             lines
                 .iter()
@@ -1521,11 +1696,14 @@ mod tests {
         );
         assert!(lines.iter().all(|l| !l.to_string().contains("重新登录")));
         // 失败且鉴权失效：提示重新登录；原始错误降级为次要信息。
-        let lines = upload_lines(&UploadState::Failed {
-            message: "登录已失效，请重新登录".into(),
-            need_relogin: true,
-            detail: Some("用户名不能为空！".into()),
-        });
+        let lines = upload_lines(
+            &UploadState::Failed {
+                message: "登录已失效，请重新登录".into(),
+                need_relogin: true,
+                detail: Some("用户名不能为空！".into()),
+            },
+            theme,
+        );
         assert!(lines.iter().any(|l| l.to_string().contains("重新登录")));
         assert!(lines.iter().any(|l| l.to_string().contains("原始错误: 用户名不能为空！")));
     }
@@ -1657,7 +1835,7 @@ mod tests {
             r#"{"error":0,"msg":{"isLogin":0}}"#,
         )]);
         let api = ApiClient::with_base_url(&format!("http://127.0.0.1:{port}"));
-        let app = App::new_with(file_text("你好"), store, api);
+        let app = App::new_with(file_text("你好"), store, api, temp_settings_store());
         handle.join().unwrap();
         assert!(app.token.is_none());
         assert_eq!(app.login_notice.as_deref(), Some("登录已失效，请重新登录"));
@@ -1672,7 +1850,7 @@ mod tests {
             r#"{"error":0,"msg":{"isLogin":1}}"#,
         )]);
         let api = ApiClient::with_base_url(&format!("http://127.0.0.1:{port}"));
-        let app = App::new_with(file_text("你好"), store, api);
+        let app = App::new_with(file_text("你好"), store, api, temp_settings_store());
         handle.join().unwrap();
         assert_eq!(app.token.as_deref(), Some("good-token"));
         assert!(app.login_notice.is_none());
@@ -1687,6 +1865,7 @@ mod tests {
             file_text("你好"),
             store,
             ApiClient::with_base_url("http://127.0.0.1:1"),
+            temp_settings_store(),
         );
         assert_eq!(app.token.as_deref(), Some("tok"));
         assert!(app.login_notice.is_none());
@@ -1703,6 +1882,7 @@ mod tests {
             online_text("你好世界"),
             store,
             ApiClient::with_base_url("http://127.0.0.1:1"),
+            temp_settings_store(),
         );
         assert_eq!(app.token.as_deref(), Some("stale"));
         // 载文前换成失效探测的 mock。
@@ -1728,6 +1908,7 @@ mod tests {
             online_text("你好世界"),
             store,
             ApiClient::with_base_url("http://127.0.0.1:1"),
+            temp_settings_store(),
         );
         app.online_loading = Some(CompetitionType::Jisu);
         app.download_online(CompetitionType::Jisu);
