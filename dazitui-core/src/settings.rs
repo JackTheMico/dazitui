@@ -172,6 +172,16 @@ impl Default for Settings {
     }
 }
 
+/// 字体开关对应的字号（pt）。
+pub const FONT_SIZE_PT: u16 = 16;
+
+/// 生成 kitty 兼容的 OSC 50 字号设置序列（尽力而为，仅 kitty 等少数终端支持）。
+///
+/// 返回形如 `\x1b]50;font_size=<size>\x07` 的字节序列；不支持的终端会静默忽略。
+pub fn osc_font_size_sequence(size: u16) -> String {
+    format!("\x1b]50;font_size={size}\x07")
+}
+
 /// 设置文件读写（极简 key=value 格式，无 serde）。
 ///
 /// 文件缺失或损坏时回退到 `Settings::default()`；单个字段损坏仅该字段回退默认。
@@ -397,5 +407,12 @@ mod tests {
         store.save(&Settings::default()).unwrap();
         assert_eq!(store.load(), Settings::default());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn osc_font_size_sequence_emits_kitty_osc50() {
+        assert_eq!(osc_font_size_sequence(16), "\x1b]50;font_size=16\x07");
+        assert_eq!(osc_font_size_sequence(20), "\x1b]50;font_size=20\x07");
+        assert_eq!(FONT_SIZE_PT, 16);
     }
 }

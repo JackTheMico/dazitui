@@ -414,12 +414,16 @@ mod tests {
 
     #[test]
     fn parse_base_info_accepts_bool_and_string_forms() {
-        assert!(parse_base_info_response(r#"{"error":0,"msg":{"isLogin":true}}"#)
-            .unwrap()
-            .is_login);
-        assert!(!parse_base_info_response(r#"{"error":0,"msg":{"isLogin":"0"}}"#)
-            .unwrap()
-            .is_login);
+        assert!(
+            parse_base_info_response(r#"{"error":0,"msg":{"isLogin":true}}"#)
+                .unwrap()
+                .is_login
+        );
+        assert!(
+            !parse_base_info_response(r#"{"error":0,"msg":{"isLogin":"0"}}"#)
+                .unwrap()
+                .is_login
+        );
     }
 
     #[test]

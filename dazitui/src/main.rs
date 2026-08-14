@@ -5,16 +5,16 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use dazitui_core::{
-    ApiClient, ApiError, CharStatus, CompetitionType, LoadError, LoadOptions, Rgb, Session,
-    Settings, SettingsStore, Stats, Text, TextSource, Theme, ThemePreset, TokenStore,
-    build_upload_payload, env_credentials, format_share_text, is_auth_failure,
-    load_text_from_file, load_text_from_file_with_options, osc52_clipboard, should_auto_relogin,
+    ApiClient, ApiError, CharStatus, CompetitionType, FONT_SIZE_PT, LoadError, LoadOptions, Rgb,
+    Session, Settings, SettingsStore, Stats, Text, TextSource, Theme, TokenStore,
+    build_upload_payload, env_credentials, format_share_text, is_auth_failure, load_text_from_file,
+    load_text_from_file_with_options, osc_font_size_sequence, osc52_clipboard, should_auto_relogin,
     to_upload_stats, token_is_valid,
 };
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::prelude::Stylize;
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 
@@ -29,6 +29,14 @@ enum AppState {
     /// 设置视图：切换主题等外观设置。
     Settings,
 }
+
+/// 设置视图焦点项下标。
+const FOCUS_THEME: usize = 0;
+const FOCUS_RATIO: usize = 1;
+const FOCUS_BOLD: usize = 2;
+const FOCUS_FONT: usize = 3;
+/// 设置视图焦点项总数。
+const SETTINGS_FOCUS_COUNT: usize = 4;
 
 /// 成绩视图里的成绩上传状态（在线赛文完成跟打后自动上传）。
 #[derive(Debug, Clone, PartialEq)]
@@ -85,6 +93,8 @@ struct App {
     settings: Settings,
     /// 设置持久化存储。
     settings_store: SettingsStore,
+    /// 设置视图当前焦点项（FOCUS_THEME/FOCUS_RATIO/FOCUS_BOLD/FOCUS_FONT）。
+    settings_focus: usize,
 }
 
 /// 登录模态框输入状态。
@@ -169,6 +179,7 @@ impl App {
             online_error: None,
             settings,
             settings_store,
+            settings_focus: FOCUS_THEME,
         }
     }
 
@@ -186,6 +197,24 @@ impl App {
     /// 切换到上一主题并即时持久化。
     fn prev_theme(&mut self) {
         self.settings.theme = self.settings.theme.prev();
+        let _ = self.settings_store.save(&self.settings);
+    }
+
+    /// 调整对照区占比（±5%，越界截断）并即时持久化。
+    fn adjust_ratio(&mut self, delta: i8) {
+        self.settings.reference_ratio = adjust_ratio_value(self.settings.reference_ratio, delta);
+        let _ = self.settings_store.save(&self.settings);
+    }
+
+    /// 切换粗体开关并即时持久化。
+    fn toggle_bold(&mut self) {
+        self.settings.bold = !self.settings.bold;
+        let _ = self.settings_store.save(&self.settings);
+    }
+
+    /// 切换字体开关并即时持久化（OSC 序列由事件层在开启时输出）。
+    fn toggle_font(&mut self) {
+        self.settings.font = !self.settings.font;
         let _ = self.settings_store.save(&self.settings);
     }
 
@@ -330,8 +359,13 @@ impl App {
     /// 并重试上传一次；重试仍失败按原失败路径提示。
     fn do_upload(&mut self, stats: &Stats, elapsed: Duration) {
         let mut upload = self.perform_upload(stats, elapsed);
-        let need_relogin =
-            matches!(&upload, UploadState::Failed { need_relogin: true, .. });
+        let need_relogin = matches!(
+            &upload,
+            UploadState::Failed {
+                need_relogin: true,
+                ..
+            }
+        );
         let credentials = env_credentials(|k| std::env::var(k).ok());
         if should_auto_relogin(need_relogin, credentials.is_some())
             && let Some((user, pass)) = credentials
@@ -392,7 +426,10 @@ impl App {
                 let need_relogin = is_auth_failure(&e);
                 // 登录失效：主文案用友好提示，原始服务器错误降级为次要信息。
                 let (message, detail) = if need_relogin {
-                    ("登录已失效，请重新登录".to_string(), Some(api_error_text(&e)))
+                    (
+                        "登录已失效，请重新登录".to_string(),
+                        Some(api_error_text(&e)),
+                    )
                 } else {
                     (api_error_text(&e), None)
                 };
@@ -434,6 +471,10 @@ fn main() {
 
 fn run_tui(app: App) -> io::Result<()> {
     let mut terminal = ratatui::init();
+    // 启动时若字体开关已开启，输出 OSC 字体尝试序列（尽力而为）。
+    if app.settings.font {
+        emit_font_osc();
+    }
     // bracketed paste：中文输入法（fcitx/ibus）上屏以 paste 事件到达，必须启用
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste);
     let result = event_loop(&mut terminal, app);
@@ -536,8 +577,29 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                         _ => {}
                     },
                     AppState::Settings => match key.code {
-                        KeyCode::Up | KeyCode::Left => app.prev_theme(),
-                        KeyCode::Down | KeyCode::Right => app.next_theme(),
+                        KeyCode::Up => app.settings_focus = move_focus(app.settings_focus, -1),
+                        KeyCode::Down => app.settings_focus = move_focus(app.settings_focus, 1),
+                        KeyCode::Left | KeyCode::Right => {
+                            let forward = key.code == KeyCode::Right;
+                            match app.settings_focus {
+                                FOCUS_THEME => {
+                                    if forward {
+                                        app.next_theme();
+                                    } else {
+                                        app.prev_theme();
+                                    }
+                                }
+                                FOCUS_RATIO => app.adjust_ratio(if forward { 5 } else { -5 }),
+                                FOCUS_BOLD => app.toggle_bold(),
+                                FOCUS_FONT => {
+                                    app.toggle_font();
+                                    if app.settings.font {
+                                        emit_font_osc();
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
                         KeyCode::Esc => app.state = AppState::Typing,
                         _ => {}
                     },
@@ -665,6 +727,39 @@ fn write_clipboard(text: &str) {
     let _ = crossterm::execute!(std::io::stdout(), Print(seq));
 }
 
+/// 输出 kitty 兼容的 OSC 字体设置序列（尽力而为，不支持/失败静默忽略）。
+fn emit_font_osc() {
+    use crossterm::style::Print;
+    let seq = osc_font_size_sequence(FONT_SIZE_PT);
+    let _ = crossterm::execute!(std::io::stdout(), Print(seq));
+}
+
+/// 焦点在设置项间循环移动（向上为负、向下为正）。
+fn move_focus(current: usize, delta: i8) -> usize {
+    ((current as isize + delta as isize).rem_euclid(SETTINGS_FOCUS_COUNT as isize)) as usize
+}
+
+/// 调整对照区占比并截断到合法范围（30–80%）。
+fn adjust_ratio_value(current: u8, delta: i8) -> u8 {
+    let next = (current as i16 + delta as i16).clamp(0, u8::MAX as i16) as u8;
+    Settings::clamp_ratio(next)
+}
+
+/// 粗体开关派生的样式修饰符。
+fn bold_modifier(bold: bool) -> Modifier {
+    if bold {
+        Modifier::BOLD
+    } else {
+        Modifier::empty()
+    }
+}
+
+/// 派生对照区/跟打区占比：返回 `(对照区%, 跟打区%)`。
+fn area_ratios(reference_ratio: u8) -> (u16, u16) {
+    let ref_pct = Settings::clamp_ratio(reference_ratio) as u16;
+    (ref_pct, 100 - ref_pct)
+}
+
 /// core 的 `Rgb` 转 ratatui `Color`。
 fn color(rgb: Rgb) -> Color {
     Color::Rgb(rgb.0, rgb.1, rgb.2)
@@ -759,20 +854,23 @@ fn ui(frame: &mut Frame, app: &App) {
     if browsing {
         render_preview(frame, app, content);
     } else {
-        // 内容区：上对照区 + 下跟打区
-        let [ref_area, type_area] =
-            Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
-                .areas(content);
+        // 内容区：上对照区 + 下跟打区（按设置占比分配）
+        let (ref_pct, type_pct) = area_ratios(app.settings.reference_ratio);
+        let [ref_area, type_area] = Layout::vertical([
+            Constraint::Percentage(ref_pct),
+            Constraint::Percentage(type_pct),
+        ])
+        .areas(content);
         // 上：对照原文区（已跟打部分绿/红着色）
         frame.render_widget(
-            Paragraph::new(original_line(&app.session, app.theme()))
+            Paragraph::new(original_line(&app.session, app.theme(), app.settings.bold))
                 .block(themed_block(app.theme()).title(format!(" 对照区 — {} ", app.text.title)))
                 .wrap(Wrap { trim: false }),
             ref_area,
         );
         // 下：跟打区（实时绿/红渲染）
         frame.render_widget(
-            Paragraph::new(type_line(&app.session, app.theme()))
+            Paragraph::new(type_line(&app.session, app.theme(), app.settings.bold))
                 .block(themed_block(app.theme()).title(format!(
                     " 跟打区 — {}/{} 字符 ",
                     app.session.len(),
@@ -958,35 +1056,67 @@ fn render_preview(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     );
 }
 
-/// 设置视图：切换主题（占比/粗体/字体由后续 ticket 加入）。
+/// 设置视图：焦点行 + 左右调整（主题/占比/粗体/字体）。
 fn render_settings(frame: &mut Frame, app: &App) {
     let theme = app.theme();
+    let focus = app.settings_focus;
     let mut lines = vec![Line::from(" 设置 ").bold(), Line::from("")];
-    lines.push(Line::from(" 主题:").bold());
-    for preset in ThemePreset::ALL {
-        let is_current = preset == app.settings.theme;
-        let marker = if is_current { " > " } else { "   " };
-        let line = Line::from(format!("{marker}{}", preset.name()));
-        let line = if is_current {
-            line.fg(color(theme.accent))
-        } else {
-            line
-        };
-        lines.push(line);
-    }
+
+    lines.push(settings_row(
+        "主题",
+        app.settings.theme.name(),
+        focus == FOCUS_THEME,
+        theme,
+    ));
+    lines.push(settings_row(
+        "对照区占比",
+        &format!("{}%", app.settings.reference_ratio),
+        focus == FOCUS_RATIO,
+        theme,
+    ));
+    lines.push(settings_row(
+        "粗体",
+        on_off(app.settings.bold),
+        focus == FOCUS_BOLD,
+        theme,
+    ));
+    lines.push(settings_row(
+        "字体",
+        on_off(app.settings.font),
+        focus == FOCUS_FONT,
+        theme,
+    ));
+
     lines.push(Line::from(""));
-    // 主题预览：用当前主题的对/错/强调色渲染示意文字。
+    // 主题预览：用当前主题的对/错色渲染示意文字。
     lines.push(Line::from(" 预览:").bold());
     lines.push(Line::from("  对正确对正确").fg(color(theme.correct)));
     lines.push(Line::from("  错错误错错误").fg(color(theme.wrong)));
     lines.push(Line::from(""));
-    lines.push(Line::from(" ↑↓ / ←→ 切换主题 | Esc 返回").fg(color(theme.muted)));
+    lines.push(Line::from(" ↑↓ 选择 | ←→ 调整 | Esc 返回").fg(color(theme.muted)));
+
     frame.render_widget(
         Paragraph::new(lines)
             .block(themed_block(theme).title(" 设置 "))
             .wrap(Wrap { trim: false }),
         centered_rect(frame.area(), 60, 14),
     );
+}
+
+/// 设置项行：焦点项用 accent 色 + `>` 标记高亮。
+fn settings_row(label: &str, value: &str, focused: bool, theme: Theme) -> Line<'static> {
+    let marker = if focused { " > " } else { "   " };
+    let line = Line::from(format!("{marker}{label}: {value}"));
+    if focused {
+        line.fg(color(theme.accent))
+    } else {
+        line
+    }
+}
+
+/// 布尔开关显示为「开/关」。
+fn on_off(v: bool) -> &'static str {
+    if v { "开" } else { "关" }
 }
 
 /// 全屏成绩视图：WPM/错字/回改/按键频率 + 上传状态（在线赛文）。
@@ -1089,7 +1219,7 @@ fn upload_lines(upload: &UploadState, theme: Theme) -> Vec<Line<'static>> {
 }
 
 /// 将对照区的字符按跟打状态着色：已打对=correct、已打错=wrong、未打到=默认。
-fn original_line(session: &Session, theme: Theme) -> Line<'static> {
+fn original_line(session: &Session, theme: Theme, bold: bool) -> Line<'static> {
     let spans: Vec<Span<'static>> = session
         .original_status()
         .into_iter()
@@ -1099,14 +1229,14 @@ fn original_line(session: &Session, theme: Theme) -> Line<'static> {
                 Some(CharStatus::Wrong) => Style::default().fg(color(theme.wrong)),
                 None => Style::default(),
             };
-            Span::styled(c.to_string(), style)
+            Span::styled(c.to_string(), style.add_modifier(bold_modifier(bold)))
         })
         .collect();
     Line::from(spans)
 }
 
 /// 将跟打区的字符按对/错渲染为 correct/wrong 一行。
-fn type_line(session: &Session, theme: Theme) -> Line<'static> {
+fn type_line(session: &Session, theme: Theme, bold: bool) -> Line<'static> {
     let display = session.display();
     if display.is_empty() {
         return Line::from("（跟打区 — 输入法上屏文字将显示在这里）").fg(color(theme.muted));
@@ -1118,7 +1248,7 @@ fn type_line(session: &Session, theme: Theme) -> Line<'static> {
                 CharStatus::Correct => Style::default().fg(color(theme.correct)),
                 CharStatus::Wrong => Style::default().fg(color(theme.wrong)),
             };
-            Span::styled(c.to_string(), style)
+            Span::styled(c.to_string(), style.add_modifier(bold_modifier(bold)))
         })
         .collect();
     Line::from(spans)
@@ -1127,7 +1257,7 @@ fn type_line(session: &Session, theme: Theme) -> Line<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dazitui_core::TextSource;
+    use dazitui_core::{TextSource, ThemePreset};
     use std::fs;
 
     fn temp_dir(suffix: &str) -> PathBuf {
@@ -1164,9 +1294,7 @@ mod tests {
 
     /// 起本地 mock HTTP 服务器：按请求路径返回固定响应（按 `responses` 长度 accept 次数）。
     /// 返回 `(端口, 线程句柄)`，`responses` 为 `(请求路径, 响应体)` 列表。
-    fn mock_server(
-        responses: &[(&str, &str)],
-    ) -> (u16, std::thread::JoinHandle<()>) {
+    fn mock_server(responses: &[(&str, &str)]) -> (u16, std::thread::JoinHandle<()>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let responses: Vec<(String, String)> = responses
@@ -1185,10 +1313,7 @@ mod tests {
                 let mut content_length = 0usize;
                 loop {
                     let mut line = String::new();
-                    if reader.read_line(&mut line).unwrap() == 0
-                        || line == "\r\n"
-                        || line == "\n"
-                    {
+                    if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" || line == "\n" {
                         break;
                     }
                     if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
@@ -1375,7 +1500,7 @@ mod tests {
         let theme = Theme::preset(ThemePreset::Default);
         let mut session = Session::new("你好世界");
         session.type_text("你好四界");
-        let line = type_line(&session, theme);
+        let line = type_line(&session, theme, false);
         assert_eq!(line.spans.len(), 4);
         assert_eq!(line.spans[0].style.fg, Some(color(theme.correct)));
         assert_eq!(line.spans[2].style.fg, Some(color(theme.wrong)));
@@ -1386,11 +1511,90 @@ mod tests {
         let theme = Theme::preset(ThemePreset::Default);
         let mut session = Session::new("你好世界");
         session.type_text("你好四");
-        let line = original_line(&session, theme);
+        let line = original_line(&session, theme, false);
         assert_eq!(line.spans.len(), 4);
         assert_eq!(line.spans[0].style.fg, Some(color(theme.correct))); // 你 ✓
         assert_eq!(line.spans[2].style.fg, Some(color(theme.wrong))); // 世 ✗（打成四）
         assert_eq!(line.spans[3].style.fg, None); // 界：未打到，默认色
+    }
+
+    #[test]
+    fn bold_modifier_switches_bold() {
+        assert_eq!(bold_modifier(true), Modifier::BOLD);
+        assert_eq!(bold_modifier(false), Modifier::empty());
+    }
+
+    #[test]
+    fn type_line_applies_bold_modifier() {
+        let theme = Theme::preset(ThemePreset::Default);
+        let mut session = Session::new("你好世界");
+        session.type_text("你好");
+        let line = type_line(&session, theme, true);
+        assert_eq!(line.spans[0].style.add_modifier, Modifier::BOLD);
+        assert_eq!(line.spans[1].style.add_modifier, Modifier::BOLD);
+        let plain = type_line(&session, theme, false);
+        assert_eq!(plain.spans[0].style.add_modifier, Modifier::empty());
+    }
+
+    #[test]
+    fn original_line_applies_bold_modifier() {
+        let theme = Theme::preset(ThemePreset::Default);
+        let mut session = Session::new("你好世界");
+        session.type_text("你好");
+        // 已打到（对）与未打到都加粗。
+        let line = original_line(&session, theme, true);
+        assert_eq!(line.spans[0].style.add_modifier, Modifier::BOLD);
+        assert_eq!(line.spans[2].style.add_modifier, Modifier::BOLD);
+        let plain = original_line(&session, theme, false);
+        assert_eq!(plain.spans[0].style.add_modifier, Modifier::empty());
+    }
+
+    #[test]
+    fn move_focus_wraps_around() {
+        assert_eq!(move_focus(0, -1), 3);
+        assert_eq!(move_focus(3, 1), 0);
+        assert_eq!(move_focus(0, 1), 1);
+        assert_eq!(move_focus(2, -1), 1);
+    }
+
+    #[test]
+    fn adjust_ratio_value_steps_and_clamps() {
+        assert_eq!(adjust_ratio_value(62, 5), 67);
+        assert_eq!(adjust_ratio_value(62, -5), 57);
+        assert_eq!(adjust_ratio_value(78, 5), 80); // 越界截断到 80
+        assert_eq!(adjust_ratio_value(32, -5), 30); // 越界截断到 30
+    }
+
+    #[test]
+    fn area_ratios_derive_layout() {
+        assert_eq!(area_ratios(62), (62, 38));
+        assert_eq!(area_ratios(0), (30, 70)); // 越界截断
+        assert_eq!(area_ratios(100), (80, 20)); // 越界截断
+    }
+
+    #[test]
+    fn adjust_ratio_persists_and_clamps() {
+        let mut app = test_app(file_text("你好"));
+        assert_eq!(app.settings.reference_ratio, 62); // 默认
+        app.adjust_ratio(5);
+        assert_eq!(app.settings.reference_ratio, 67);
+        assert_eq!(app.settings_store.load().reference_ratio, 67);
+        app.adjust_ratio(20); // 越界截断到 80
+        assert_eq!(app.settings.reference_ratio, 80);
+    }
+
+    #[test]
+    fn toggle_bold_and_font_persist() {
+        let mut app = test_app(file_text("你好"));
+        assert!(!app.settings.bold);
+        assert!(!app.settings.font);
+        app.toggle_bold();
+        app.toggle_font();
+        assert!(app.settings.bold);
+        assert!(app.settings.font);
+        let loaded = app.settings_store.load();
+        assert!(loaded.bold);
+        assert!(loaded.font);
     }
 
     #[test]
@@ -1496,14 +1700,32 @@ mod tests {
         let dracula_theme = Theme::preset(ThemePreset::Dracula);
         let mut session = Session::new("你好");
         session.type_text("你四");
-        let default_line = original_line(&session, default_theme);
-        let dracula_line = original_line(&session, dracula_theme);
-        assert_eq!(default_line.spans[0].style.fg, Some(color(default_theme.correct)));
-        assert_eq!(default_line.spans[1].style.fg, Some(color(default_theme.wrong)));
-        assert_eq!(dracula_line.spans[0].style.fg, Some(color(dracula_theme.correct)));
-        assert_eq!(dracula_line.spans[1].style.fg, Some(color(dracula_theme.wrong)));
-        assert_ne!(default_line.spans[0].style.fg, dracula_line.spans[0].style.fg);
-        assert_ne!(default_line.spans[1].style.fg, dracula_line.spans[1].style.fg);
+        let default_line = original_line(&session, default_theme, false);
+        let dracula_line = original_line(&session, dracula_theme, false);
+        assert_eq!(
+            default_line.spans[0].style.fg,
+            Some(color(default_theme.correct))
+        );
+        assert_eq!(
+            default_line.spans[1].style.fg,
+            Some(color(default_theme.wrong))
+        );
+        assert_eq!(
+            dracula_line.spans[0].style.fg,
+            Some(color(dracula_theme.correct))
+        );
+        assert_eq!(
+            dracula_line.spans[1].style.fg,
+            Some(color(dracula_theme.wrong))
+        );
+        assert_ne!(
+            default_line.spans[0].style.fg,
+            dracula_line.spans[0].style.fg
+        );
+        assert_ne!(
+            default_line.spans[1].style.fg,
+            dracula_line.spans[1].style.fg
+        );
     }
 
     #[test]
@@ -1705,7 +1927,11 @@ mod tests {
             theme,
         );
         assert!(lines.iter().any(|l| l.to_string().contains("重新登录")));
-        assert!(lines.iter().any(|l| l.to_string().contains("原始错误: 用户名不能为空！")));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.to_string().contains("原始错误: 用户名不能为空！"))
+        );
     }
 
     #[test]
@@ -1943,7 +2169,10 @@ mod tests {
     fn retry_after_relogin_relogins_and_uploads() {
         // 自动重登成功：token 更新为新值，并重试上传成功。
         let (port, handle) = mock_server(&[
-            ("/Api/User/login", r#"{"error":0,"msg":{"token":"new-tok"}}"#),
+            (
+                "/Api/User/login",
+                r#"{"error":0,"msg":{"token":"new-tok"}}"#,
+            ),
             (
                 "/Api/Rank/uploadResult",
                 r#"{"error":0,"msg":{"ranking":5,"rankTips":"恭喜获得第5名"}}"#,
