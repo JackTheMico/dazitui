@@ -163,9 +163,6 @@ pub fn parse_upload_response(body: &str) -> Result<RankResult, ApiError> {
     }
 }
 
-/// 解析 getBaseInfo 响应：`msg.isLogin`（数字 1/0、布尔或字符串均可）。
-///
-/// `error != 0`（如 token 缺失）由 `parse_api_response` 统一转为 `Server` 错误；
 /// 请求体公共字段：`version` + `subversions` + 可选 `token`。
 fn base_fields(token: Option<&str>) -> Map<String, Value> {
     let mut m = Map::new();
