@@ -216,8 +216,12 @@ impl Default for ApiClient {
 
 impl ApiClient {
     /// 指向 52dazi 网关的客户端（10 秒超时）。
+    ///
+    /// 网关地址可用 `DAZITUI_BASE_URL` 环境变量覆盖（调试/抓包用，如反向代理）。
     pub fn new() -> Self {
-        Self::with_base_url(BASE_URL)
+        let base_url =
+            std::env::var("DAZITUI_BASE_URL").unwrap_or_else(|_| BASE_URL.to_string());
+        Self::with_base_url(&base_url)
     }
 
     /// 指定网关根地址（测试时指向本地 mock）。
@@ -413,5 +417,98 @@ mod tests {
         let client = ApiClient::with_base_url("http://127.0.0.1:1");
         let err = client.login("a", "b").unwrap_err();
         assert!(matches!(err, ApiError::Transport(_)), "得到: {err:?}");
+    }
+
+    #[test]
+    fn session_cookie_is_replayed_between_requests() {
+        // 核心回归：ureq 启用 cookies feature 后，login 返回的 Set-Cookie（PHPSESSID）
+        // 必须在同一 ApiClient 实例的后续请求中自动回传，否则登录后上传仍会「用户名不能为空」。
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        fn read_http_request(conn: &mut std::net::TcpStream) -> String {
+            conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut total = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = conn.read(&mut buf).expect("读取请求失败");
+                if n == 0 {
+                    break;
+                }
+                total.extend_from_slice(&buf[..n]);
+                // 找到 header 结尾后，按 Content-Length 判断 body 是否读完
+                if let Some(pos) = total.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&total[..pos]);
+                    let content_len = headers
+                        .lines()
+                        .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+                        .and_then(|l| l.split(':').nth(1))
+                        .and_then(|s| s.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if total.len() >= pos + 4 + content_len {
+                        break;
+                    }
+                }
+            }
+            String::from_utf8_lossy(&total).to_string()
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = std::thread::spawn(move || {
+            // 请求 1：login，返回 Set-Cookie
+            let (mut conn, _) = listener.accept().unwrap();
+            let req1 = read_http_request(&mut conn);
+            assert!(req1.contains("Api/User/login"), "请求1 应为 login: {req1}");
+            assert!(
+                !req1.to_ascii_lowercase().contains("cookie:"),
+                "请求1 不应带 cookie: {req1}"
+            );
+            let body1 = r#"{"error":0,"msg":{"token":"t1"}}"#;
+            conn.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nSet-Cookie: PHPSESSID=abc123; path=/\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body1}",
+                    body1.len()
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+            drop(conn);
+
+            // 请求 2：uploadResult，应回传 PHPSESSID
+            let (mut conn2, _) = listener.accept().unwrap();
+            let req2 = read_http_request(&mut conn2);
+            assert!(
+                req2.contains("Api/Rank/uploadResult"),
+                "请求2 应为 uploadResult: {req2}"
+            );
+            let cookie = req2
+                .lines()
+                .find(|l| l.to_ascii_lowercase().starts_with("cookie:"))
+                .unwrap_or("")
+                .to_string();
+            assert!(
+                cookie.contains("PHPSESSID=abc123"),
+                "请求2 未回传会话 cookie。Cookie 头: {cookie:?}\n完整请求:\n{req2}"
+            );
+            let body2 = r#"{"error":0,"msg":"上传成功"}"#;
+            conn2.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body2}",
+                    body2.len()
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        });
+
+        let client = ApiClient::with_base_url(&format!("http://{addr}"));
+        let login = client.login("u", "p").unwrap();
+        assert_eq!(login.token, "t1");
+        let rank = client.upload_result("t1", &json!({"speed": 85.0})).unwrap();
+        assert_eq!(rank.message, "上传成功");
+
+        server.join().unwrap();
     }
 }
