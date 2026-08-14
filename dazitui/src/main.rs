@@ -77,8 +77,11 @@ struct App {
     browse_error: Option<String>,
     /// token 持久化存储。
     token_store: TokenStore,
-    /// 当前登录 token（`None` = 未登录）。
+    /// 请求携带的 52dazi token（登录后获得；持久化仅用于请求携带，不代表已登录）。
     token: Option<String>,
+    /// 本次进程是否已建立登录会话（持有 session cookie）。
+    /// 会话不持久化：即使启动时加载了持久化 token 也不视为已登录，需重新登录才能上传成绩。
+    logged_in: bool,
     /// 52dazi 客户端。
     api: ApiClient,
     /// 登录模态框（`None` = 未打开）。
@@ -137,23 +140,25 @@ impl App {
     ) -> Self {
         let session = Session::new(&text.content);
         let settings = settings_store.load();
-        // 免登录：加载已保存的 token，直接保持登录（与 52dazi 前端一致：本地有 token 即视为已登录）。
-        // token 有效性不做实时探测——服务器不提供可靠的只读校验接口（getBaseInfo 的 isLogin 恒为 0），
-        // 唯一真实校验发生在上传时（uploadResult），失败会走「登录已失效」提示与自动重登。
+        // token 持久化仅用于请求携带；登录会话（session cookie）不持久化，
+        // 故每次启动都需重新登录（方案 1）。即使加载到持久化 token 也不视为已登录。
         let saved_token = token_store.load();
-        let (token, login_notice) = if let Some(t) = saved_token {
-            (Some(t), None)
-        } else if let Some((user, pass)) = env_credentials(|k| std::env::var(k).ok()) {
-            match api.login(&user, &pass) {
-                Ok(r) => {
-                    let _ = token_store.save(&r.token);
-                    (Some(r.token), Some("已通过环境变量登录".to_string()))
+        let (token, logged_in, login_notice) =
+            if let Some((user, pass)) = env_credentials(|k| std::env::var(k).ok()) {
+                match api.login(&user, &pass) {
+                    Ok(r) => {
+                        let _ = token_store.save(&r.token);
+                        (Some(r.token), true, Some("已通过环境变量登录".to_string()))
+                    }
+                    Err(e) => (
+                        saved_token,
+                        false,
+                        Some(format!("自动登录失败: {}", api_error_text(&e))),
+                    ),
                 }
-                Err(e) => (None, Some(format!("自动登录失败: {}", api_error_text(&e)))),
-            }
-        } else {
-            (None, None)
-        };
+            } else {
+                (saved_token, false, None)
+            };
         Self {
             text,
             session,
@@ -166,6 +171,7 @@ impl App {
             browse_error: None,
             token_store,
             token,
+            logged_in,
             api,
             login_form: None,
             login_notice,
@@ -238,6 +244,7 @@ impl App {
             Ok(r) => {
                 let _ = self.token_store.save(&r.token);
                 self.token = Some(r.token);
+                self.logged_in = true;
                 self.login_form = None;
                 self.login_notice = Some("登录成功".to_string());
             }
@@ -314,6 +321,11 @@ impl App {
     /// 不做 token 有效性预探测：getBaseInfo 的 isLogin 恒为 0、无法反映登录态，
     /// token 有效性唯一由上传接口（uploadResult）真实校验，失败走「登录已失效」提示。
     fn download_online(&mut self, competition_type: CompetitionType) {
+        if !self.logged_in {
+            self.online_loading = None;
+            self.online_error = Some("请先登录 52dazi（Ctrl-O）".to_string());
+            return;
+        }
         let Some(token) = self.token.clone() else {
             self.online_loading = None;
             self.online_error = Some("请先登录 52dazi（Ctrl-O）".to_string());
@@ -376,6 +388,7 @@ impl App {
             Ok(r) => {
                 let _ = self.token_store.save(&r.token);
                 self.token = Some(r.token);
+                self.logged_in = true;
                 self.perform_upload(stats, elapsed)
             }
             Err(e) => UploadState::Failed {
@@ -388,6 +401,13 @@ impl App {
 
     /// 执行上传：构造 payload → 调网关 → 处理结果（成功则写剪贴板）。纯状态产出，不修改自身。
     fn perform_upload(&self, stats: &Stats, elapsed: Duration) -> UploadState {
+        if !self.logged_in {
+            return UploadState::Failed {
+                message: "未登录，无法上传成绩".to_string(),
+                need_relogin: true,
+                detail: None,
+            };
+        }
         let Some(token) = self.token.clone() else {
             return UploadState::Failed {
                 message: "未登录，无法上传成绩".to_string(),
@@ -518,7 +538,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                             continue;
                         }
                         if let Some(competition_type) = online_shortcut(key) {
-                            if app.token.is_none() {
+                            if !app.logged_in {
                                 // 未登录：引导先登录。
                                 app.online_error =
                                     Some("请先登录 52dazi 后再载入在线赛文".to_string());
@@ -971,7 +991,7 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: ratatui::layout::Rect, bro
     lines.push(Line::from(format!(" {punct} 2 去符号")));
     lines.push(Line::from(""));
     lines.push(Line::from(" 在线:").bold());
-    let login_entry = if app.token.is_some() {
+    let login_entry = if app.logged_in {
         Line::from(" 已登录 52dazi").fg(color(theme.accent))
     } else {
         Line::from(" 登录 52dazi（Ctrl-O）").fg(color(theme.warn))
@@ -1940,6 +1960,7 @@ mod tests {
     fn perform_upload_network_failure_is_not_relogin() {
         let mut app = test_app(online_text("你好世界"));
         app.token = Some("dead-token".into());
+        app.logged_in = true;
         // 指向必然拒绝连接的地址，验证网络错误被友好化。
         app.api = ApiClient::with_base_url("http://127.0.0.1:1");
         let stats = app.session.finish(Duration::from_secs(10));
@@ -1986,6 +2007,7 @@ mod tests {
         });
         let mut app = test_app(online_text("你好世界"));
         app.token = Some("tok".into());
+        app.logged_in = true;
         app.api = ApiClient::with_base_url(&format!("http://127.0.0.1:{port}"));
         let stats = app.session.finish(Duration::from_secs(40));
         let up = app.perform_upload(&stats, Duration::from_secs(40));
@@ -2038,8 +2060,8 @@ mod tests {
     }
 
     #[test]
-    fn startup_with_saved_token_keeps_login() {
-        // 本地有已保存 token → 直接保持登录，不做实时探测（getBaseInfo 的 isLogin 恒为 0，不可靠）。
+    fn startup_with_saved_token_keeps_token_but_requires_relogin() {
+        // 持久化 token 仍被加载（用于请求携带），但会话不持久化——不视为已登录，需重新登录。
         let store = temp_token_store();
         store.save("saved-token").unwrap();
         let app = App::new_with(
@@ -2049,6 +2071,7 @@ mod tests {
             temp_settings_store(),
         );
         assert_eq!(app.token.as_deref(), Some("saved-token"));
+        assert!(!app.logged_in);
         assert!(app.login_notice.is_none());
     }
 
@@ -2067,6 +2090,7 @@ mod tests {
             ApiClient::with_base_url(&format!("http://127.0.0.1:{port}")),
             temp_settings_store(),
         );
+        app.logged_in = true;
         app.online_loading = Some(CompetitionType::Jisu);
         app.download_online(CompetitionType::Jisu);
         handle.join().unwrap();
@@ -2089,6 +2113,7 @@ mod tests {
             ApiClient::with_base_url("http://127.0.0.1:1"),
             temp_settings_store(),
         );
+        app.logged_in = true;
         app.online_loading = Some(CompetitionType::Jisu);
         app.download_online(CompetitionType::Jisu);
         assert!(app.online_loading.is_none());
@@ -2104,6 +2129,7 @@ mod tests {
         )]);
         let mut app = test_app(online_text("你好世界"));
         app.token = Some("dead-token".into());
+        app.logged_in = true;
         app.api = ApiClient::with_base_url(&format!("http://127.0.0.1:{port}"));
         let stats = app.session.finish(Duration::from_secs(10));
         let up = app.perform_upload(&stats, Duration::from_secs(10));

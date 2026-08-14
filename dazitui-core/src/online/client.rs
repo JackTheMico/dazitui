@@ -219,8 +219,7 @@ impl ApiClient {
     ///
     /// 网关地址可用 `DAZITUI_BASE_URL` 环境变量覆盖（调试/抓包用，如反向代理）。
     pub fn new() -> Self {
-        let base_url =
-            std::env::var("DAZITUI_BASE_URL").unwrap_or_else(|_| BASE_URL.to_string());
+        let base_url = std::env::var("DAZITUI_BASE_URL").unwrap_or_else(|_| BASE_URL.to_string());
         Self::with_base_url(&base_url)
     }
 
