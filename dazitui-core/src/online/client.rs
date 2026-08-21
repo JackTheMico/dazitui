@@ -510,4 +510,255 @@ mod tests {
 
         server.join().unwrap();
     }
+
+    /// 三步链路回归：登录 → 载文 → 上传成绩，全程同一 ApiClient（同一 cookie store）。
+    ///
+    /// 真实流程为登录后先 F1 载入赛文（`getContent`），打完后才 `uploadResult`。
+    /// 现行 `session_cookie_is_replayed_between_requests` 只验证 login → uploadResult 两步，
+    /// 没有覆盖中间的 `getContent`，故即便 cookie 在 GET/POST 间丢失也测不出。
+    /// 本测试追加中间一步，断言 login 后下发的 PHPSESSID 在 getContent 与 uploadResult
+    /// 两次后续请求中都仍然回传。
+    #[test]
+    fn session_cookie_survives_three_step_login_get_content_upload_result() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        fn read_http_request(conn: &mut std::net::TcpStream) -> String {
+            conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut total = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = conn.read(&mut buf).expect("读取请求失败");
+                if n == 0 {
+                    break;
+                }
+                total.extend_from_slice(&buf[..n]);
+                if let Some(pos) = total.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&total[..pos]);
+                    let content_len = headers
+                        .lines()
+                        .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+                        .and_then(|l| l.split(':').nth(1))
+                        .and_then(|s| s.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if total.len() >= pos + 4 + content_len {
+                        break;
+                    }
+                }
+            }
+            String::from_utf8_lossy(&total).to_string()
+        }
+
+        /// 从原始 HTTP 请求行里取出 cookie 头（小写键名），找不到返回空串。
+        fn cookie_header(req: &str) -> String {
+            req.lines()
+                .find(|l| l.to_ascii_lowercase().starts_with("cookie:"))
+                .unwrap_or("")
+                .to_string()
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = std::thread::spawn(move || {
+            // 请求 1：login，下发 Set-Cookie: PHPSESSID=abc123
+            let (mut conn, _) = listener.accept().unwrap();
+            let req1 = read_http_request(&mut conn);
+            assert!(req1.contains("Api/User/login"), "请求1 应为 login: {req1}");
+            assert!(
+                !req1.to_ascii_lowercase().contains("cookie:"),
+                "请求1 不应带 cookie: {req1}"
+            );
+            let body1 = r#"{"error":0,"msg":{"token":"t1"}}"#;
+            conn.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nSet-Cookie: PHPSESSID=abc123; path=/\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body1}",
+                    body1.len()
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+            drop(conn);
+
+            // 请求 2：getContent，应已回传 PHPSESSID（此为现行两步测试所缺校验）
+            let (mut conn2, _) = listener.accept().unwrap();
+            let req2 = read_http_request(&mut conn2);
+            assert!(
+                req2.contains("Api/Text/getContent"),
+                "请求2 应为 getContent: {req2}"
+            );
+            let cookie2 = cookie_header(&req2);
+            assert!(
+                cookie2.contains("PHPSESSID=abc123"),
+                "请求2（getContent）未回传会话 cookie。Cookie 头: {cookie2:?}\n完整请求:\n{req2}"
+            );
+            // 极速杯风格：只返回 "0" 内容字段
+            let body2 = r#"{"error":0,"msg":{"0":"户外溯溪玩水的夏日治愈"}}"#;
+            conn2.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body2}",
+                    body2.len()
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+            drop(conn2);
+
+            // 请求 3：uploadResult，应仍回传 PHPSESSID
+            let (mut conn3, _) = listener.accept().unwrap();
+            let req3 = read_http_request(&mut conn3);
+            assert!(
+                req3.contains("Api/Rank/uploadResult"),
+                "请求3 应为 uploadResult: {req3}"
+            );
+            let cookie3 = cookie_header(&req3);
+            assert!(
+                cookie3.contains("PHPSESSID=abc123"),
+                "请求3（uploadResult）未回传会话 cookie。Cookie 头: {cookie3:?}\n完整请求:\n{req3}"
+            );
+            let body3 = r#"{"error":0,"msg":"上传成功"}"#;
+            conn3.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body3}",
+                    body3.len()
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        });
+
+        let client = ApiClient::with_base_url(&format!("http://{addr}"));
+        // 步骤 1：登录，cookie 落到 client.agent 的 cookie store
+        let login = client.login("u", "p").unwrap();
+        assert_eq!(login.token, "t1");
+        // 步骤 2：载入赛文——这是现行两步测试缺的关键一步
+        let text = client
+            .get_content("t1", CompetitionType::Jisu)
+            .expect("getContent 应成功（cookie 应仍有效）");
+        assert_eq!(text.content, "户外溯溪玩水的夏日治愈");
+        // 步骤 3：上传成绩——真实 bug 现场：服务端在此步回「用户名不能为空！」
+        let rank = client
+            .upload_result("t1", &json!({"speed": 48.34, "wordNum": 369}))
+            .expect("upload_result 应成功（cookie 应仍有效）");
+        assert_eq!(rank.message, "上传成功");
+
+        server.join().unwrap();
+    }
+
+    /// 针对性回归：mock 服务收 uploadResult，解密 AES-CBC 请求体，
+    /// 断言 build_upload_payload 产出的所有前端 schema 必填字段都在（jianZhun/repeatNum/daCi/xuanChong/keyMethod 等）。
+    ///
+    /// 这条测试锚定 wire format：未来任何人改 build_upload_payload 漏掉某个字段时
+    /// （这是历史上 `Server("用户名不能为空！")` 错误的诱因之一），这测试会红。
+    #[test]
+    fn upload_result_encrypts_all_frontend_schema_fields() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        fn read_http_request(conn: &mut std::net::TcpStream) -> String {
+            conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut total = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = conn.read(&mut buf).expect("读取请求失败");
+                if n == 0 {
+                    break;
+                }
+                total.extend_from_slice(&buf[..n]);
+                if let Some(pos) = total.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&total[..pos]);
+                    let content_len = headers
+                        .lines()
+                        .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+                        .and_then(|l| l.split(':').nth(1))
+                        .and_then(|s| s.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if total.len() >= pos + 4 + content_len {
+                        break;
+                    }
+                }
+            }
+            String::from_utf8_lossy(&total).to_string()
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let req = read_http_request(&mut conn);
+            assert!(
+                req.contains("Api/Rank/uploadResult"),
+                "应为 uploadResult: {req}"
+            );
+            // body 是请求头 \r\n\r\n 之后的部分
+            let body = req
+                .split("\r\n\r\n")
+                .nth(1)
+                .unwrap_or("")
+                .to_string();
+            assert!(!body.is_empty(), "请求体为空");
+            // 解密 AES-CBC 加密的请求体（前端格式）
+            let plaintext = super::super::protocol::decrypt(&body);
+            let v: Value = serde_json::from_str(&plaintext)
+                .unwrap_or_else(|e| panic!("解密后不是有效 JSON: {e}\n明文: {plaintext}"));
+            // 公共字段（由 upload_payload 合并）
+            assert_eq!(v["version"], VERSION);
+            assert_eq!(v["subversions"], SUBVERSIONS);
+            assert_eq!(v["token"], "tok-9");
+            // 业务字段：前端 resultPostData 完整 schema（含新补的字段）
+            for key in [
+                "textTitle", "speed", "keystrokes", "maChang", "wordNum", "typingTime",
+                "huiGai", "huiChe", "jianShu", "jianZhun", "repeatNum", "daCi",
+                "wrongNum", "inputMethod", "backspace", "xuanChong", "keyMethod",
+                "challengeFlag", "isFirstSubmit", "isGroupText",
+            ] {
+                assert!(
+                    v.get(key).is_some(),
+                    "uploadResult 请求体缺字段 `{key}`（与前端 resultPostData schema 对齐）。完整:\n{plaintext}"
+                );
+            }
+            // 响应成功，随便返个 msg
+            let resp = r#"{"error":0,"msg":"上传成功"}"#;
+            conn.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp}",
+                    resp.len()
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        });
+
+        let client = ApiClient::with_base_url(&format!("http://{addr}"));
+        // 与 share.rs build_upload_payload 同源字段：speed/wordNum/textTitle 是最简单的可充值 payload
+        let payload = json!({
+            "textTitle": "极速杯",
+            "speed": 48.34,
+            "keystrokes": 3.5,
+            "maChang": 2.8,
+            "wordNum": 369,
+            "typingTime": "05:32.410",
+            "huiGai": 0,
+            "huiChe": 0,
+            "jianShu": 1024,
+            "jianZhun": "100.00%",
+            "repeatNum": 0,
+            "daCi": "0%",
+            "wrongNum": 0,
+            "inputMethod": "",
+            "backspace": 0,
+            "xuanChong": 0,
+            "keyMethod": "0%",
+            "challengeFlag": 0,
+            "isFirstSubmit": 0,
+            "isGroupText": 0,
+        });
+        let rank = client
+            .upload_result("tok-9", &payload)
+            .expect("upload_result 应成功");
+        assert_eq!(rank.message, "上传成功");
+
+        server.join().unwrap();
+    }
 }

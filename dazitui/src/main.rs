@@ -150,11 +150,13 @@ impl App {
                         let _ = token_store.save(&r.token);
                         (Some(r.token), true, Some("已通过环境变量登录".to_string()))
                     }
-                    Err(e) => (
+                    Err(e) => {
+                        (
                         saved_token,
                         false,
                         Some(format!("自动登录失败: {}", api_error_text(&e))),
-                    ),
+                        )
+                    }
                 }
             } else {
                 (saved_token, false, None)
@@ -270,7 +272,8 @@ impl App {
     fn finish_typing(&mut self) -> Option<(Stats, Duration)> {
         let elapsed = self.start.elapsed();
         let stats = self.session.finish(elapsed);
-        if self.text.is_online() {
+        let is_online = self.text.is_online();
+        if is_online {
             self.state = AppState::Finished {
                 stats: stats.clone(),
                 upload: UploadState::Uploading,
@@ -551,10 +554,10 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                             }
                             continue;
                         }
-                        handle_key(&mut app.session, key);
-                        if app.session.is_complete() {
-                            finish_and_maybe_upload(&mut app, terminal)?;
-                        }
+                    handle_key(&mut app.session, key);
+                    if app.session.is_complete() {
+                        finish_and_maybe_upload(&mut app, terminal)?;
+                    }
                     }
                     AppState::Finished { .. } => {
                         // 离线赛文：任意键重打同一篇；在线赛文不支持重打。
@@ -629,7 +632,8 @@ fn finish_and_maybe_upload(
     app: &mut App,
     terminal: &mut ratatui::DefaultTerminal,
 ) -> io::Result<()> {
-    if let Some((stats, elapsed)) = app.finish_typing() {
+    let result = app.finish_typing();
+    if let Some((stats, elapsed)) = result {
         // 先渲染「上传中」，再同步上传（阻塞）。
         terminal.draw(|frame| ui(frame, app))?;
         app.do_upload(&stats, elapsed);

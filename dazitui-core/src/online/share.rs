@@ -63,7 +63,15 @@ pub fn format_time(elapsed: Duration) -> String {
 
 /// 构造 52dazi.cn 上传请求体（业务字段，公共字段由 `client.upload_result` 自动合并）。
 ///
-/// 字段名与前端 `resultPostData` 一致；dazitui 无法采集的字段用 0 / 空串兜底。
+/// 字段名与前端 `resultPostData`（app.js 中的 vuex getter）逐项对齐：
+/// dazitui 不采集的字段用与前端一致的兜底值——`repeatNum`/`xuanChong`=0、
+/// `daCi`/`keyMethod`="0%"、`inputMethod`/`challengeFlag`/`isFirstSubmit`/`isGroupText`
+/// 沿用前端默认 0 / 空串。可采集字段：
+/// - `jianZhun`（击准率）= 正确字数 / 已上屏字数，百分比字符串（与前端 `e.accuracy+"%"` 同构）；
+/// - `wrongNum`/`jianShu`/`backspace`/`huiGai` 仍来自 `Stats`。
+///
+/// 缺字段会让服务端字段对齐校验失败（错误信息可表现为 token/username 解析异常），
+/// 故即便本端无法采集某些指标，也按前端 schema 输出兜底值。
 pub fn build_upload_payload(
     text: &Text,
     stats: &Stats,
@@ -77,6 +85,12 @@ pub fn build_upload_payload(
         .find(|(k, _)| k == "Backspace")
         .map(|(_, n)| *n)
         .unwrap_or(0);
+    // 击准率 = 正确字数 / 已上屏字数 * 100（与前端 accuracy 同口径）。无上屏时记 0。
+    let accuracy_pct = if stats.typed_chars == 0 {
+        0.0
+    } else {
+        stats.correct_chars as f64 / stats.typed_chars as f64 * 100.0
+    };
     serde_json::json!({
         "textTitle": text.title,
         "speed": upload.speed,
@@ -87,9 +101,14 @@ pub fn build_upload_payload(
         "huiGai": stats.edits,
         "huiChe": 0,
         "jianShu": total_keys,
-        "backspace": backspace,
+        "jianZhun": format!("{:.2}%", accuracy_pct),
+        "repeatNum": 0,
+        "daCi": "0%",
         "wrongNum": stats.wrong_total,
         "inputMethod": "",
+        "backspace": backspace,
+        "xuanChong": 0,
+        "keyMethod": "0%",
         "challengeFlag": 0,
         "isFirstSubmit": 0,
         "isGroupText": 0,
@@ -213,6 +232,65 @@ mod tests {
         assert_eq!(v["wrongNum"], 3); // sample_stats wrong_total=3
         assert_eq!(v["challengeFlag"], 0);
         assert_eq!(v["isFirstSubmit"], 0);
+    }
+
+    #[test]
+    fn build_upload_payload_includes_frontend_schema_fields() {
+        // 与前端 resultPostData 逐项对齐：服务端按字段位置校验，缺字段会被拒
+        // （错误信息可能表现为 token/username 解析异常）。此处断言这些字段键存在。
+        let stats = sample_stats();
+        let up = UploadStats {
+            speed: 85.2,
+            keystrokes: 3.5,
+            key_length: 2.8,
+        };
+        let text = Text {
+            title: "极速杯".into(),
+            content: "你好世界".into(),
+            source: TextSource::Online {
+                competition_type: CompetitionType::Jisu,
+            },
+        };
+        let v = build_upload_payload(&text, &stats, &up, Duration::from_secs(60));
+        // 五个之前缺失的新字段：jianZhun / repeatNum / daCi / xuanChong / keyMethod
+        assert!(v.get("jianZhun").is_some(), "缺 jianZhun: {v}");
+        assert!(v.get("repeatNum").is_some(), "缺 repeatNum: {v}");
+        assert!(v.get("daCi").is_some(), "缺 daCi: {v}");
+        assert!(v.get("xuanChong").is_some(), "缺 xuanChong: {v}");
+        assert!(v.get("keyMethod").is_some(), "缺 keyMethod: {v}");
+        // jianZhun 为击准率百分号字符串
+        let jian_zhun = v["jianZhun"].as_str().expect("jianZhun 应为字符串");
+        assert!(
+            jian_zhun.ends_with('%'),
+            "jianZhun 应以 % 结尾: {jian_zhun}"
+        );
+        // sample_stats: correct=40, typed=40 → 100%
+        assert_eq!(jian_zhun, "100.00%");
+        // daCi / keyMethod 为兜底的 "0%"
+        assert_eq!(v["daCi"], "0%");
+        assert_eq!(v["keyMethod"], "0%");
+        // repeatNum / xuanChong 兜底 0
+        assert_eq!(v["repeatNum"], 0);
+        assert_eq!(v["xuanChong"], 0);
+    }
+
+    #[test]
+    fn build_upload_payload_accuracy_zero_when_no_typed_chars() {
+        // 无上屏时击准率应记 0% 而非 NaN
+        let mut stats = sample_stats();
+        stats.typed_chars = 0;
+        let up = UploadStats {
+            speed: 0.0,
+            keystrokes: 0.0,
+            key_length: 0.0,
+        };
+        let text = Text {
+            title: "x".into(),
+            content: "c".into(),
+            source: TextSource::File,
+        };
+        let v = build_upload_payload(&text, &stats, &up, Duration::from_secs(1));
+        assert_eq!(v["jianZhun"], "0.00%");
     }
 
     #[test]
