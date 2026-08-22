@@ -5,17 +5,17 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use dazitui_core::{
-    ApiClient, ApiError, CharStatus, CompetitionType, FONT_SIZE_PT, LoadError, LoadOptions, Rgb,
-    Session, Settings, SettingsStore, Stats, Text, TextSource, Theme, TokenStore,
-    build_upload_payload, env_credentials, format_share_text, is_auth_failure, load_text_from_file,
-    load_text_from_file_with_options, osc_font_size_sequence, osc52_clipboard, should_auto_relogin,
-    to_upload_stats,
+    ApiClient, ApiError, BUILTIN_SETS, CharStatus, CompetitionType, FONT_SIZE_PT,
+    LoadError, LoadOptions, Rgb, Session, Settings, SettingsStore, Stats, Text, TextSource,
+    Theme, TokenStore, build_upload_payload, env_credentials, format_share_text,
+    is_auth_failure, load_builtin_text, load_text_from_file, load_text_from_file_with_options,
+    osc_font_size_sequence, osc52_clipboard, should_auto_relogin, to_upload_stats,
 };
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::prelude::Stylize;
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::text::{Line, Span, Text as TextLines};
 use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 
 /// 跟打应用状态。
@@ -26,6 +26,8 @@ enum AppState {
     Finished { stats: Stats, upload: UploadState },
     /// 载文浏览：功能栏显示文件列表，可预览与载入。
     Browsing,
+    /// 内置赛文浏览：功能栏显示套题列表，可载入。
+    BrowsingBuiltin,
     /// 设置视图：切换主题等外观设置。
     Settings,
 }
@@ -71,6 +73,8 @@ struct App {
     browse_files: Vec<PathBuf>,
     /// 文件列表当前选中下标。
     browse_selection: usize,
+    /// 内置赛文浏览当前选中下标。
+    builtin_selection: usize,
     /// 载文选项。
     options: LoadOptions,
     /// 载文失败时的错误提示。
@@ -169,6 +173,7 @@ impl App {
             sidebar_visible: true,
             browse_files: Vec::new(),
             browse_selection: 0,
+            builtin_selection: 0,
             options: LoadOptions::default(),
             browse_error: None,
             token_store,
@@ -316,6 +321,23 @@ impl App {
         }
     }
 
+    /// 进入内置赛文浏览：展示套题列表，可载入。
+    fn open_builtin_browser(&mut self) {
+        self.builtin_selection = 0;
+        self.state = AppState::BrowsingBuiltin;
+    }
+
+    /// 载入当前选中的内置赛文，进入新跟打。
+    fn load_selected_builtin(&mut self) {
+        let Some(set) = BUILTIN_SETS.get(self.builtin_selection).copied() else {
+            return;
+        };
+        self.text = load_builtin_text(set);
+        self.session = Session::new(&self.text.content);
+        self.start = Instant::now();
+        self.state = AppState::Typing;
+    }
+
     /// 按比赛类型下载在线赛文并进入跟打。
     ///
     /// 调用前 `online_loading` 已由事件循环置为 `Some` 并渲染（保证「加载中...」可见）；
@@ -454,9 +476,14 @@ impl App {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    // 无参数：默认载入首套内置赛文（常用单字前五百）。
     let Some(path) = args.get(1) else {
-        eprintln!("用法: dazitui <文件名>");
-        std::process::exit(1);
+        let text = load_builtin_text(BUILTIN_SETS[0]);
+        if let Err(e) = run_tui(App::new(text)) {
+            eprintln!("错误: {e}");
+            std::process::exit(1);
+        }
+        return;
     };
 
     let text = match load_text_from_file(Path::new(path)) {
@@ -532,6 +559,10 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                             app.open_browser();
                             continue;
                         }
+                        if is_open_builtin_browser(key) {
+                            app.open_builtin_browser();
+                            continue;
+                        }
                         if is_open_settings(key) {
                             app.state = AppState::Settings;
                             continue;
@@ -583,6 +614,18 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                         KeyCode::Char('2') => {
                             app.options.strip_punctuation = !app.options.strip_punctuation
                         }
+                        _ => {}
+                    },
+                    AppState::BrowsingBuiltin => match key.code {
+                        KeyCode::Up => {
+                            app.builtin_selection = app.builtin_selection.saturating_sub(1);
+                        }
+                        KeyCode::Down => {
+                            app.builtin_selection =
+                                (app.builtin_selection + 1).min(BUILTIN_SETS.len() - 1);
+                        }
+                        KeyCode::Enter => app.load_selected_builtin(),
+                        KeyCode::Esc => app.state = AppState::Typing,
                         _ => {}
                     },
                     AppState::Settings => match key.code {
@@ -657,19 +700,26 @@ fn restart_allowed(key: KeyEvent, is_online: bool) -> bool {
 }
 
 /// 底部快捷键提示栏文案：按浏览状态与赛文来源动态切换（在线赛文不显示重打）。
-fn hint_text(browsing: bool, is_online: bool) -> &'static str {
+fn hint_text(browsing: bool, browsing_builtin: bool, is_online: bool) -> &'static str {
     if browsing {
         " ↑↓ 选择 | Enter 载入 | Esc 取消 | 1 去空格 | 2 去符号 | Ctrl-E 设置 | q 退出"
+    } else if browsing_builtin {
+        " ↑↓ 选择 | Enter 载入 | Esc 取消 | q 退出"
     } else if is_online {
-        " q 退出 | Ctrl-S 结束 | Ctrl-F 载文 | Ctrl-O 登录 | Ctrl-E 设置 | Tab 收起栏 "
+        " q 退出 | Ctrl-S 结束 | Ctrl-B 内置赛文 | Ctrl-F 载文 | Ctrl-O 登录 | Ctrl-E 设置 | Tab 收起栏 "
     } else {
-        " q 退出 | Ctrl-S 结束 | Ctrl-R 重打 | Ctrl-F 载文 | Ctrl-O 登录 | Ctrl-E 设置 | Tab 收起栏 "
+        " q 退出 | Ctrl-S 结束 | Ctrl-R 重打 | Ctrl-B 内置赛文 | Ctrl-F 载文 | Ctrl-O 登录 | Ctrl-E 设置 | Tab 收起栏 "
     }
 }
 
 /// 进入载文浏览快捷键：Ctrl-F（File）。
 fn is_open_browser(key: KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('f')
+}
+
+/// 进入内置赛文浏览快捷键：Ctrl-B（Builtin）。
+fn is_open_builtin_browser(key: KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('b')
 }
 
 /// 收起/展开功能栏：Tab。
@@ -849,6 +899,7 @@ fn ui(frame: &mut Frame, app: &App) {
         return;
     }
     let browsing = matches!(app.state, AppState::Browsing);
+    let browsing_builtin = matches!(app.state, AppState::BrowsingBuiltin);
     // 整体：主区 + 底部快捷键 bar
     let [main, help_bar] =
         Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(frame.area());
@@ -858,11 +909,13 @@ fn ui(frame: &mut Frame, app: &App) {
         Layout::horizontal([Constraint::Length(sidebar_width), Constraint::Min(0)]).areas(main);
 
     if app.sidebar_visible {
-        render_sidebar(frame, app, sidebar, browsing);
+        render_sidebar(frame, app, sidebar, browsing, browsing_builtin);
     }
 
     if browsing {
         render_preview(frame, app, content);
+    } else if browsing_builtin {
+        render_builtin_preview(frame, app, content);
     } else {
         // 内容区：上对照区 + 下跟打区（按设置占比分配）
         let (ref_pct, type_pct) = area_ratios(app.settings.reference_ratio);
@@ -873,26 +926,36 @@ fn ui(frame: &mut Frame, app: &App) {
         .areas(content);
         // 上：对照原文区（已跟打部分绿/红着色）
         frame.render_widget(
-            Paragraph::new(original_line(&app.session, app.theme(), app.settings.bold))
-                .block(themed_block(app.theme()).title(format!(" 对照区 — {} ", app.text.title)))
-                .wrap(Wrap { trim: false }),
+            Paragraph::new(original_line(
+                &app.session,
+                app.text.source,
+                app.theme(),
+                app.settings.bold,
+            ))
+            .block(themed_block(app.theme()).title(format!(" 对照区 — {} ", app.text.title)))
+            .wrap(Wrap { trim: false }),
             ref_area,
         );
         // 下：跟打区（实时绿/红渲染）
         frame.render_widget(
-            Paragraph::new(type_line(&app.session, app.theme(), app.settings.bold))
-                .block(themed_block(app.theme()).title(format!(
-                    " 跟打区 — {}/{} 字符 ",
-                    app.session.len(),
-                    app.text.content.chars().count()
-                )))
-                .wrap(Wrap { trim: false }),
+            Paragraph::new(type_line(
+                &app.session,
+                app.text.source,
+                app.theme(),
+                app.settings.bold,
+            ))
+            .block(themed_block(app.theme()).title(format!(
+                " 跟打区 — {}/{} 字符 ",
+                app.session.len(),
+                app.text.content.chars().count()
+            )))
+            .wrap(Wrap { trim: false }),
             type_area,
         );
     }
 
     // 底部快捷键提示 bar
-    let hint = hint_text(browsing, app.text.is_online());
+    let hint = hint_text(browsing, browsing_builtin, app.text.is_online());
     frame.render_widget(Paragraph::new(Line::from(hint)), help_bar);
 
     // 登录模态框（覆盖层）
@@ -952,7 +1015,13 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
 }
 
 /// 左侧功能栏：文件列表 + 载文选项开关。
-fn render_sidebar(frame: &mut Frame, app: &App, area: ratatui::layout::Rect, browsing: bool) {
+fn render_sidebar(
+    frame: &mut Frame,
+    app: &App,
+    area: ratatui::layout::Rect,
+    browsing: bool,
+    browsing_builtin: bool,
+) {
     let theme = app.theme();
     let mut lines: Vec<Line> = Vec::new();
     if browsing {
@@ -976,8 +1045,19 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: ratatui::layout::Rect, bro
         if let Some(err) = &app.browse_error {
             lines.push(Line::from(format!(" 错误: {err}")).fg(color(theme.wrong)));
         }
+    } else if browsing_builtin {
+        lines.push(Line::from(" 内置赛文:").bold());
+        for (i, set) in BUILTIN_SETS.iter().enumerate() {
+            let prefix = if i == app.builtin_selection {
+                " > "
+            } else {
+                "   "
+            };
+            lines.push(Line::from(format!("{prefix}{}", set.name())));
+        }
     } else {
         lines.push(Line::from(" 载入文件（Ctrl-F）").fg(color(theme.muted)));
+        lines.push(Line::from(" 内置赛文（Ctrl-B）").fg(color(theme.muted)));
     }
     lines.push(Line::from(""));
     lines.push(Line::from(" 载文选项:").bold());
@@ -1058,6 +1138,36 @@ fn render_preview(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         Line::from(""),
         Line::from(" Enter 载入 | Esc 取消 ").fg(color(theme.muted)),
     ];
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(themed_block(theme).title(" 预览 "))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+/// 内置赛文预览：右侧内容区显示选中套题的内容预览。
+fn render_builtin_preview(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let theme = app.theme();
+    let (title, body) = match BUILTIN_SETS.get(app.builtin_selection) {
+        Some(set) => {
+            let content = set.content();
+            let chars: Vec<char> = content.chars().take(400).collect();
+            let dot = if content.chars().count() > 400 { "…" } else { "" };
+            (set.name(), format!("{}{dot}", chars.iter().collect::<String>()))
+        }
+        None => ("预览", "（无内置赛文）".to_string()),
+    };
+    // 预览也按每 10 字一页，与实际跟打展示一致。
+    let mut lines: Vec<Line> = vec![
+        Line::from(format!(" 内置赛文 — {title} ")).bold(),
+        Line::from(""),
+    ];
+    for chunk in body.chars().collect::<Vec<char>>().chunks(BUILTIN_CHARS_PER_PAGE) {
+        lines.push(Line::from(chunk.iter().collect::<String>()));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(" Enter 载入 | Esc 取消 ").fg(color(theme.muted)));
     frame.render_widget(
         Paragraph::new(lines)
             .block(themed_block(theme).title(" 预览 "))
@@ -1228,10 +1338,35 @@ fn upload_lines(upload: &UploadState, theme: Theme) -> Vec<Line<'static>> {
     }
 }
 
+/// 内置赛文每页显示的字数（每 10 字一页，打完当前页自动翻到下一页）。
+const BUILTIN_CHARS_PER_PAGE: usize = 10;
+
+/// 内置赛文当前页的起始字符索引：已打字数整除页大小，打满当前页（第 10 字）即翻到下一页。
+fn builtin_page_start(typed_len: usize) -> usize {
+    (typed_len / BUILTIN_CHARS_PER_PAGE) * BUILTIN_CHARS_PER_PAGE
+}
+
 /// 将对照区的字符按跟打状态着色：已打对=correct、已打错=wrong、未打到=默认。
-fn original_line(session: &Session, theme: Theme, bold: bool) -> Line<'static> {
-    let spans: Vec<Span<'static>> = session
-        .original_status()
+///
+/// 内置赛文只显示当前页（10 字），打完当前页自动翻页；其余来源显示全文（由终端宽度自动折行）。
+fn original_line(
+    session: &Session,
+    source: TextSource,
+    theme: Theme,
+    bold: bool,
+) -> TextLines<'static> {
+    let statuses = if matches!(source, TextSource::Builtin { .. }) {
+        let start = builtin_page_start(session.len());
+        session
+            .original_status()
+            .into_iter()
+            .skip(start)
+            .take(BUILTIN_CHARS_PER_PAGE)
+            .collect::<Vec<_>>()
+    } else {
+        session.original_status()
+    };
+    let spans: Vec<Span<'static>> = statuses
         .into_iter()
         .map(|(c, status)| {
             let style = match status {
@@ -1242,14 +1377,33 @@ fn original_line(session: &Session, theme: Theme, bold: bool) -> Line<'static> {
             Span::styled(c.to_string(), style.add_modifier(bold_modifier(bold)))
         })
         .collect();
-    Line::from(spans)
+    group_spans(spans, source)
 }
 
-/// 将跟打区的字符按对/错渲染为 correct/wrong 一行。
-fn type_line(session: &Session, theme: Theme, bold: bool) -> Line<'static> {
-    let display = session.display();
+/// 将跟打区的字符按对/错渲染为 correct/wrong。
+///
+/// 内置赛文只显示当前页（10 字），打完当前页自动翻页；其余来源显示全文（由终端宽度自动折行）。
+fn type_line(
+    session: &Session,
+    source: TextSource,
+    theme: Theme,
+    bold: bool,
+) -> TextLines<'static> {
+    let display = if matches!(source, TextSource::Builtin { .. }) {
+        let start = builtin_page_start(session.len());
+        session
+            .display()
+            .into_iter()
+            .skip(start)
+            .take(BUILTIN_CHARS_PER_PAGE)
+            .collect::<Vec<_>>()
+    } else {
+        session.display()
+    };
     if display.is_empty() {
-        return Line::from("（跟打区 — 输入法上屏文字将显示在这里）").fg(color(theme.muted));
+        return TextLines::from(
+            Line::from("（跟打区 — 输入法上屏文字将显示在这里）").fg(color(theme.muted)),
+        );
     }
     let spans: Vec<Span<'static>> = display
         .into_iter()
@@ -1261,7 +1415,20 @@ fn type_line(session: &Session, theme: Theme, bold: bool) -> Line<'static> {
             Span::styled(c.to_string(), style.add_modifier(bold_modifier(bold)))
         })
         .collect();
-    Line::from(spans)
+    group_spans(spans, source)
+}
+
+/// 把已着色的 span 序列按赛文来源组织成多行文本：内置赛文每页 10 字一行，其余为单行。
+fn group_spans(spans: Vec<Span<'static>>, source: TextSource) -> TextLines<'static> {
+    let mut text = TextLines::default();
+    if matches!(source, TextSource::Builtin { .. }) {
+        for chunk in spans.chunks(BUILTIN_CHARS_PER_PAGE) {
+            text.push_line(Line::from(chunk.to_vec()));
+        }
+    } else {
+        text.push_line(Line::from(spans));
+    }
+    text
 }
 
 #[cfg(test)]
@@ -1420,12 +1587,107 @@ mod tests {
     #[test]
     fn hint_text_hides_restart_when_online() {
         // 离线跟打：显示重打提示。
-        assert!(hint_text(false, false).contains("重打"));
+        assert!(hint_text(false, false, false).contains("重打"));
         // 在线跟打：不显示重打提示。
-        assert!(!hint_text(false, true).contains("重打"));
+        assert!(!hint_text(false, false, true).contains("重打"));
         // 浏览态（载文选择）与来源无关，也不显示重打。
-        assert!(!hint_text(true, false).contains("重打"));
-        assert!(!hint_text(true, true).contains("重打"));
+        assert!(!hint_text(true, false, false).contains("重打"));
+        assert!(!hint_text(true, false, true).contains("重打"));
+        // 内置赛文浏览态：不显示重打。
+        assert!(!hint_text(false, true, false).contains("重打"));
+    }
+
+    #[test]
+    fn ctrl_b_opens_builtin_browser() {
+        assert!(is_open_builtin_browser(KeyEvent::new(
+            KeyCode::Char('b'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(!is_open_builtin_browser(KeyEvent::new(
+            KeyCode::Char('b'),
+            KeyModifiers::NONE
+        )));
+    }
+
+    #[test]
+    fn no_arg_startup_loads_default_builtin() {
+        // 默认载入首套内置赛文（常用单字前五百）：内容非空、来源为 Builtin、可重打。
+        let text = load_builtin_text(BUILTIN_SETS[0]);
+        assert!(!text.content.is_empty());
+        assert!(matches!(text.source, TextSource::Builtin { .. }));
+        assert!(!text.is_online());
+        assert_eq!(text.title, "常用单字前五百");
+    }
+
+    #[test]
+    fn builtin_sets_in_order() {
+        assert_eq!(BUILTIN_SETS.len(), 6);
+        assert_eq!(BUILTIN_SETS[0].name(), "常用单字前五百");
+        assert_eq!(BUILTIN_SETS[1].name(), "常用单字中五百");
+        assert_eq!(BUILTIN_SETS[2].name(), "常用单字后五百");
+        assert_eq!(BUILTIN_SETS[3].name(), "常用词组前五百");
+        assert_eq!(BUILTIN_SETS[4].name(), "常用词组中五百");
+        assert_eq!(BUILTIN_SETS[5].name(), "常用词组后五百");
+    }
+
+    #[test]
+    fn builtin_content_has_no_newlines() {
+        // include_str! 后去换行：内容应为纯单字串，无换行。
+        for set in BUILTIN_SETS {
+            let text = load_builtin_text(set);
+            assert!(
+                !text.content.contains('\n') && !text.content.contains('\r'),
+                "{} 含换行",
+                set.name()
+            );
+        }
+    }
+
+    #[test]
+    fn builtin_sets_have_no_overlap_and_unique() {
+        // 单字三套各 500 字，互不重复。用 load_builtin_text（已去换行）取内容。
+        let cq: Vec<char> = load_builtin_text(BUILTIN_SETS[0]).content.chars().collect();
+        let cz: Vec<char> = load_builtin_text(BUILTIN_SETS[1]).content.chars().collect();
+        let ch: Vec<char> = load_builtin_text(BUILTIN_SETS[2]).content.chars().collect();
+        assert_eq!(cq.len(), 500);
+        assert_eq!(cz.len(), 500);
+        assert_eq!(ch.len(), 500);
+        let cq_set: std::collections::HashSet<char> = cq.iter().copied().collect();
+        let cz_set: std::collections::HashSet<char> = cz.iter().copied().collect();
+        let ch_set: std::collections::HashSet<char> = ch.iter().copied().collect();
+        assert_eq!(cq_set.len(), 500, "单字前五百有重复");
+        assert_eq!(cz_set.len(), 500, "单字中五百有重复");
+        assert_eq!(ch_set.len(), 500, "单字后五百有重复");
+        assert!(cq_set.is_disjoint(&cz_set), "单字前/中五百有重叠");
+        assert!(cq_set.is_disjoint(&ch_set), "单字前/后五百有重叠");
+        assert!(cz_set.is_disjoint(&ch_set), "单字中/后五百有重叠");
+
+        // 词组三套：内容非空，互不相同（词组以二字词为主，字符会复现，不做字符级唯一性检查）。
+        let wq = load_builtin_text(BUILTIN_SETS[3]).content;
+        let wz = load_builtin_text(BUILTIN_SETS[4]).content;
+        let wh = load_builtin_text(BUILTIN_SETS[5]).content;
+        assert!(!wq.is_empty() && !wz.is_empty() && !wh.is_empty());
+        assert_ne!(wq, wz);
+        assert_ne!(wq, wh);
+        assert_ne!(wz, wh);
+    }
+
+    #[test]
+    fn load_selected_builtin_replaces_text_and_starts_typing() {
+        let mut app = test_app(Text {
+            title: "old".into(),
+            content: "旧赛文".into(),
+            source: TextSource::File,
+        });
+        // 选中第二套（中五百）。
+        app.open_builtin_browser();
+        app.builtin_selection = 1;
+        app.load_selected_builtin();
+        assert_eq!(app.text.title, "常用单字中五百");
+        assert!(matches!(app.text.source, TextSource::Builtin { .. }));
+        assert!(!app.text.is_online());
+        assert!(matches!(app.state, AppState::Typing));
+        assert_eq!(app.session.len(), 0);
     }
 
     #[test]
@@ -1510,7 +1772,8 @@ mod tests {
         let theme = Theme::preset(ThemePreset::Default);
         let mut session = Session::new("你好世界");
         session.type_text("你好四界");
-        let line = type_line(&session, theme, false);
+        let text = type_line(&session, TextSource::File, theme, false);
+        let line = &text.lines[0];
         assert_eq!(line.spans.len(), 4);
         assert_eq!(line.spans[0].style.fg, Some(color(theme.correct)));
         assert_eq!(line.spans[2].style.fg, Some(color(theme.wrong)));
@@ -1521,7 +1784,8 @@ mod tests {
         let theme = Theme::preset(ThemePreset::Default);
         let mut session = Session::new("你好世界");
         session.type_text("你好四");
-        let line = original_line(&session, theme, false);
+        let text = original_line(&session, TextSource::File, theme, false);
+        let line = &text.lines[0];
         assert_eq!(line.spans.len(), 4);
         assert_eq!(line.spans[0].style.fg, Some(color(theme.correct))); // 你 ✓
         assert_eq!(line.spans[2].style.fg, Some(color(theme.wrong))); // 世 ✗（打成四）
@@ -1539,11 +1803,13 @@ mod tests {
         let theme = Theme::preset(ThemePreset::Default);
         let mut session = Session::new("你好世界");
         session.type_text("你好");
-        let line = type_line(&session, theme, true);
+        let text = type_line(&session, TextSource::File, theme, true);
+        let line = &text.lines[0];
         assert_eq!(line.spans[0].style.add_modifier, Modifier::BOLD);
         assert_eq!(line.spans[1].style.add_modifier, Modifier::BOLD);
-        let plain = type_line(&session, theme, false);
-        assert_eq!(plain.spans[0].style.add_modifier, Modifier::empty());
+        let plain = type_line(&session, TextSource::File, theme, false);
+        let plain_line = &plain.lines[0];
+        assert_eq!(plain_line.spans[0].style.add_modifier, Modifier::empty());
     }
 
     #[test]
@@ -1552,11 +1818,13 @@ mod tests {
         let mut session = Session::new("你好世界");
         session.type_text("你好");
         // 已打到（对）与未打到都加粗。
-        let line = original_line(&session, theme, true);
+        let text = original_line(&session, TextSource::File, theme, true);
+        let line = &text.lines[0];
         assert_eq!(line.spans[0].style.add_modifier, Modifier::BOLD);
         assert_eq!(line.spans[2].style.add_modifier, Modifier::BOLD);
-        let plain = original_line(&session, theme, false);
-        assert_eq!(plain.spans[0].style.add_modifier, Modifier::empty());
+        let plain = original_line(&session, TextSource::File, theme, false);
+        let plain_line = &plain.lines[0];
+        assert_eq!(plain_line.spans[0].style.add_modifier, Modifier::empty());
     }
 
     #[test]
@@ -1710,8 +1978,10 @@ mod tests {
         let dracula_theme = Theme::preset(ThemePreset::Dracula);
         let mut session = Session::new("你好");
         session.type_text("你四");
-        let default_line = original_line(&session, default_theme, false);
-        let dracula_line = original_line(&session, dracula_theme, false);
+        let default_text = original_line(&session, TextSource::File, default_theme, false);
+        let dracula_text = original_line(&session, TextSource::File, dracula_theme, false);
+        let default_line = &default_text.lines[0];
+        let dracula_line = &dracula_text.lines[0];
         assert_eq!(
             default_line.spans[0].style.fg,
             Some(color(default_theme.correct))
@@ -1736,6 +2006,64 @@ mod tests {
             default_line.spans[1].style.fg,
             dracula_line.spans[1].style.fg
         );
+    }
+
+    #[test]
+    fn type_line_builtin_shows_only_current_page() {
+        // 25 字内置赛文：每页 10 字，打满当前页（第 10 字）即翻到下一页，跟打区只显示当前页。
+        let theme = Theme::preset(ThemePreset::Default);
+        let mut session = Session::new("一二三四五六七八九十甲乙丙丁戊己庚辛壬癸子丑寅卯辰");
+        // 打 5 字：仍在第一页，跟打区显示当前页已打的 5 字。
+        session.type_text("一二三四五");
+        let text = type_line(&session, TextSource::Builtin { set: BUILTIN_SETS[0] }, theme, false);
+        assert_eq!(text.lines.len(), 1, "第一页应只有一行");
+        assert_eq!(text.lines[0].spans.len(), 5, "打 5 字应显示 5 字");
+        // 打到 10 字：打满第一页，翻到第二页，跟打区显示第二页前 0 字（空输入提示）。
+        session.type_text("六七八九十");
+        let text = type_line(&session, TextSource::Builtin { set: BUILTIN_SETS[0] }, theme, false);
+        assert_eq!(text.lines.len(), 1, "翻到第二页尚未打字时应显示提示行");
+        // 打到 13 字：第二页已打 3 字，跟打区显示 3 字。
+        session.type_text("甲乙丙");
+        let text = type_line(&session, TextSource::Builtin { set: BUILTIN_SETS[0] }, theme, false);
+        assert_eq!(text.lines.len(), 1, "第二页应只有一行");
+        assert_eq!(text.lines[0].spans.len(), 3, "打 13 字应翻页显示第 11-13 字");
+    }
+
+    #[test]
+    fn original_line_builtin_shows_only_current_page() {
+        // 25 字内置赛文：对照区只显示当前页 10 字，打满当前页（第 10 字）即翻到下一页。
+        let theme = Theme::preset(ThemePreset::Default);
+        let mut session = Session::new("一二三四五六七八九十甲乙丙丁戊己庚辛壬癸子丑寅卯辰");
+        // 打 5 字：对照区显示第一页 10 字（前 5 已打对，后 5 未打到）。
+        session.type_text("一二三四五");
+        let text = original_line(&session, TextSource::Builtin { set: BUILTIN_SETS[0] }, theme, false);
+        assert_eq!(text.lines.len(), 1, "第一页应只有一行");
+        assert_eq!(text.lines[0].spans.len(), 10, "对照区第一页应显示 10 字");
+        // 打到 10 字：打满第一页，翻到第二页，对照区显示第 11-20 字（10 字）。
+        session.type_text("六七八九十");
+        let text = original_line(&session, TextSource::Builtin { set: BUILTIN_SETS[0] }, theme, false);
+        assert_eq!(text.lines.len(), 1, "第二页应只有一行");
+        assert_eq!(text.lines[0].spans.len(), 10, "对照区第二页应显示 10 字");
+    }
+
+    #[test]
+    fn type_line_file_source_stays_single_line() {
+        // 非内置赛文（File）保持单行：由终端宽度自动折行，不分多行 span。
+        let theme = Theme::preset(ThemePreset::Default);
+        let mut session = Session::new("一二三四五六七八九十十一十");
+        session.type_text("一二三四五六七八九十十一十");
+        let text = type_line(&session, TextSource::File, theme, false);
+        assert_eq!(text.lines.len(), 1);
+        assert_eq!(text.lines[0].spans.len(), 13);
+    }
+
+    #[test]
+    fn type_line_empty_input_builtin_shows_placeholder() {
+        // 空输入时显示提示行（不分多行、无空 span）。
+        let theme = Theme::preset(ThemePreset::Default);
+        let session = Session::new("一二三四五六七八九十");
+        let text = type_line(&session, TextSource::Builtin { set: BUILTIN_SETS[0] }, theme, false);
+        assert_eq!(text.lines.len(), 1, "空输入应只有一行提示");
     }
 
     #[test]
@@ -2060,6 +2388,16 @@ mod tests {
             title: "t".into(),
             content: content.into(),
             source: TextSource::File,
+        }
+    }
+
+    fn builtin_text(content: &str) -> Text {
+        Text {
+            title: "常用单字前五百".into(),
+            content: content.into(),
+            source: TextSource::Builtin {
+                set: BUILTIN_SETS[0],
+            },
         }
     }
 

@@ -36,13 +36,77 @@ pub struct Text {
     pub source: TextSource,
 }
 
-/// 赛文来源：本地文件或 52dazi.cn 在线比赛。
+/// 赛文来源：本地文件、内置赛文或 52dazi.cn 在线比赛。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TextSource {
     /// 本地文件。
     File,
+    /// 内置赛文（随二进制分发的练习材料，如常用单字）。
+    Builtin { set: BuiltinSet },
     /// 52dazi.cn 在线赛文。
     Online { competition_type: CompetitionType },
+}
+
+/// 内置赛文集合（每套一个枚举变体）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuiltinSet {
+    /// 常用单字前五百。
+    CommonCharsQian,
+    /// 常用单字中五百。
+    CommonCharsZhong,
+    /// 常用单字后五百。
+    CommonCharsHou,
+    /// 常用词组前五百。
+    CommonWordsQian,
+    /// 常用词组中五百。
+    CommonWordsZhong,
+    /// 常用词组后五百。
+    CommonWordsHou,
+}
+
+impl BuiltinSet {
+    /// 赛文的中文名。
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::CommonCharsQian => "常用单字前五百",
+            Self::CommonCharsZhong => "常用单字中五百",
+            Self::CommonCharsHou => "常用单字后五百",
+            Self::CommonWordsQian => "常用词组前五百",
+            Self::CommonWordsZhong => "常用词组中五百",
+            Self::CommonWordsHou => "常用词组后五百",
+        }
+    }
+
+    /// 赛文内容（已去换行，为纯字符串）。
+    pub fn content(&self) -> &'static str {
+        match self {
+            Self::CommonCharsQian => include_str!("../data/common-chars-qian.txt"),
+            Self::CommonCharsZhong => include_str!("../data/common-chars-zhong.txt"),
+            Self::CommonCharsHou => include_str!("../data/common-chars-hou.txt"),
+            Self::CommonWordsQian => include_str!("../data/common-words-qian.txt"),
+            Self::CommonWordsZhong => include_str!("../data/common-words-zhong.txt"),
+            Self::CommonWordsHou => include_str!("../data/common-words-hou.txt"),
+        }
+    }
+}
+
+/// 所有内置赛文，按功能栏展示顺序。
+pub const BUILTIN_SETS: [BuiltinSet; 6] = [
+    BuiltinSet::CommonCharsQian,
+    BuiltinSet::CommonCharsZhong,
+    BuiltinSet::CommonCharsHou,
+    BuiltinSet::CommonWordsQian,
+    BuiltinSet::CommonWordsZhong,
+    BuiltinSet::CommonWordsHou,
+];
+
+/// 载入内置赛文：内容为纯字符串（已去除换行）。
+pub fn load_builtin_text(set: BuiltinSet) -> Text {
+    Text {
+        title: set.name().to_string(),
+        content: set.content().replace(['\n', '\r'], ""),
+        source: TextSource::Builtin { set },
+    }
 }
 
 /// 52dazi.cn 比赛类型。

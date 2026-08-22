@@ -44,6 +44,7 @@ pub fn to_upload_stats(stats: &Stats, elapsed: Duration) -> UploadStats {
 pub fn format_share_text(source: &TextSource, rank: Option<u32>, stats: &UploadStats) -> String {
     let name = match source {
         TextSource::File => "本地",
+        TextSource::Builtin { set } => set.name(),
         TextSource::Online { competition_type } => competition_type.name(),
     };
     let rank_part = rank.map(|r| format!(" 第{r}名")).unwrap_or_default();
