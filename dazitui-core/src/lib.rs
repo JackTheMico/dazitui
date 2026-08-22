@@ -6,7 +6,7 @@ mod settings;
 #[cfg(feature = "online")]
 mod online;
 
-pub use session::{CharStatus, Session, Stats, TypeResult};
+pub use session::{CharStatus, GROUP_SIZE, Session, Stats, TypeResult};
 pub use settings::{
     FONT_SIZE_PT, Rgb, Settings, SettingsStore, Theme, ThemePreset, osc_font_size_sequence,
 };
@@ -65,6 +65,11 @@ impl TextSource {
                     | BuiltinSet::CommonWordsHou
             }
         )
+    }
+
+    /// 是否为内置赛文（启用组边界门槛）。
+    pub fn is_builtin(&self) -> bool {
+        matches!(self, TextSource::Builtin { .. })
     }
 }
 

@@ -42,44 +42,89 @@ pub struct Stats {
     pub edit_details: Vec<char>,
 }
 
+/// 内置赛文组大小：每组 10 个单位（单字赛文=10 字，词组赛文=10 词）。
+/// 组内可自由打/退；组边界处设门槛——当前组全对才放行进下一组。
+pub const GROUP_SIZE: usize = 10;
+
 /// 跟打会话状态机。
 ///
 /// 持有原文与当前已上屏的输入，通过 LCS 对齐逐字比对。
+/// `completed_groups` 跟踪已全对完成的组数（每组 `GROUP_SIZE` 字），
+/// 用于内置赛文的组边界门槛：组内可自由打/退，但退格不可跨越已完成组边界。
+/// `group_gated` 为 true 时启用组边界门槛（内置赛文），为 false 时无门槛（离线/在线赛文）。
 pub struct Session {
     original: Vec<char>,
     input: Vec<char>,
     edits: u32,
     key_counts: HashMap<String, u32>,
     edit_details: Vec<char>,
+    completed_groups: usize,
+    group_gated: bool,
 }
 
 impl Session {
-    /// 以赛文原文初始化跟打会话。
+    /// 以赛文原文初始化跟打会话（无组门槛）。
     pub fn new(original: &str) -> Self {
+        Self::new_gated(original, false)
+    }
+
+    /// 以赛文原文初始化跟打会话，指定是否启用组边界门槛（内置赛文）。
+    pub fn new_gated(original: &str, group_gated: bool) -> Self {
         Self {
             original: original.chars().collect(),
             input: Vec::new(),
             edits: 0,
             key_counts: HashMap::new(),
             edit_details: Vec::new(),
+            completed_groups: 0,
+            group_gated,
         }
     }
 
     /// 上屏一段文本：追加到输入末尾，重新与原文比对，返回本次字符的对/错。
+    ///
+    /// 组边界门槛（内置赛文）：当前组（`GROUP_SIZE` 字）全对才放行。
+    /// 多字符输入跨组边界时只接受到当前组末尾，超出部分丢弃。
     pub fn type_text(&mut self, committed: &str) -> TypeResult {
         let chars: Vec<char> = committed.chars().collect();
         let start = self.input.len();
-        self.input.extend(chars.iter().copied());
+        if self.group_gated {
+            let (_, group_end) = self.current_group_bounds();
+            // 截断到组边界：只接受到当前组末尾的字符数
+            let accept = group_end.saturating_sub(self.input.len()).min(chars.len());
+            self.input.extend(chars[..accept].iter().copied());
+        } else {
+            self.input.extend(chars.iter().copied());
+        }
         let statuses = self.align();
         let statuses = statuses[start..].to_vec();
+        // 检查当前组是否全对（仅组门槛模式）
+        if self.group_gated {
+            let (group_start, group_end) = self.current_group_bounds();
+            if self.input.len() >= group_end && group_end > group_start {
+                let all_correct = (group_start..group_end)
+                    .all(|i| self.input.get(i) == Some(&self.original[i]));
+                if all_correct {
+                    self.completed_groups += 1;
+                }
+            }
+        }
         TypeResult {
             statuses,
             edit_count: 0,
         }
     }
 
-    /// 回改一次：删除最后一个已上屏字符，返回是否成功（输入非空才有效）。
+    /// 回改一次：删除最后一个已上屏字符，返回是否成功。
+    ///
+    /// 组边界门槛（内置赛文）：已完成组的起始位置不可回改（锁住已完成组）。
     pub fn backspace(&mut self) -> bool {
+        if self.group_gated {
+            let (group_start, _) = self.current_group_bounds();
+            if self.input.len() <= group_start {
+                return false;
+            }
+        }
         if let Some(c) = self.input.pop() {
             self.edits += 1;
             self.edit_details.push(c);
@@ -173,13 +218,32 @@ impl Session {
     }
 
     /// 是否已上屏完整篇原文。
+    ///
+    /// 组边界门槛（内置赛文）：所有组全部全对才算完成（`completed_groups * GROUP_SIZE >= original.len()`）。
+    /// 非门槛模式：上屏长度 ≥ 原文长度即完成。
     pub fn is_complete(&self) -> bool {
-        self.input.len() >= self.original.len()
+        if self.group_gated {
+            self.completed_groups * GROUP_SIZE >= self.original.len()
+        } else {
+            self.input.len() >= self.original.len()
+        }
     }
 
     /// 累计回改次数。
     pub fn edit_count(&self) -> u32 {
         self.edits
+    }
+
+    /// 已全对完成的组数（每组 `GROUP_SIZE` 字）。TUI 据此计算当前页起始。
+    pub fn completed_groups(&self) -> usize {
+        self.completed_groups
+    }
+
+    /// 当前组的字符范围 `[start, end)`（`end` 尾组截断到原文长度）。
+    fn current_group_bounds(&self) -> (usize, usize) {
+        let start = self.completed_groups * GROUP_SIZE;
+        let end = (start + GROUP_SIZE).min(self.original.len());
+        (start, end)
     }
 
     /// 对 input 与 original 做 LCS 对齐，返回 input 每个字符的对/错。
@@ -259,7 +323,7 @@ mod tests {
     #[test]
     fn extra_typed_char_is_wrong_but_does_not_crash() {
         let mut session = Session::new("你好世界");
-        // 多打一个字：你好呀世界
+        // 多打一个字：你好呀世界 — 非门槛模式不截断，全部接受
         let r = session.type_text("你好呀世界");
         // LCS 对齐后「呀」为 Wrong，其余 Correct
         assert_eq!(r.statuses.len(), 5);
@@ -413,5 +477,88 @@ mod tests {
         assert_eq!(freq[2], ("i".to_string(), 1));
         // 按次数降序：n(3) > Backspace(1) = i(1)，同次数按键名升序
         assert_eq!(freq.len(), 3);
+    }
+
+    #[test]
+    fn completed_groups_starts_at_zero() {
+        let session = Session::new_gated("一二三四五六七八九十甲乙丙", true);
+        assert_eq!(session.completed_groups(), 0);
+    }
+
+    #[test]
+    fn type_text_advances_group_when_all_correct() {
+        // 13 字赛文：第一组 10 字全对 → completed_groups 推进到 1
+        let mut session = Session::new_gated("一二三四五六七八九十甲乙丙", true);
+        session.type_text("一二三四五六七八九十");
+        assert_eq!(session.completed_groups(), 1, "第一组 10 字全对应推进到 1");
+        assert!(!session.is_complete(), "尾组未打完不应判定完成");
+    }
+
+    #[test]
+    fn type_text_does_not_advance_when_wrong() {
+        let mut session = Session::new_gated("一二三四五六七八九十甲乙丙", true);
+        // 第 10 字打错 → 组未全对 → completed_groups 不推进
+        session.type_text("一二三四五六七八九X");
+        assert_eq!(session.completed_groups(), 0, "组内有错字不应推进");
+        assert!(!session.is_complete());
+    }
+
+    #[test]
+    fn type_text_advances_after_correcting_wrong_in_group() {
+        // 组内打错 → 回改 → 改对 → 推进
+        let mut session = Session::new_gated("一二三四五六七八九十甲乙丙", true);
+        session.type_text("一二三四五六七八九X");
+        assert_eq!(session.completed_groups(), 0);
+        session.backspace(); // 删掉 'X'
+        session.type_text("十"); // 改对
+        assert_eq!(session.completed_groups(), 1, "改对后应推进");
+    }
+
+    #[test]
+    fn backspace_locked_at_group_boundary() {
+        let mut session = Session::new_gated("一二三四五六七八九十甲乙丙", true);
+        session.type_text("一二三四五六七八九十");
+        assert_eq!(session.completed_groups(), 1);
+        // 已完成组的起始位置不可退格
+        assert!(!session.backspace(), "组边界处退格应返回 false");
+        assert_eq!(session.len(), 10, "退格失败不应改变 input 长度");
+    }
+
+    #[test]
+    fn backspace_works_within_group() {
+        let mut session = Session::new_gated("一二三四五六七八九十甲乙丙", true);
+        session.type_text("一二三");
+        assert!(session.backspace(), "组内退格应成功");
+        assert_eq!(session.len(), 2);
+    }
+
+    #[test]
+    fn type_text_truncates_at_group_boundary() {
+        // 赛文 13 字，第一组 10 字。一次上屏 12 字 → 只接受 10 字
+        let mut session = Session::new_gated("一二三四五六七八九十甲乙丙", true);
+        let r = session.type_text("一二三四五六七八九十甲乙");
+        assert_eq!(session.len(), 10, "跨组边界应截断到 10 字");
+        assert_eq!(r.statuses.len(), 10, "返回的状态应只含接受的 10 字");
+        assert_eq!(session.completed_groups(), 1, "第一组全对应推进");
+    }
+
+    #[test]
+    fn is_complete_requires_all_groups_correct() {
+        // 13 字赛文：第一组 10 字 + 尾组 3 字，尾组全对才算完成
+        let mut session = Session::new_gated("一二三四五六七八九十甲乙丙", true);
+        session.type_text("一二三四五六七八九十");
+        assert!(!session.is_complete(), "尾组未打不应完成");
+        session.type_text("甲乙丙");
+        assert!(session.is_complete(), "尾组全对应判定完成");
+        assert_eq!(session.completed_groups(), 2);
+    }
+
+    #[test]
+    fn is_complete_false_when_group_has_wrong() {
+        let mut session = Session::new_gated("一二三四五六七八九十甲乙丙", true);
+        session.type_text("一二三四五六七八九十");
+        session.type_text("甲乙X"); // 尾组有错字
+        assert!(!session.is_complete(), "尾组有错字不应完成");
+        assert_eq!(session.completed_groups(), 1);
     }
 }

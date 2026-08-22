@@ -149,7 +149,7 @@ impl App {
         api: ApiClient,
         settings_store: SettingsStore,
     ) -> Self {
-        let session = Session::new(&text.content);
+        let session = Session::new_gated(&text.content, text.source.is_builtin());
         let settings = settings_store.load();
         // token 持久化仅用于请求携带；登录会话（session cookie）不持久化，
         // 故每次启动都需重新登录（方案 1）。即使加载到持久化 token 也不视为已登录。
@@ -279,7 +279,7 @@ impl App {
                 self.text = load_builtin_text_shuffled(set);
             }
         }
-        self.session = Session::new(&self.text.content);
+        self.session = Session::new_gated(&self.text.content, self.text.source.is_builtin());
         self.start = Instant::now();
         self.state = AppState::Typing;
         self.browse_error = None;
@@ -382,7 +382,7 @@ impl App {
         } else {
             load_builtin_text(set)
         };
-        self.session = Session::new(&self.text.content);
+        self.session = Session::new_gated(&self.text.content, self.text.source.is_builtin());
         self.start = Instant::now();
         self.state = AppState::Typing;
     }
@@ -414,7 +414,8 @@ impl App {
                     word_boundaries: None,
                     shuffled: false,
                 };
-                self.session = Session::new(&self.text.content);
+                self.session =
+                    Session::new_gated(&self.text.content, self.text.source.is_builtin());
                 self.start = Instant::now();
                 self.state = AppState::Typing;
                 self.online_loading = None;
@@ -1428,11 +1429,11 @@ fn upload_lines(upload: &UploadState, theme: Theme) -> Vec<Line<'static>> {
 }
 
 /// 内置赛文每页显示的单位数（单字赛文每页 10 字，词组赛文每页 10 个词）。
-const BUILTIN_ITEMS_PER_PAGE: usize = 10;
+const BUILTIN_ITEMS_PER_PAGE: usize = dazitui_core::GROUP_SIZE;
 
-/// 单字赛文当前页的起始字符索引：已打字数整除页大小，打满当前页即翻到下一页。
-fn builtin_page_start(typed_len: usize) -> usize {
-    (typed_len / BUILTIN_ITEMS_PER_PAGE) * BUILTIN_ITEMS_PER_PAGE
+/// 单字赛文当前页的起始字符索引：基于已全对完成的组数。
+fn builtin_page_start(session: &Session) -> usize {
+    session.completed_groups() * BUILTIN_ITEMS_PER_PAGE
 }
 
 /// 对照区：将当前页 10 个词的原文按跟打状态着色，词间插入空格 span（不可打）。
@@ -1529,13 +1530,7 @@ fn original_line(
                     &owned_boundaries
                 }
             };
-            let typed_len = session.len();
-            let current_word_idx = boundaries
-                .iter()
-                .position(|(_, end)| typed_len < *end)
-                .unwrap_or(boundaries.len());
-            let page_start_word =
-                (current_word_idx / BUILTIN_ITEMS_PER_PAGE) * BUILTIN_ITEMS_PER_PAGE;
+            let page_start_word = builtin_page_start(session);
             let page_end_word =
                 (page_start_word + BUILTIN_ITEMS_PER_PAGE).min(boundaries.len());
             if page_start_word >= boundaries.len() {
@@ -1554,7 +1549,7 @@ fn original_line(
             return text_lines;
         }
         // 单字赛文：每页 10 字
-        let start = builtin_page_start(session.len());
+        let start = builtin_page_start(session);
         let statuses: Vec<_> = session
             .original_status()
             .into_iter()
@@ -1617,13 +1612,7 @@ fn type_line(
                     Line::from("（跟打区 — 输入法上屏文字将显示在这里）").fg(color(theme.muted)),
                 );
             }
-            let typed_len = session.len();
-            let current_word_idx = boundaries
-                .iter()
-                .position(|(_, end)| typed_len < *end)
-                .unwrap_or(boundaries.len());
-            let page_start_word =
-                (current_word_idx / BUILTIN_ITEMS_PER_PAGE) * BUILTIN_ITEMS_PER_PAGE;
+            let page_start_word = builtin_page_start(session);
             let page_end_word =
                 (page_start_word + BUILTIN_ITEMS_PER_PAGE).min(boundaries.len());
             if page_start_word >= boundaries.len() {
@@ -1648,7 +1637,7 @@ fn type_line(
             return text_lines;
         }
         // 单字赛文：每页 10 字
-        let start = builtin_page_start(session.len());
+        let start = builtin_page_start(session);
         let display: Vec<_> = session
             .display()
             .into_iter()
@@ -2024,7 +2013,7 @@ mod tests {
         assert!(text.shuffled);
         let boundaries = text.word_boundaries.as_ref().unwrap();
         assert!(!boundaries.is_empty());
-        let session = Session::new(&text.content);
+        let session = Session::new_gated(&text.content, true);
         let rendered = original_line(&session, &text, theme, false);
         assert_eq!(rendered.lines.len(), 1, "乱序词组对照区应只有一行");
         let first_page_words = boundaries.len().min(BUILTIN_ITEMS_PER_PAGE);
@@ -2050,7 +2039,7 @@ mod tests {
         let set = BUILTIN_SETS[3]; // 常用词组前五百
         let text = load_builtin_text_shuffled(set);
         let boundaries = text.word_boundaries.as_ref().unwrap();
-        let mut session = Session::new(&text.content);
+        let mut session = Session::new_gated(&text.content, true);
         // 打第 1 个乱序词的全部字符
         let (ws, we) = boundaries[0];
         let first_word: String = text.content.chars().skip(ws).take(we - ws).collect();
@@ -2433,44 +2422,84 @@ mod tests {
 
     #[test]
     fn type_line_builtin_shows_only_current_page() {
-        // 25 字内置赛文：每页 10 字，打满当前页（第 10 字）即翻到下一页，跟打区只显示当前页。
+        // 25 字内置赛文：每页 10 字，当前组 10 字全对才翻到下一页，跟打区只显示当前页。
         let theme = Theme::preset(ThemePreset::Default);
         let content = "一二三四五六七八九十甲乙丙丁戊己庚辛壬癸子丑寅卯辰";
-        let mut session = Session::new(content);
+        let mut session = Session::new_gated(content, true);
         let text = builtin_text(content);
-        // 打 5 字：仍在第一页，跟打区显示当前页已打的 5 字。
+        // 打 5 字（全对）：仍在第一组，跟打区显示当前页已打的 5 字。
         session.type_text("一二三四五");
         let rendered = type_line(&session, &text, theme, false);
         assert_eq!(rendered.lines.len(), 1, "第一页应只有一行");
         assert_eq!(rendered.lines[0].spans.len(), 5, "打 5 字应显示 5 字");
-        // 打到 10 字：打满第一页，翻到第二页，跟打区显示第二页前 0 字（空输入提示）。
+        // 打到 10 字（全对）：第一组全对，completed_groups 推进，翻到第二组，跟打区显示提示行。
         session.type_text("六七八九十");
         let rendered = type_line(&session, &text, theme, false);
-        assert_eq!(rendered.lines.len(), 1, "翻到第二页尚未打字时应显示提示行");
-        // 打到 13 字：第二页已打 3 字，跟打区显示 3 字。
+        assert_eq!(rendered.lines.len(), 1, "翻到第二组尚未打字时应显示提示行");
+        // 打到 13 字（全对）：第二组已打 3 字，跟打区显示 3 字。
         session.type_text("甲乙丙");
         let rendered = type_line(&session, &text, theme, false);
-        assert_eq!(rendered.lines.len(), 1, "第二页应只有一行");
+        assert_eq!(rendered.lines.len(), 1, "第二组应只有一行");
         assert_eq!(rendered.lines[0].spans.len(), 3, "打 13 字应翻页显示第 11-13 字");
     }
 
     #[test]
-    fn original_line_builtin_shows_only_current_page() {
-        // 25 字内置赛文：对照区只显示当前页 10 字，打满当前页（第 10 字）即翻到下一页。
+    fn type_line_builtin_wrong_char_blocks_page_advance() {
+        // 组内有错字 → completed_groups 不推进 → 不翻页。
         let theme = Theme::preset(ThemePreset::Default);
         let content = "一二三四五六七八九十甲乙丙丁戊己庚辛壬癸子丑寅卯辰";
-        let mut session = Session::new(content);
+        let mut session = Session::new_gated(content, true);
         let text = builtin_text(content);
-        // 打 5 字：对照区显示第一页 10 字（前 5 已打对，后 5 未打到）。
+        // 打 10 字但第 10 字打错 → 组未全对 → 不翻页
+        session.type_text("一二三四五六七八九X");
+        let rendered = type_line(&session, &text, theme, false);
+        assert_eq!(rendered.lines[0].spans.len(), 10, "组内打错仍应显示当前组 10 字");
+        assert_eq!(session.completed_groups(), 0, "有错字不应推进 completed_groups");
+    }
+
+    #[test]
+    fn type_line_builtin_backspace_at_group_boundary_keeps_page() {
+        // 退格到组首封顶 → 页起始不变、不翻回上一组。
+        let theme = Theme::preset(ThemePreset::Default);
+        let content = "一二三四五六七八九十甲乙丙丁戊己庚辛壬癸子丑寅卯辰";
+        let mut session = Session::new_gated(content, true);
+        let text = builtin_text(content);
+        // 第一组 10 字全对 → 推进到第 2 组
+        session.type_text("一二三四五六七八九十");
+        assert_eq!(session.completed_groups(), 1);
+        // 第 2 组打 3 字后回改 3 次回到组首
+        session.type_text("甲乙丙");
+        assert_eq!(session.len(), 13);
+        assert!(session.backspace());
+        assert!(session.backspace());
+        assert!(session.backspace());
+        // 回到组首，再回改应被封顶（返回 false）
+        assert!(!session.backspace(), "组首回改应封顶");
+        assert_eq!(session.len(), 10, "不应减过组首");
+        assert_eq!(session.completed_groups(), 1, "已完成组不应回退");
+        // 页起始仍为第 2 组
+        assert_eq!(builtin_page_start(&session), 10);
+        let rendered = type_line(&session, &text, theme, false);
+        assert_eq!(rendered.lines.len(), 1, "未打字时应显示提示行");
+    }
+
+    #[test]
+    fn original_line_builtin_shows_only_current_page() {
+        // 25 字内置赛文：对照区只显示当前组 10 字，当前组全对才翻到下一组。
+        let theme = Theme::preset(ThemePreset::Default);
+        let content = "一二三四五六七八九十甲乙丙丁戊己庚辛壬癸子丑寅卯辰";
+        let mut session = Session::new_gated(content, true);
+        let text = builtin_text(content);
+        // 打 5 字（全对）：对照区显示第一组 10 字（前 5 已打对，后 5 未打到）。
         session.type_text("一二三四五");
         let rendered = original_line(&session, &text, theme, false);
-        assert_eq!(rendered.lines.len(), 1, "第一页应只有一行");
-        assert_eq!(rendered.lines[0].spans.len(), 10, "对照区第一页应显示 10 字");
-        // 打到 10 字：打满第一页，翻到第二页，对照区显示第 11-20 字（10 字）。
+        assert_eq!(rendered.lines.len(), 1, "第一组应只有一行");
+        assert_eq!(rendered.lines[0].spans.len(), 10, "对照区第一组应显示 10 字");
+        // 打到 10 字（全对）：第一组全对，翻到第二组，对照区显示第 11-20 字（10 字）。
         session.type_text("六七八九十");
         let rendered = original_line(&session, &text, theme, false);
-        assert_eq!(rendered.lines.len(), 1, "第二页应只有一行");
-        assert_eq!(rendered.lines[0].spans.len(), 10, "对照区第二页应显示 10 字");
+        assert_eq!(rendered.lines.len(), 1, "第二组应只有一行");
+        assert_eq!(rendered.lines[0].spans.len(), 10, "对照区第二组应显示 10 字");
     }
 
     #[test]
@@ -2488,7 +2517,7 @@ mod tests {
     fn type_line_empty_input_builtin_shows_placeholder() {
         // 空输入时显示提示行（不分多行、无空 span）。
         let theme = Theme::preset(ThemePreset::Default);
-        let session = Session::new("一二三四五六七八九十");
+        let session = Session::new_gated("一二三四五六七八九十", true);
         let text = type_line(&session, &builtin_text("一二三四五六七八九十"), theme, false);
         assert_eq!(text.lines.len(), 1, "空输入应只有一行提示");
     }
@@ -2500,7 +2529,7 @@ mod tests {
         // content_no_commas = "可以一个自己没有..."（词间无逗号）
         let set = BUILTIN_SETS[3]; // 常用词组前五百
         let no_commas = set.content_no_commas();
-        let mut session = Session::new(no_commas.as_str());
+        let mut session = Session::new_gated(no_commas.as_str(), true);
         let text = Text {
             title: set.name().into(),
             content: no_commas.clone(),
@@ -2536,7 +2565,7 @@ mod tests {
         let set = BUILTIN_SETS[3]; // 常用词组前五百
         let no_commas = set.content_no_commas();
         let boundaries = set.word_boundaries();
-        let session = Session::new(no_commas.as_str());
+        let session = Session::new_gated(no_commas.as_str(), true);
         let text = Text {
             title: set.name().into(),
             content: no_commas.clone(),
@@ -2566,12 +2595,12 @@ mod tests {
 
     #[test]
     fn type_line_word_set_advances_page_after_10_words() {
-        // 词组赛文打满 10 个词后翻页。
+        // 词组赛文打满 10 个词且全对后翻页。
         let theme = Theme::preset(ThemePreset::Default);
         let set = BUILTIN_SETS[3]; // 常用词组前五百
         let no_commas = set.content_no_commas();
         let boundaries = set.word_boundaries();
-        let mut session = Session::new(no_commas.as_str());
+        let mut session = Session::new_gated(no_commas.as_str(), true);
         let text = Text {
             title: set.name().into(),
             content: no_commas.clone(),
@@ -2579,7 +2608,7 @@ mod tests {
             word_boundaries: None,
             shuffled: false,
         };
-        // 打满第 1 页 10 个词的全部字符
+        // 打满第 1 组 10 个词的全部字符（全对）
         let first_page_char_count: usize = boundaries
             .iter()
             .take(BUILTIN_ITEMS_PER_PAGE)
@@ -2587,27 +2616,28 @@ mod tests {
             .sum();
         let first_page_chars: String = no_commas.chars().take(first_page_char_count).collect();
         session.type_text(&first_page_chars);
-        // 此时 session.len() == first_page_char_count，应翻到第 2 页
+        // 全对 → completed_groups 推进 → 翻到第 2 组
+        assert_eq!(session.completed_groups(), 1, "第 1 组全对应推进到 1");
         let rendered = type_line(&session, &text, theme, false);
-        assert_eq!(rendered.lines.len(), 1, "翻到第 2 页应只有一行");
-        // 第 2 页尚未打字，应显示空输入提示
+        assert_eq!(rendered.lines.len(), 1, "翻到第 2 组应只有一行");
+        // 第 2 组尚未打字，应显示空输入提示
         let placeholder_spans: Vec<_> = rendered.lines[0]
             .spans
             .iter()
             .filter(|s| s.content.contains("跟打区"))
             .collect();
-        assert!(!placeholder_spans.is_empty(), "翻到第 2 页未打字时应显示提示行");
+        assert!(!placeholder_spans.is_empty(), "翻到第 2 组未打字时应显示提示行");
     }
 
     #[test]
     fn original_line_word_set_advances_page_after_10_words() {
-        // 词组赛文对照区：打满 10 个词后翻到第 2 页，显示第 11-20 词。
+        // 词组赛文对照区：10 个词全对后翻到第 2 组，显示第 11-20 词。
         let theme = Theme::preset(ThemePreset::Default);
         let set = BUILTIN_SETS[3]; // 常用词组前五百
         let no_commas = set.content_no_commas();
         let boundaries = set.word_boundaries();
-        let mut session = Session::new(no_commas.as_str());
-        // 打满第 1 页 10 个词的全部字符
+        let mut session = Session::new_gated(no_commas.as_str(), true);
+        // 打满第 1 组 10 个词的全部字符（全对）
         let first_page_char_count: usize = boundaries
             .iter()
             .take(BUILTIN_ITEMS_PER_PAGE)
@@ -2615,7 +2645,9 @@ mod tests {
             .sum();
         let first_page_chars: String = no_commas.chars().take(first_page_char_count).collect();
         session.type_text(&first_page_chars);
-        // 对照区应显示第 2 页（第 11-20 词）
+        // 全对 → completed_groups 推进
+        assert_eq!(session.completed_groups(), 1, "第 1 组全对应推进到 1");
+        // 对照区应显示第 2 组（第 11-20 词）
         let word_text = Text {
             title: set.name().into(),
             content: no_commas.clone(),
@@ -2624,7 +2656,7 @@ mod tests {
             shuffled: false,
         };
         let rendered = original_line(&session, &word_text, theme, false);
-        assert_eq!(rendered.lines.len(), 1, "第 2 页应只有一行");
+        assert_eq!(rendered.lines.len(), 1, "第 2 组应只有一行");
         let second_page_words = boundaries.len().min(BUILTIN_ITEMS_PER_PAGE);
         let space_spans = rendered.lines[0]
             .spans
