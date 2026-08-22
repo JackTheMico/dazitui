@@ -1151,20 +1151,50 @@ fn render_builtin_preview(frame: &mut Frame, app: &App, area: ratatui::layout::R
     let theme = app.theme();
     let (title, body) = match BUILTIN_SETS.get(app.builtin_selection) {
         Some(set) => {
-            let content = set.content();
-            let chars: Vec<char> = content.chars().take(400).collect();
-            let dot = if content.chars().count() > 400 { "…" } else { "" };
-            (set.name(), format!("{}{dot}", chars.iter().collect::<String>()))
+            // 词组赛文：去逗号、词间加空格，与跟打显示一致。
+            if set.is_words() {
+                let no_commas = set.content_no_commas();
+                let boundaries = set.word_boundaries();
+                // 预览取前 10 个词（一页），词间加空格
+                let preview_words = boundaries.len().min(BUILTIN_ITEMS_PER_PAGE);
+                let mut preview = String::new();
+                for (i, &(ws, we)) in boundaries.iter().take(preview_words).enumerate() {
+                    if i > 0 {
+                        preview.push(' ');
+                    }
+                    let chars: Vec<char> = no_commas.chars().collect();
+                    for ch in chars[ws..we].iter() {
+                        preview.push(*ch);
+                    }
+                }
+                let dot = if boundaries.len() > BUILTIN_ITEMS_PER_PAGE {
+                    " …"
+                } else {
+                    ""
+                };
+                (set.name(), format!("{preview}{dot}"))
+            } else {
+                // 单字赛文：取前 400 字预览
+                let content = set.content();
+                let chars: Vec<char> = content.chars().take(400).collect();
+                let dot = if content.chars().count() > 400 { "…" } else { "" };
+                (set.name(), format!("{}{dot}", chars.iter().collect::<String>()))
+            }
         }
         None => ("预览", "（无内置赛文）".to_string()),
     };
-    // 预览也按每 10 字一页，与实际跟打展示一致。
+    // 预览按每 10 字一页（单字）或整行（词组），与实际跟打展示一致。
     let mut lines: Vec<Line> = vec![
         Line::from(format!(" 内置赛文 — {title} ")).bold(),
         Line::from(""),
     ];
-    for chunk in body.chars().collect::<Vec<char>>().chunks(BUILTIN_CHARS_PER_PAGE) {
-        lines.push(Line::from(chunk.iter().collect::<String>()));
+    if matches!(BUILTIN_SETS.get(app.builtin_selection), Some(set) if set.is_words()) {
+        // 词组赛文：整行显示（一页 10 词已在 body 中用空格分隔）
+        lines.push(Line::from(body));
+    } else {
+        for chunk in body.chars().collect::<Vec<char>>().chunks(BUILTIN_ITEMS_PER_PAGE) {
+            lines.push(Line::from(chunk.iter().collect::<String>()));
+        }
     }
     lines.push(Line::from(""));
     lines.push(Line::from(" Enter 载入 | Esc 取消 ").fg(color(theme.muted)));
@@ -1338,35 +1368,148 @@ fn upload_lines(upload: &UploadState, theme: Theme) -> Vec<Line<'static>> {
     }
 }
 
-/// 内置赛文每页显示的字数（每 10 字一页，打完当前页自动翻到下一页）。
-const BUILTIN_CHARS_PER_PAGE: usize = 10;
+/// 内置赛文每页显示的单位数（单字赛文每页 10 字，词组赛文每页 10 个词）。
+const BUILTIN_ITEMS_PER_PAGE: usize = 10;
 
-/// 内置赛文当前页的起始字符索引：已打字数整除页大小，打满当前页（第 10 字）即翻到下一页。
+/// 单字赛文当前页的起始字符索引：已打字数整除页大小，打满当前页即翻到下一页。
 fn builtin_page_start(typed_len: usize) -> usize {
-    (typed_len / BUILTIN_CHARS_PER_PAGE) * BUILTIN_CHARS_PER_PAGE
+    (typed_len / BUILTIN_ITEMS_PER_PAGE) * BUILTIN_ITEMS_PER_PAGE
+}
+
+/// 对照区：将当前页 10 个词的原文按跟打状态着色，词间插入空格 span（不可打）。
+fn build_word_spans(
+    session: &Session,
+    word_boundaries: &[(usize, usize)],
+    page_start_word: usize,
+    page_end_word: usize,
+    theme: Theme,
+    bold: bool,
+) -> Vec<Span<'static>> {
+    let statuses = session.original_status();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (word_i, &(ws, we)) in word_boundaries
+        .iter()
+        .enumerate()
+        .skip(page_start_word)
+        .take(page_end_word - page_start_word)
+    {
+        if word_i > page_start_word {
+            // 词间空格（不可打的分隔符，用默认色）
+            spans.push(Span::raw(" "));
+        }
+        for ci in ws..we {
+            let (c, status) = statuses[ci];
+            let style = match status {
+                Some(CharStatus::Correct) => Style::default().fg(color(theme.correct)),
+                Some(CharStatus::Wrong) => Style::default().fg(color(theme.wrong)),
+                None => Style::default(),
+            };
+            spans.push(Span::styled(
+                c.to_string(),
+                style.add_modifier(bold_modifier(bold)),
+            ));
+        }
+    }
+    spans
+}
+
+/// 跟打区：将当前页 10 个词的已打字符按对/错着色，词间插入空格 span。
+fn build_word_type_spans(
+    display: &[(char, CharStatus)],
+    word_boundaries: &[(usize, usize)],
+    page_start_word: usize,
+    page_end_word: usize,
+    theme: Theme,
+    bold: bool,
+) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (word_i, &(ws, we)) in word_boundaries
+        .iter()
+        .enumerate()
+        .skip(page_start_word)
+        .take(page_end_word - page_start_word)
+    {
+        if word_i > page_start_word {
+            spans.push(Span::raw(" "));
+        }
+        for ci in ws..we {
+            if ci < display.len() {
+                let (c, status) = display[ci];
+                let style = match status {
+                    CharStatus::Correct => Style::default().fg(color(theme.correct)),
+                    CharStatus::Wrong => Style::default().fg(color(theme.wrong)),
+                };
+                spans.push(Span::styled(
+                    c.to_string(),
+                    style.add_modifier(bold_modifier(bold)),
+                ));
+            }
+        }
+    }
+    spans
 }
 
 /// 将对照区的字符按跟打状态着色：已打对=correct、已打错=wrong、未打到=默认。
 ///
-/// 内置赛文只显示当前页（10 字），打完当前页自动翻页；其余来源显示全文（由终端宽度自动折行）。
+/// 内置赛文只显示当前页：单字赛文每页 10 字、词组赛文每页 10 个词（词间加空格、去逗号）；
+/// 打完当前页自动翻页；其余来源显示全文（由终端宽度自动折行）。
 fn original_line(
     session: &Session,
     source: TextSource,
     theme: Theme,
     bold: bool,
 ) -> TextLines<'static> {
-    let statuses = if matches!(source, TextSource::Builtin { .. }) {
+    if let TextSource::Builtin { set } = source {
+        if set.is_words() {
+            let boundaries = set.word_boundaries();
+            let typed_len = session.len();
+            let current_word_idx = boundaries
+                .iter()
+                .position(|(_, end)| typed_len < *end)
+                .unwrap_or(boundaries.len());
+            let page_start_word =
+                (current_word_idx / BUILTIN_ITEMS_PER_PAGE) * BUILTIN_ITEMS_PER_PAGE;
+            let page_end_word =
+                (page_start_word + BUILTIN_ITEMS_PER_PAGE).min(boundaries.len());
+            if page_start_word >= boundaries.len() {
+                return TextLines::default();
+            }
+            let spans = build_word_spans(
+                session,
+                &boundaries,
+                page_start_word,
+                page_end_word,
+                theme,
+                bold,
+            );
+            let mut text = TextLines::default();
+            text.push_line(Line::from(spans));
+            return text;
+        }
+        // 单字赛文：每页 10 字
         let start = builtin_page_start(session.len());
-        session
+        let statuses: Vec<_> = session
             .original_status()
             .into_iter()
             .skip(start)
-            .take(BUILTIN_CHARS_PER_PAGE)
-            .collect::<Vec<_>>()
-    } else {
-        session.original_status()
-    };
-    let spans: Vec<Span<'static>> = statuses
+            .take(BUILTIN_ITEMS_PER_PAGE)
+            .collect();
+        let spans: Vec<Span<'static>> = statuses
+            .into_iter()
+            .map(|(c, status)| {
+                let style = match status {
+                    Some(CharStatus::Correct) => Style::default().fg(color(theme.correct)),
+                    Some(CharStatus::Wrong) => Style::default().fg(color(theme.wrong)),
+                    None => Style::default(),
+                };
+                Span::styled(c.to_string(), style.add_modifier(bold_modifier(bold)))
+            })
+            .collect();
+        return group_spans(spans, source);
+    }
+    // 非内置赛文：全文单行
+    let spans: Vec<Span<'static>> = session
+        .original_status()
         .into_iter()
         .map(|(c, status)| {
             let style = match status {
@@ -1382,24 +1525,80 @@ fn original_line(
 
 /// 将跟打区的字符按对/错渲染为 correct/wrong。
 ///
-/// 内置赛文只显示当前页（10 字），打完当前页自动翻页；其余来源显示全文（由终端宽度自动折行）。
+/// 内置赛文只显示当前页：单字赛文每页 10 字、词组赛文每页 10 个词（词间加空格、去逗号）；
+/// 打完当前页自动翻页；其余来源显示全文（由终端宽度自动折行）。
 fn type_line(
     session: &Session,
     source: TextSource,
     theme: Theme,
     bold: bool,
 ) -> TextLines<'static> {
-    let display = if matches!(source, TextSource::Builtin { .. }) {
+    if let TextSource::Builtin { set } = source {
+        if set.is_words() {
+            let boundaries = set.word_boundaries();
+            let display = session.display();
+            if display.is_empty() {
+                return TextLines::from(
+                    Line::from("（跟打区 — 输入法上屏文字将显示在这里）").fg(color(theme.muted)),
+                );
+            }
+            let typed_len = session.len();
+            let current_word_idx = boundaries
+                .iter()
+                .position(|(_, end)| typed_len < *end)
+                .unwrap_or(boundaries.len());
+            let page_start_word =
+                (current_word_idx / BUILTIN_ITEMS_PER_PAGE) * BUILTIN_ITEMS_PER_PAGE;
+            let page_end_word =
+                (page_start_word + BUILTIN_ITEMS_PER_PAGE).min(boundaries.len());
+            if page_start_word >= boundaries.len() {
+                return TextLines::default();
+            }
+            let spans = build_word_type_spans(
+                &display,
+                &boundaries,
+                page_start_word,
+                page_end_word,
+                theme,
+                bold,
+            );
+            // 当前页无已打字符时（仅有词间空格 span），显示提示行。
+            if spans.is_empty() || spans.iter().all(|s| s.content == " ") {
+                return TextLines::from(
+                    Line::from("（跟打区 — 输入法上屏文字将显示在这里）").fg(color(theme.muted)),
+                );
+            }
+            let mut text = TextLines::default();
+            text.push_line(Line::from(spans));
+            return text;
+        }
+        // 单字赛文：每页 10 字
         let start = builtin_page_start(session.len());
-        session
+        let display: Vec<_> = session
             .display()
             .into_iter()
             .skip(start)
-            .take(BUILTIN_CHARS_PER_PAGE)
-            .collect::<Vec<_>>()
-    } else {
-        session.display()
-    };
+            .take(BUILTIN_ITEMS_PER_PAGE)
+            .collect();
+        if display.is_empty() {
+            return TextLines::from(
+                Line::from("（跟打区 — 输入法上屏文字将显示在这里）").fg(color(theme.muted)),
+            );
+        }
+        let spans: Vec<Span<'static>> = display
+            .into_iter()
+            .map(|(c, status)| {
+                let style = match status {
+                    CharStatus::Correct => Style::default().fg(color(theme.correct)),
+                    CharStatus::Wrong => Style::default().fg(color(theme.wrong)),
+                };
+                Span::styled(c.to_string(), style.add_modifier(bold_modifier(bold)))
+            })
+            .collect();
+        return group_spans(spans, source);
+    }
+    // 非内置赛文：全文单行
+    let display = session.display();
     if display.is_empty() {
         return TextLines::from(
             Line::from("（跟打区 — 输入法上屏文字将显示在这里）").fg(color(theme.muted)),
@@ -1418,11 +1617,12 @@ fn type_line(
     group_spans(spans, source)
 }
 
-/// 把已着色的 span 序列按赛文来源组织成多行文本：内置赛文每页 10 字一行，其余为单行。
+/// 把已着色的 span 序列按赛文来源组织成多行文本：单字内置赛文每页 10 字一行，其余为单行。
+/// 词组赛文已在调用方按页组装，不走此函数。
 fn group_spans(spans: Vec<Span<'static>>, source: TextSource) -> TextLines<'static> {
     let mut text = TextLines::default();
-    if matches!(source, TextSource::Builtin { .. }) {
-        for chunk in spans.chunks(BUILTIN_CHARS_PER_PAGE) {
+    if matches!(source, TextSource::Builtin { set } if !set.is_words()) {
+        for chunk in spans.chunks(BUILTIN_ITEMS_PER_PAGE) {
             text.push_line(Line::from(chunk.to_vec()));
         }
     } else {
@@ -2064,6 +2264,134 @@ mod tests {
         let session = Session::new("一二三四五六七八九十");
         let text = type_line(&session, TextSource::Builtin { set: BUILTIN_SETS[0] }, theme, false);
         assert_eq!(text.lines.len(), 1, "空输入应只有一行提示");
+    }
+
+    #[test]
+    fn type_line_word_set_shows_space_between_words() {
+        // 词组赛文：词间显示空格 span，去逗号。每页 10 个词。
+        let theme = Theme::preset(ThemePreset::Default);
+        // content_no_commas = "可以一个自己没有..."（词间无逗号）
+        let set = BUILTIN_SETS[3]; // 常用词组前五百
+        let no_commas = set.content_no_commas();
+        let boundaries = set.word_boundaries();
+        let mut session = Session::new(no_commas.as_str());
+        // 打第 1 个词「可以」（2 字）
+        session.type_text("可以");
+        let text = type_line(&session, TextSource::Builtin { set }, theme, false);
+        assert_eq!(text.lines.len(), 1, "词组赛文应只有一行");
+        // 第 1 个词 2 字 + 空格 + 第 2 个词的已打部分…跟打区只显示已打字符
+        // 已打 2 字（第 1 词），应在 spans 中。第 2+ 词尚未打，跟打区无内容。
+        let typed_spans: Vec<_> = text.lines[0]
+            .spans
+            .iter()
+            .filter(|s| !s.content.is_empty())
+            .collect();
+        assert!(
+            typed_spans.iter().any(|s| s.content == "可"),
+            "跟打区应含已打的「可」字"
+        );
+        assert!(
+            typed_spans.iter().any(|s| s.content == "以"),
+            "跟打区应含已打的「以」字"
+        );
+    }
+
+    #[test]
+    fn original_line_word_set_shows_10_words_per_page() {
+        // 词组赛文对照区：每页显示 10 个词，词间有 9 个空格 span。
+        let theme = Theme::preset(ThemePreset::Default);
+        let set = BUILTIN_SETS[3]; // 常用词组前五百
+        let no_commas = set.content_no_commas();
+        let boundaries = set.word_boundaries();
+        let session = Session::new(no_commas.as_str());
+        let text = original_line(&session, TextSource::Builtin { set }, theme, false);
+        assert_eq!(text.lines.len(), 1, "词组赛文应只有一行");
+        // 第 1 页 10 个词，词间 9 个空格 span
+        let first_page_words = boundaries.len().min(BUILTIN_ITEMS_PER_PAGE);
+        let word_chars: usize = boundaries.iter().take(first_page_words).map(|(s, e)| e - s).sum();
+        let space_spans = text.lines[0]
+            .spans
+            .iter()
+            .filter(|s| s.content == " ")
+            .count();
+        assert_eq!(space_spans, first_page_words - 1, "第 1 页应有 {} 个词间空格", first_page_words - 1);
+        // 非空格 span 数 = 第 1 页所有词的字符数
+        let non_space_spans = text.lines[0]
+            .spans
+            .iter()
+            .filter(|s| s.content != " ")
+            .count();
+        assert_eq!(non_space_spans, word_chars, "非空格 span 数应等于第 1 页词字符数");
+    }
+
+    #[test]
+    fn type_line_word_set_advances_page_after_10_words() {
+        // 词组赛文打满 10 个词后翻页。
+        let theme = Theme::preset(ThemePreset::Default);
+        let set = BUILTIN_SETS[3]; // 常用词组前五百
+        let no_commas = set.content_no_commas();
+        let boundaries = set.word_boundaries();
+        let mut session = Session::new(no_commas.as_str());
+        // 打满第 1 页 10 个词的全部字符
+        let first_page_char_count: usize = boundaries
+            .iter()
+            .take(BUILTIN_ITEMS_PER_PAGE)
+            .map(|(s, e)| e - s)
+            .sum();
+        let first_page_chars: String = no_commas.chars().take(first_page_char_count).collect();
+        session.type_text(&first_page_chars);
+        // 此时 session.len() == first_page_char_count，应翻到第 2 页
+        let text = type_line(&session, TextSource::Builtin { set }, theme, false);
+        assert_eq!(text.lines.len(), 1, "翻到第 2 页应只有一行");
+        // 第 2 页尚未打字，应显示空输入提示
+        let placeholder_spans: Vec<_> = text.lines[0]
+            .spans
+            .iter()
+            .filter(|s| s.content.contains("跟打区"))
+            .collect();
+        assert!(!placeholder_spans.is_empty(), "翻到第 2 页未打字时应显示提示行");
+    }
+
+    #[test]
+    fn original_line_word_set_advances_page_after_10_words() {
+        // 词组赛文对照区：打满 10 个词后翻到第 2 页，显示第 11-20 词。
+        let theme = Theme::preset(ThemePreset::Default);
+        let set = BUILTIN_SETS[3]; // 常用词组前五百
+        let no_commas = set.content_no_commas();
+        let boundaries = set.word_boundaries();
+        let mut session = Session::new(no_commas.as_str());
+        // 打满第 1 页 10 个词的全部字符
+        let first_page_char_count: usize = boundaries
+            .iter()
+            .take(BUILTIN_ITEMS_PER_PAGE)
+            .map(|(s, e)| e - s)
+            .sum();
+        let first_page_chars: String = no_commas.chars().take(first_page_char_count).collect();
+        session.type_text(&first_page_chars);
+        // 对照区应显示第 2 页（第 11-20 词）
+        let text = original_line(&session, TextSource::Builtin { set }, theme, false);
+        assert_eq!(text.lines.len(), 1, "第 2 页应只有一行");
+        let second_page_words = boundaries.len().min(BUILTIN_ITEMS_PER_PAGE);
+        let space_spans = text.lines[0]
+            .spans
+            .iter()
+            .filter(|s| s.content == " ")
+            .count();
+        assert_eq!(space_spans, second_page_words - 1, "第 2 页应有 {} 个词间空格", second_page_words - 1);
+    }
+
+    #[test]
+    fn word_set_no_commas_in_original() {
+        // 词组赛文原文（Session::original）无逗号：用户无需打逗号。
+        let set = BUILTIN_SETS[3]; // 常用词组前五百
+        let no_commas = set.content_no_commas();
+        assert!(
+            !no_commas.contains('，') && !no_commas.contains(','),
+            "去逗号后的内容不应含逗号"
+        );
+        let session = Session::new(&no_commas);
+        // original_len 等于去逗号后的字符数
+        assert_eq!(session.original_len(), no_commas.chars().count());
     }
 
     #[test]

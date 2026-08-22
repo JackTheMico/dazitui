@@ -47,6 +47,20 @@ pub enum TextSource {
     Online { competition_type: CompetitionType },
 }
 
+impl TextSource {
+    /// 是否以词组为单位分页显示（每页 10 个词）。
+    pub fn is_word_paged(&self) -> bool {
+        matches!(
+            self,
+            TextSource::Builtin {
+                set: BuiltinSet::CommonWordsQian
+                    | BuiltinSet::CommonWordsZhong
+                    | BuiltinSet::CommonWordsHou
+            }
+        )
+    }
+}
+
 /// 内置赛文集合（每套一个枚举变体）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuiltinSet {
@@ -77,6 +91,14 @@ impl BuiltinSet {
         }
     }
 
+    /// 是否为词组赛文（以词组为单位分页显示，显示时词间加空格、不显示逗号）。
+    pub fn is_words(&self) -> bool {
+        matches!(
+            self,
+            Self::CommonWordsQian | Self::CommonWordsZhong | Self::CommonWordsHou
+        )
+    }
+
     /// 赛文内容（已去换行，为纯字符串）。
     pub fn content(&self) -> &'static str {
         match self {
@@ -87,6 +109,49 @@ impl BuiltinSet {
             Self::CommonWordsZhong => include_str!("../data/common-words-zhong.txt"),
             Self::CommonWordsHou => include_str!("../data/common-words-hou.txt"),
         }
+    }
+
+    /// 将词组赛文的原始内容（逗号分隔）切分为词组的字符范围列表。
+    /// 返回每个词组在**去逗号后**内容中的 `(char_start, char_end)` 索引。
+    /// 非词组赛文返回空 Vec。
+    pub fn word_boundaries(&self) -> Vec<(usize, usize)> {
+        if !self.is_words() {
+            return Vec::new();
+        }
+        // 逐字符扫描逗号分隔的原始内容，跳过逗号，
+        // 记录每个词组在去逗号后的 char 索引范围。
+        let content = self.content();
+        let mut boundaries = Vec::new();
+        let mut decommad_start: Option<usize> = None;
+        let mut decommad_idx: usize = 0;
+        for ch in content.chars() {
+            if ch == '，' || ch == ',' {
+                if let Some(s) = decommad_start.take() {
+                    boundaries.push((s, decommad_idx));
+                }
+            } else if ch != '\n' && ch != '\r' {
+                if decommad_start.is_none() {
+                    decommad_start = Some(decommad_idx);
+                }
+                decommad_idx += 1;
+            }
+        }
+        if let Some(s) = decommad_start.take() {
+            boundaries.push((s, decommad_idx));
+        }
+        boundaries
+    }
+
+    /// 词组赛文去逗号后的纯字符内容（词组直接拼接，无分隔符）。
+    /// 非词组赛文返回 content() 本身。
+    pub fn content_no_commas(&self) -> String {
+        if !self.is_words() {
+            return self.content().to_string();
+        }
+        self.content()
+            .chars()
+            .filter(|c| *c != '，' && *c != ',' && *c != '\n' && *c != '\r')
+            .collect()
     }
 }
 
@@ -101,10 +166,16 @@ pub const BUILTIN_SETS: [BuiltinSet; 6] = [
 ];
 
 /// 载入内置赛文：内容为纯字符串（已去除换行）。
+/// 词组赛文去掉逗号（用户无需打逗号），分页渲染时按 word_boundaries 切词、词间加空格显示。
 pub fn load_builtin_text(set: BuiltinSet) -> Text {
+    let content = if set.is_words() {
+        set.content_no_commas()
+    } else {
+        set.content().replace(['\n', '\r'], "")
+    };
     Text {
         title: set.name().to_string(),
-        content: set.content().replace(['\n', '\r'], ""),
+        content,
         source: TextSource::Builtin { set },
     }
 }
@@ -405,5 +476,81 @@ mod tests {
         };
         assert!(!file_text.is_online());
         assert!(online_text.is_online());
+    }
+
+    #[test]
+    fn word_sets_strip_commas_on_load() {
+        // 词组赛文加载后内容无逗号、无换行：用户无需打逗号。
+        for &set in &[
+            BuiltinSet::CommonWordsQian,
+            BuiltinSet::CommonWordsZhong,
+            BuiltinSet::CommonWordsHou,
+        ] {
+            let text = load_builtin_text(set);
+            assert!(
+                !text.content.contains('，') && !text.content.contains(','),
+                "{} 加载后含逗号",
+                set.name()
+            );
+            assert!(
+                !text.content.contains('\n') && !text.content.contains('\r'),
+                "{} 加载后含换行",
+                set.name()
+            );
+        }
+    }
+
+    #[test]
+    fn word_boundaries_match_word_count() {
+        // 词组赛文 word_boundaries 返回 500 个词，每个词的字符范围在 content_no_commas 内有效。
+        for &set in &[
+            BuiltinSet::CommonWordsQian,
+            BuiltinSet::CommonWordsZhong,
+            BuiltinSet::CommonWordsHou,
+        ] {
+            let boundaries = set.word_boundaries();
+            assert_eq!(boundaries.len(), 500, "{} 应有 500 个词", set.name());
+            let no_commas = set.content_no_commas();
+            let char_count = no_commas.chars().count();
+            // 每个词的 (start, end) 范围合法且不重叠
+            let mut prev_end = 0;
+            for &(start, end) in &boundaries {
+                assert!(start < end, "{} 词范围空: ({}, {})", set.name(), start, end);
+                assert!(
+                    start >= prev_end,
+                    "{} 词范围重叠: prev_end={}, start={}",
+                    set.name(),
+                    prev_end,
+                    start
+                );
+                assert!(
+                    end <= char_count,
+                    "{} 词范围越界: end={}, char_count={}",
+                    set.name(),
+                    end,
+                    char_count
+                );
+                prev_end = end;
+            }
+            // 最后一个词的结尾 = content_no_commas 的字符数
+            assert_eq!(
+                boundaries.last().unwrap().1, char_count,
+                "{} 最后一个词的结尾应等于去逗号后的字符数",
+                set.name()
+            );
+        }
+    }
+
+    #[test]
+    fn is_words_flags_only_word_sets() {
+        for &set in &BUILTIN_SETS {
+            let expected = matches!(
+                set,
+                BuiltinSet::CommonWordsQian
+                    | BuiltinSet::CommonWordsZhong
+                    | BuiltinSet::CommonWordsHou
+            );
+            assert_eq!(set.is_words(), expected, "{} is_words 不正确", set.name());
+        }
     }
 }

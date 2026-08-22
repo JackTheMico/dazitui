@@ -162,6 +162,11 @@ impl Session {
         self.input.len()
     }
 
+    /// 赛文总字符数。
+    pub fn original_len(&self) -> usize {
+        self.original.len()
+    }
+
     /// 是否还没有任何上屏字符。
     pub fn is_empty(&self) -> bool {
         self.input.is_empty()
