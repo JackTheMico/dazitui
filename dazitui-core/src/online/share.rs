@@ -220,6 +220,8 @@ mod tests {
             source: TextSource::Online {
                 competition_type: CompetitionType::Jinbiao,
             },
+            word_boundaries: None,
+            shuffled: false,
         };
         let v = build_upload_payload(&text, &stats, &up, Duration::from_secs_f64(85.23));
         assert_eq!(v["textTitle"], "锦标赛第3279期");
@@ -251,6 +253,8 @@ mod tests {
             source: TextSource::Online {
                 competition_type: CompetitionType::Jisu,
             },
+            word_boundaries: None,
+            shuffled: false,
         };
         let v = build_upload_payload(&text, &stats, &up, Duration::from_secs(60));
         // 五个之前缺失的新字段：jianZhun / repeatNum / daCi / xuanChong / keyMethod
@@ -289,6 +293,8 @@ mod tests {
             title: "x".into(),
             content: "c".into(),
             source: TextSource::File,
+            word_boundaries: None,
+            shuffled: false,
         };
         let v = build_upload_payload(&text, &stats, &up, Duration::from_secs(1));
         assert_eq!(v["jianZhun"], "0.00%");
@@ -307,6 +313,8 @@ mod tests {
             title: "t".into(),
             content: "c".into(),
             source: TextSource::File,
+            word_boundaries: None,
+            shuffled: false,
         };
         let v = build_upload_payload(&text, &stats, &up, Duration::from_secs(1));
         assert_eq!(v["backspace"], 7);

@@ -34,12 +34,19 @@ pub struct Text {
     pub content: String,
     /// 赛文来源。
     pub source: TextSource,
+    /// 乱序词组赛文的重排后词边界（`(char_start, char_end)`）。
+    /// 顺序版与非词组赛文为 `None`，渲染时回退到 `BuiltinSet::word_boundaries()`。
+    pub word_boundaries: Option<Vec<(usize, usize)>>,
+    /// 是否为乱序版（`load_builtin_text_shuffled` 产出 true）。
+    /// `restart()` 据此判断是否重新打乱。
+    pub shuffled: bool,
 }
 
 /// 赛文来源：本地文件、内置赛文或 52dazi.cn 在线比赛。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TextSource {
     /// 本地文件。
+    #[default]
     File,
     /// 内置赛文（随二进制分发的练习材料，如常用单字）。
     Builtin { set: BuiltinSet },
@@ -177,7 +184,62 @@ pub fn load_builtin_text(set: BuiltinSet) -> Text {
         title: set.name().to_string(),
         content,
         source: TextSource::Builtin { set },
+        word_boundaries: None,
+        shuffled: false,
     }
+}
+
+/// 载入内置赛文的乱序版：每次调用随机打乱排列，产出新 Text。
+///
+/// - 单字赛文：打散字符顺序
+/// - 词组赛文：打乱词组顺序（每个词组内部字符顺序不变），重排 content 并重算 word_boundaries
+///
+/// `title` 带「（乱序）」后缀；`source` 仍为 `TextSource::Builtin { set }`；
+/// `shuffled=true`；词组赛文 `word_boundaries=Some(...)`。
+pub fn load_builtin_text_shuffled(set: BuiltinSet) -> Text {
+    use rand::seq::SliceRandom;
+    let mut rng = rand::rng();
+    if set.is_words() {
+        let no_commas = set.content_no_commas();
+        let chars: Vec<char> = no_commas.chars().collect();
+        let mut boundaries = set.word_boundaries();
+        boundaries.shuffle(&mut rng);
+        // 按打乱后的词序重排字符，并重算连续边界
+        let mut new_content = String::with_capacity(chars.len());
+        let mut new_boundaries = Vec::with_capacity(boundaries.len());
+        let mut char_count = 0;
+        for &(ws, we) in &boundaries {
+            let start = char_count;
+            for &c in &chars[ws..we] {
+                new_content.push(c);
+            }
+            char_count += we - ws;
+            new_boundaries.push((start, char_count));
+        }
+        Text {
+            title: shuffled_title(set),
+            content: new_content,
+            source: TextSource::Builtin { set },
+            word_boundaries: Some(new_boundaries),
+            shuffled: true,
+        }
+    } else {
+        let mut chars: Vec<char> = set.content().replace(['\n', '\r'], "").chars().collect();
+        chars.shuffle(&mut rng);
+        let content: String = chars.into_iter().collect();
+        Text {
+            title: shuffled_title(set),
+            content,
+            source: TextSource::Builtin { set },
+            word_boundaries: None,
+            shuffled: true,
+        }
+    }
+}
+
+/// 乱序版赛文标题：`set.name()` +「（乱序）」后缀。
+fn shuffled_title(set: BuiltinSet) -> String {
+    format!("{}（乱序）", set.name())
 }
 
 /// 52dazi.cn 比赛类型。
@@ -264,6 +326,8 @@ pub fn load_text_from_file_with_options(
         title,
         content,
         source: TextSource::File,
+        word_boundaries: None,
+        shuffled: false,
     })
 }
 
@@ -466,6 +530,8 @@ mod tests {
             title: "f".into(),
             content: "c".into(),
             source: TextSource::File,
+            word_boundaries: None,
+            shuffled: false,
         };
         let online_text = Text {
             title: "o".into(),
@@ -473,6 +539,8 @@ mod tests {
             source: TextSource::Online {
                 competition_type: CompetitionType::Jisu,
             },
+            word_boundaries: None,
+            shuffled: false,
         };
         assert!(!file_text.is_online());
         assert!(online_text.is_online());
@@ -551,6 +619,156 @@ mod tests {
                     | BuiltinSet::CommonWordsHou
             );
             assert_eq!(set.is_words(), expected, "{} is_words 不正确", set.name());
+        }
+    }
+
+    #[test]
+    fn shuffled_text_has_correct_metadata() {
+        for &set in &BUILTIN_SETS {
+            let text = load_builtin_text_shuffled(set);
+            assert!(text.shuffled, "{} 乱序版 shuffled 应为 true", set.name());
+            assert!(
+                text.title.ends_with("（乱序）"),
+                "{} 乱序版标题应带（乱序）后缀, got {}",
+                set.name(),
+                text.title
+            );
+            assert_eq!(
+                text.source,
+                TextSource::Builtin { set },
+                "{} 乱序版 source 应保持 Builtin",
+                set.name()
+            );
+            if set.is_words() {
+                assert!(
+                    text.word_boundaries.is_some(),
+                    "{} 乱序词组版应有 word_boundaries",
+                    set.name()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shuffled_char_set_preserves_multiset() {
+        // 单字赛文乱序后字符多重集不变（排序后相同）。
+        for &set in &[
+            BuiltinSet::CommonCharsQian,
+            BuiltinSet::CommonCharsZhong,
+            BuiltinSet::CommonCharsHou,
+        ] {
+            let original: Vec<char> = set.content().replace(['\n', '\r'], "").chars().collect();
+            let shuffled: Vec<char> = load_builtin_text_shuffled(set).content.chars().collect();
+            assert_eq!(
+                original.len(),
+                shuffled.len(),
+                "{} 乱序后字符数变化",
+                set.name()
+            );
+            let mut orig_sorted = original.clone();
+            orig_sorted.sort_unstable();
+            let mut shuf_sorted = shuffled.clone();
+            shuf_sorted.sort_unstable();
+            assert_eq!(
+                orig_sorted, shuf_sorted,
+                "{} 乱序后字符多重集不一致",
+                set.name()
+            );
+        }
+    }
+
+    #[test]
+    fn shuffled_word_set_preserves_word_multiset() {
+        // 词组赛文乱序后词组多重集不变（每个词的字符序列不变）。
+        for &set in &[
+            BuiltinSet::CommonWordsQian,
+            BuiltinSet::CommonWordsZhong,
+            BuiltinSet::CommonWordsHou,
+        ] {
+            let original_words: Vec<String> = set
+                .word_boundaries()
+                .iter()
+                .map(|&(s, e)| {
+                    set.content_no_commas()
+                        .chars()
+                        .skip(s)
+                        .take(e - s)
+                        .collect()
+                })
+                .collect();
+            let text = load_builtin_text_shuffled(set);
+            let boundaries = text.word_boundaries.unwrap();
+            let shuffled_words: Vec<String> = boundaries
+                .iter()
+                .map(|&(s, e)| text.content.chars().skip(s).take(e - s).collect())
+                .collect();
+            assert_eq!(
+                original_words.len(),
+                shuffled_words.len(),
+                "{} 乱序后词数变化",
+                set.name()
+            );
+            let mut orig_sorted = original_words.clone();
+            orig_sorted.sort_unstable();
+            let mut shuf_sorted = shuffled_words.clone();
+            shuf_sorted.sort_unstable();
+            assert_eq!(
+                orig_sorted, shuf_sorted,
+                "{} 乱序后词组多重集不一致",
+                set.name()
+            );
+        }
+    }
+
+    #[test]
+    fn shuffled_word_boundaries_are_contiguous_and_valid() {
+        // 词组赛文乱序后 word_boundaries 应覆盖整个 content 且不重叠。
+        for &set in &[
+            BuiltinSet::CommonWordsQian,
+            BuiltinSet::CommonWordsZhong,
+            BuiltinSet::CommonWordsHou,
+        ] {
+            let text = load_builtin_text_shuffled(set);
+            let boundaries = text.word_boundaries.unwrap();
+            let total_chars = text.content.chars().count();
+            let mut prev_end = 0;
+            for &(start, end) in &boundaries {
+                assert!(
+                    start == prev_end,
+                    "{} 乱序边界不连续: prev_end={}, start={}",
+                    set.name(),
+                    prev_end,
+                    start
+                );
+                assert!(start < end, "{} 乱序词范围空", set.name());
+                assert!(
+                    end <= total_chars,
+                    "{} 乱序词范围越界: end={}, total={}",
+                    set.name(),
+                    end,
+                    total_chars
+                );
+                prev_end = end;
+            }
+            assert_eq!(
+                prev_end, total_chars,
+                "{} 乱序边界未覆盖全部 content",
+                set.name()
+            );
+        }
+    }
+
+    #[test]
+    fn shuffled_differs_from_ordered_on_average() {
+        // 乱序后与顺序版不同的概率应很高（对 500 字/词来说几乎为 1）。
+        for &set in &BUILTIN_SETS {
+            let ordered = load_builtin_text(set);
+            let shuffled = load_builtin_text_shuffled(set);
+            assert_ne!(
+                ordered.content, shuffled.content,
+                "{} 乱序后内容与顺序版完全相同（极低概率，可能乱序未生效）",
+                set.name()
+            );
         }
     }
 }

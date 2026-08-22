@@ -8,7 +8,8 @@ use dazitui_core::{
     ApiClient, ApiError, BUILTIN_SETS, CharStatus, CompetitionType, FONT_SIZE_PT,
     LoadError, LoadOptions, Rgb, Session, Settings, SettingsStore, Stats, Text, TextSource,
     Theme, TokenStore, build_upload_payload, env_credentials, format_share_text,
-    is_auth_failure, load_builtin_text, load_text_from_file, load_text_from_file_with_options,
+    is_auth_failure, load_builtin_text, load_builtin_text_shuffled,
+    load_text_from_file, load_text_from_file_with_options,
     osc_font_size_sequence, osc52_clipboard, should_auto_relogin, to_upload_stats,
 };
 use ratatui::Frame;
@@ -102,6 +103,12 @@ struct App {
     settings_store: SettingsStore,
     /// 设置视图当前焦点项（FOCUS_THEME/FOCUS_RATIO/FOCUS_BOLD/FOCUS_FONT）。
     settings_focus: usize,
+    /// 内置赛文浏览中的乱序开关（`true` = 载入时打乱顺序）。
+    builtin_shuffle: bool,
+    /// 内置赛文浏览器预览缓存 `(title, body)`。
+    /// 乱序开时存乱序版预览（避免每帧重新随机导致闪烁），关时存顺序版预览。
+    /// 在 `open_builtin_browser` 与 Up/Down/s 按键时重新生成。
+    builtin_preview: Option<(String, String)>,
 }
 
 /// 登录模态框输入状态。
@@ -187,6 +194,8 @@ impl App {
             settings,
             settings_store,
             settings_focus: FOCUS_THEME,
+            builtin_shuffle: false,
+            builtin_preview: None,
         }
     }
 
@@ -263,7 +272,13 @@ impl App {
     }
 
     /// 重打当前赛文：重置会话与计时。
+    /// 若当前赛文为乱序版，重新打乱以获得新的随机排列。
     fn restart(&mut self) {
+        if self.text.shuffled {
+            if let TextSource::Builtin { set } = self.text.source {
+                self.text = load_builtin_text_shuffled(set);
+            }
+        }
         self.session = Session::new(&self.text.content);
         self.start = Instant::now();
         self.state = AppState::Typing;
@@ -324,7 +339,37 @@ impl App {
     /// 进入内置赛文浏览：展示套题列表，可载入。
     fn open_builtin_browser(&mut self) {
         self.builtin_selection = 0;
+        self.refresh_builtin_preview();
         self.state = AppState::BrowsingBuiltin;
+    }
+
+    /// 重新生成内置赛文浏览器预览缓存。
+    /// 乱序开时加载打乱版（每次调用随机不同），关时顺序版。
+    /// 在 `open_builtin_browser`、Up/Down 选区变化、s 切换乱序时调用。
+    fn refresh_builtin_preview(&mut self) {
+        self.builtin_preview = Some(match BUILTIN_SETS.get(self.builtin_selection) {
+            Some(&set) if self.builtin_shuffle => {
+                let text = load_builtin_text_shuffled(set);
+                let body = if set.is_words() {
+                    let boundaries = text.word_boundaries.as_ref().unwrap();
+                    let chars: Vec<char> = text.content.chars().collect();
+                    builtin_word_preview(boundaries, &chars)
+                } else {
+                    builtin_char_preview(&text.content)
+                };
+                (text.title, body)
+            }
+            Some(&set) if set.is_words() => {
+                let no_commas = set.content_no_commas();
+                let boundaries = set.word_boundaries();
+                let chars: Vec<char> = no_commas.chars().collect();
+                (set.name().to_string(), builtin_word_preview(&boundaries, &chars))
+            }
+            Some(&set) => {
+                (set.name().to_string(), builtin_char_preview(set.content()))
+            }
+            None => ("预览".to_string(), "（无内置赛文）".to_string()),
+        });
     }
 
     /// 载入当前选中的内置赛文，进入新跟打。
@@ -332,7 +377,11 @@ impl App {
         let Some(set) = BUILTIN_SETS.get(self.builtin_selection).copied() else {
             return;
         };
-        self.text = load_builtin_text(set);
+        self.text = if self.builtin_shuffle {
+            load_builtin_text_shuffled(set)
+        } else {
+            load_builtin_text(set)
+        };
         self.session = Session::new(&self.text.content);
         self.start = Instant::now();
         self.state = AppState::Typing;
@@ -362,6 +411,8 @@ impl App {
                     title: comp.title,
                     content: comp.content,
                     source: TextSource::Online { competition_type },
+                    word_boundaries: None,
+                    shuffled: false,
                 };
                 self.session = Session::new(&self.text.content);
                 self.start = Instant::now();
@@ -619,12 +670,18 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                     AppState::BrowsingBuiltin => match key.code {
                         KeyCode::Up => {
                             app.builtin_selection = app.builtin_selection.saturating_sub(1);
+                            app.refresh_builtin_preview();
                         }
                         KeyCode::Down => {
                             app.builtin_selection =
                                 (app.builtin_selection + 1).min(BUILTIN_SETS.len() - 1);
+                            app.refresh_builtin_preview();
                         }
                         KeyCode::Enter => app.load_selected_builtin(),
+                        KeyCode::Char('s') | KeyCode::Char('S') => {
+                            app.builtin_shuffle = !app.builtin_shuffle;
+                            app.refresh_builtin_preview();
+                        }
                         KeyCode::Esc => app.state = AppState::Typing,
                         _ => {}
                     },
@@ -704,7 +761,7 @@ fn hint_text(browsing: bool, browsing_builtin: bool, is_online: bool) -> &'stati
     if browsing {
         " ↑↓ 选择 | Enter 载入 | Esc 取消 | 1 去空格 | 2 去符号 | Ctrl-E 设置 | q 退出"
     } else if browsing_builtin {
-        " ↑↓ 选择 | Enter 载入 | Esc 取消 | q 退出"
+        " ↑↓ 选择 | Enter 载入 | s 乱序 | Esc 取消 | q 退出"
     } else if is_online {
         " q 退出 | Ctrl-S 结束 | Ctrl-B 内置赛文 | Ctrl-F 载文 | Ctrl-O 登录 | Ctrl-E 设置 | Tab 收起栏 "
     } else {
@@ -928,7 +985,7 @@ fn ui(frame: &mut Frame, app: &App) {
         frame.render_widget(
             Paragraph::new(original_line(
                 &app.session,
-                app.text.source,
+                &app.text,
                 app.theme(),
                 app.settings.bold,
             ))
@@ -940,7 +997,7 @@ fn ui(frame: &mut Frame, app: &App) {
         frame.render_widget(
             Paragraph::new(type_line(
                 &app.session,
-                app.text.source,
+                &app.text,
                 app.theme(),
                 app.settings.bold,
             ))
@@ -1146,50 +1203,48 @@ fn render_preview(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     );
 }
 
+/// 词组赛文预览：取前 `BUILTIN_ITEMS_PER_PAGE` 个词，词间加空格。
+fn builtin_word_preview(
+    boundaries: &[(usize, usize)],
+    chars: &[char],
+) -> String {
+    let preview_words = boundaries.len().min(BUILTIN_ITEMS_PER_PAGE);
+    let mut preview = String::new();
+    for (i, &(ws, we)) in boundaries.iter().take(preview_words).enumerate() {
+        if i > 0 {
+            preview.push(' ');
+        }
+        for ch in chars[ws..we].iter() {
+            preview.push(*ch);
+        }
+    }
+    if boundaries.len() > BUILTIN_ITEMS_PER_PAGE {
+        preview.push_str(" …");
+    }
+    preview
+}
+
+/// 单字赛文预览：取前 400 字，超长则加省略号。
+fn builtin_char_preview(content: &str) -> String {
+    let chars: Vec<char> = content.chars().take(400).collect();
+    let dot = if content.chars().count() > 400 { "…" } else { "" };
+    format!("{}{dot}", chars.iter().collect::<String>())
+}
+
 /// 内置赛文预览：右侧内容区显示选中套题的内容预览。
 fn render_builtin_preview(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let theme = app.theme();
-    let (title, body) = match BUILTIN_SETS.get(app.builtin_selection) {
-        Some(set) => {
-            // 词组赛文：去逗号、词间加空格，与跟打显示一致。
-            if set.is_words() {
-                let no_commas = set.content_no_commas();
-                let boundaries = set.word_boundaries();
-                // 预览取前 10 个词（一页），词间加空格
-                let preview_words = boundaries.len().min(BUILTIN_ITEMS_PER_PAGE);
-                let mut preview = String::new();
-                for (i, &(ws, we)) in boundaries.iter().take(preview_words).enumerate() {
-                    if i > 0 {
-                        preview.push(' ');
-                    }
-                    let chars: Vec<char> = no_commas.chars().collect();
-                    for ch in chars[ws..we].iter() {
-                        preview.push(*ch);
-                    }
-                }
-                let dot = if boundaries.len() > BUILTIN_ITEMS_PER_PAGE {
-                    " …"
-                } else {
-                    ""
-                };
-                (set.name(), format!("{preview}{dot}"))
-            } else {
-                // 单字赛文：取前 400 字预览
-                let content = set.content();
-                let chars: Vec<char> = content.chars().take(400).collect();
-                let dot = if content.chars().count() > 400 { "…" } else { "" };
-                (set.name(), format!("{}{dot}", chars.iter().collect::<String>()))
-            }
-        }
-        None => ("预览", "（无内置赛文）".to_string()),
-    };
+    let (title, body) = app
+        .builtin_preview
+        .clone()
+        .unwrap_or_else(|| ("预览".to_string(), "（无内置赛文）".to_string()));
     // 预览按每 10 字一页（单字）或整行（词组），与实际跟打展示一致。
     let mut lines: Vec<Line> = vec![
         Line::from(format!(" 内置赛文 — {title} ")).bold(),
         Line::from(""),
     ];
-    if matches!(BUILTIN_SETS.get(app.builtin_selection), Some(set) if set.is_words()) {
-        // 词组赛文：整行显示（一页 10 词已在 body 中用空格分隔）
+    let is_words = matches!(BUILTIN_SETS.get(app.builtin_selection), Some(set) if set.is_words());
+    if is_words {
         lines.push(Line::from(body));
     } else {
         for chunk in body.chars().collect::<Vec<char>>().chunks(BUILTIN_ITEMS_PER_PAGE) {
@@ -1197,7 +1252,11 @@ fn render_builtin_preview(frame: &mut Frame, app: &App, area: ratatui::layout::R
         }
     }
     lines.push(Line::from(""));
-    lines.push(Line::from(" Enter 载入 | Esc 取消 ").fg(color(theme.muted)));
+    let shuffle_label = if app.builtin_shuffle { "[x] 乱序" } else { "[ ] 乱序" };
+    lines.push(
+        Line::from(format!(" Enter 载入 | s {shuffle_label} | Esc 取消 "))
+            .fg(color(theme.muted)),
+    );
     frame.render_widget(
         Paragraph::new(lines)
             .block(themed_block(theme).title(" 预览 "))
@@ -1455,13 +1514,21 @@ fn build_word_type_spans(
 /// 打完当前页自动翻页；其余来源显示全文（由终端宽度自动折行）。
 fn original_line(
     session: &Session,
-    source: TextSource,
+    text: &Text,
     theme: Theme,
     bold: bool,
 ) -> TextLines<'static> {
+    let source = text.source;
     if let TextSource::Builtin { set } = source {
         if set.is_words() {
-            let boundaries = set.word_boundaries();
+            let owned_boundaries;
+            let boundaries: &[(usize, usize)] = match &text.word_boundaries {
+                Some(b) if !b.is_empty() => b,
+                _ => {
+                    owned_boundaries = set.word_boundaries();
+                    &owned_boundaries
+                }
+            };
             let typed_len = session.len();
             let current_word_idx = boundaries
                 .iter()
@@ -1476,15 +1543,15 @@ fn original_line(
             }
             let spans = build_word_spans(
                 session,
-                &boundaries,
+                boundaries,
                 page_start_word,
                 page_end_word,
                 theme,
                 bold,
             );
-            let mut text = TextLines::default();
-            text.push_line(Line::from(spans));
-            return text;
+            let mut text_lines = TextLines::default();
+            text_lines.push_line(Line::from(spans));
+            return text_lines;
         }
         // 单字赛文：每页 10 字
         let start = builtin_page_start(session.len());
@@ -1529,13 +1596,21 @@ fn original_line(
 /// 打完当前页自动翻页；其余来源显示全文（由终端宽度自动折行）。
 fn type_line(
     session: &Session,
-    source: TextSource,
+    text: &Text,
     theme: Theme,
     bold: bool,
 ) -> TextLines<'static> {
+    let source = text.source;
     if let TextSource::Builtin { set } = source {
         if set.is_words() {
-            let boundaries = set.word_boundaries();
+            let owned_boundaries;
+            let boundaries: &[(usize, usize)] = match &text.word_boundaries {
+                Some(b) if !b.is_empty() => b,
+                _ => {
+                    owned_boundaries = set.word_boundaries();
+                    &owned_boundaries
+                }
+            };
             let display = session.display();
             if display.is_empty() {
                 return TextLines::from(
@@ -1556,7 +1631,7 @@ fn type_line(
             }
             let spans = build_word_type_spans(
                 &display,
-                &boundaries,
+                boundaries,
                 page_start_word,
                 page_end_word,
                 theme,
@@ -1568,9 +1643,9 @@ fn type_line(
                     Line::from("（跟打区 — 输入法上屏文字将显示在这里）").fg(color(theme.muted)),
                 );
             }
-            let mut text = TextLines::default();
-            text.push_line(Line::from(spans));
-            return text;
+            let mut text_lines = TextLines::default();
+            text_lines.push_line(Line::from(spans));
+            return text_lines;
         }
         // 单字赛文：每页 10 字
         let start = builtin_page_start(session.len());
@@ -1878,6 +1953,8 @@ mod tests {
             title: "old".into(),
             content: "旧赛文".into(),
             source: TextSource::File,
+            word_boundaries: None,
+            shuffled: false,
         });
         // 选中第二套（中五百）。
         app.open_builtin_browser();
@@ -1888,6 +1965,105 @@ mod tests {
         assert!(!app.text.is_online());
         assert!(matches!(app.state, AppState::Typing));
         assert_eq!(app.session.len(), 0);
+    }
+
+    #[test]
+    fn s_key_toggles_builtin_shuffle() {
+        let mut app = test_app(file_text("旧赛文"));
+        app.open_builtin_browser();
+        assert!(!app.builtin_shuffle, "初始乱序开关应为关");
+        // 模拟 s 键：切换乱序开关并刷新预览（事件循环中的处理逻辑）。
+        app.builtin_shuffle = !app.builtin_shuffle;
+        app.refresh_builtin_preview();
+        assert!(app.builtin_shuffle, "s 键后乱序开关应为开");
+        let (title, _) = app.builtin_preview.as_ref().unwrap();
+        assert!(title.contains("乱序"), "乱序开时预览标题应含「（乱序）」");
+        // 再按一次 s：关闭乱序。
+        app.builtin_shuffle = !app.builtin_shuffle;
+        app.refresh_builtin_preview();
+        assert!(!app.builtin_shuffle, "再按 s 后乱序开关应为关");
+        let (title, _) = app.builtin_preview.as_ref().unwrap();
+        assert!(!title.contains("乱序"), "乱序关时预览标题不应含「（乱序）」");
+    }
+
+    #[test]
+    fn load_selected_builtin_with_shuffle_loads_shuffled_text() {
+        let mut app = test_app(file_text("旧赛文"));
+        app.open_builtin_browser();
+        app.builtin_shuffle = true;
+        app.builtin_selection = 0; // 常用单字前五百
+        app.load_selected_builtin();
+        assert!(app.text.shuffled, "乱序加载的 Text 应 shuffled=true");
+        assert_eq!(app.text.title, "常用单字前五百（乱序）");
+        assert!(matches!(app.text.source, TextSource::Builtin { .. }));
+        assert!(matches!(app.state, AppState::Typing));
+    }
+
+    #[test]
+    fn restart_reshuffles_when_text_is_shuffled() {
+        let mut app = test_app(load_builtin_text_shuffled(BUILTIN_SETS[0]));
+        assert!(app.text.shuffled);
+        let content_before = app.text.content.clone();
+        app.restart();
+        assert!(app.text.shuffled, "重打后仍应 shuffled=true");
+        assert!(app.text.title.contains("乱序"), "重打后标题仍含「（乱序）」");
+        assert_ne!(
+            app.text.content, content_before,
+            "重打应产生新的乱序排列"
+        );
+        assert_eq!(app.session.len(), 0, "重打后 session 应清空");
+        assert!(matches!(app.state, AppState::Typing));
+    }
+
+    #[test]
+    fn original_line_shuffled_word_set_uses_text_boundaries() {
+        // 乱序词组 Text 携带自身 word_boundaries，original_line 应直接使用它们。
+        let theme = Theme::preset(ThemePreset::Default);
+        let set = BUILTIN_SETS[3]; // 常用词组前五百
+        let text = load_builtin_text_shuffled(set);
+        assert!(text.shuffled);
+        let boundaries = text.word_boundaries.as_ref().unwrap();
+        assert!(!boundaries.is_empty());
+        let session = Session::new(&text.content);
+        let rendered = original_line(&session, &text, theme, false);
+        assert_eq!(rendered.lines.len(), 1, "乱序词组对照区应只有一行");
+        let first_page_words = boundaries.len().min(BUILTIN_ITEMS_PER_PAGE);
+        let space_spans = rendered.lines[0]
+            .spans
+            .iter()
+            .filter(|s| s.content == " ")
+            .count();
+        assert_eq!(space_spans, first_page_words - 1, "乱序第 1 页词间空格数");
+        let word_chars: usize = boundaries.iter().take(first_page_words).map(|(s, e)| e - s).sum();
+        let non_space_spans = rendered.lines[0]
+            .spans
+            .iter()
+            .filter(|s| s.content != " ")
+            .count();
+        assert_eq!(non_space_spans, word_chars, "乱序第 1 页非空格 span 数应等于词字符数");
+    }
+
+    #[test]
+    fn type_line_shuffled_word_set_uses_text_boundaries() {
+        // 乱序词组 Text 携带自身 word_boundaries，type_line 应直接使用它们。
+        let theme = Theme::preset(ThemePreset::Default);
+        let set = BUILTIN_SETS[3]; // 常用词组前五百
+        let text = load_builtin_text_shuffled(set);
+        let boundaries = text.word_boundaries.as_ref().unwrap();
+        let mut session = Session::new(&text.content);
+        // 打第 1 个乱序词的全部字符
+        let (ws, we) = boundaries[0];
+        let first_word: String = text.content.chars().skip(ws).take(we - ws).collect();
+        session.type_text(&first_word);
+        let rendered = type_line(&session, &text, theme, false);
+        assert_eq!(rendered.lines.len(), 1, "乱序词组跟打区应只有一行");
+        for ch in first_word.chars() {
+            let s = ch.to_string();
+            assert!(
+                rendered.lines[0].spans.iter().any(|sp| sp.content == s),
+                "跟打区应含已打的「{ch}」字"
+            );
+        }
     }
 
     #[test]
@@ -1972,7 +2148,18 @@ mod tests {
         let theme = Theme::preset(ThemePreset::Default);
         let mut session = Session::new("你好世界");
         session.type_text("你好四界");
-        let text = type_line(&session, TextSource::File, theme, false);
+        let text = type_line(
+            &session,
+            &Text {
+                title: "t".into(),
+                content: "你好世界".into(),
+                source: TextSource::File,
+                word_boundaries: None,
+                shuffled: false,
+            },
+            theme,
+            false,
+        );
         let line = &text.lines[0];
         assert_eq!(line.spans.len(), 4);
         assert_eq!(line.spans[0].style.fg, Some(color(theme.correct)));
@@ -1984,7 +2171,18 @@ mod tests {
         let theme = Theme::preset(ThemePreset::Default);
         let mut session = Session::new("你好世界");
         session.type_text("你好四");
-        let text = original_line(&session, TextSource::File, theme, false);
+        let text = original_line(
+            &session,
+            &Text {
+                title: "t".into(),
+                content: "你好世界".into(),
+                source: TextSource::File,
+                word_boundaries: None,
+                shuffled: false,
+            },
+            theme,
+            false,
+        );
         let line = &text.lines[0];
         assert_eq!(line.spans.len(), 4);
         assert_eq!(line.spans[0].style.fg, Some(color(theme.correct))); // 你 ✓
@@ -2003,11 +2201,18 @@ mod tests {
         let theme = Theme::preset(ThemePreset::Default);
         let mut session = Session::new("你好世界");
         session.type_text("你好");
-        let text = type_line(&session, TextSource::File, theme, true);
+        let file_text = Text {
+            title: "t".into(),
+            content: "你好世界".into(),
+            source: TextSource::File,
+            word_boundaries: None,
+            shuffled: false,
+        };
+        let text = type_line(&session, &file_text, theme, true);
         let line = &text.lines[0];
         assert_eq!(line.spans[0].style.add_modifier, Modifier::BOLD);
         assert_eq!(line.spans[1].style.add_modifier, Modifier::BOLD);
-        let plain = type_line(&session, TextSource::File, theme, false);
+        let plain = type_line(&session, &file_text, theme, false);
         let plain_line = &plain.lines[0];
         assert_eq!(plain_line.spans[0].style.add_modifier, Modifier::empty());
     }
@@ -2018,11 +2223,18 @@ mod tests {
         let mut session = Session::new("你好世界");
         session.type_text("你好");
         // 已打到（对）与未打到都加粗。
-        let text = original_line(&session, TextSource::File, theme, true);
+        let file_text = Text {
+            title: "t".into(),
+            content: "你好世界".into(),
+            source: TextSource::File,
+            word_boundaries: None,
+            shuffled: false,
+        };
+        let text = original_line(&session, &file_text, theme, true);
         let line = &text.lines[0];
         assert_eq!(line.spans[0].style.add_modifier, Modifier::BOLD);
         assert_eq!(line.spans[2].style.add_modifier, Modifier::BOLD);
-        let plain = original_line(&session, TextSource::File, theme, false);
+        let plain = original_line(&session, &file_text, theme, false);
         let plain_line = &plain.lines[0];
         assert_eq!(plain_line.spans[0].style.add_modifier, Modifier::empty());
     }
@@ -2084,6 +2296,8 @@ mod tests {
             title: "old".into(),
             content: "旧赛文".into(),
             source: TextSource::File,
+            word_boundaries: None,
+            shuffled: false,
         });
         app.open_browser();
         // 打开浏览时扫描的是当前工作目录，手动指向临时目录
@@ -2110,6 +2324,8 @@ mod tests {
             title: "old".into(),
             content: "旧赛文".into(),
             source: TextSource::File,
+            word_boundaries: None,
+            shuffled: false,
         });
         app.open_browser();
         app.browse_files = list_text_files(&dir);
@@ -2178,8 +2394,15 @@ mod tests {
         let dracula_theme = Theme::preset(ThemePreset::Dracula);
         let mut session = Session::new("你好");
         session.type_text("你四");
-        let default_text = original_line(&session, TextSource::File, default_theme, false);
-        let dracula_text = original_line(&session, TextSource::File, dracula_theme, false);
+        let file_text = Text {
+            title: "t".into(),
+            content: "你好".into(),
+            source: TextSource::File,
+            word_boundaries: None,
+            shuffled: false,
+        };
+        let default_text = original_line(&session, &file_text, default_theme, false);
+        let dracula_text = original_line(&session, &file_text, dracula_theme, false);
         let default_line = &default_text.lines[0];
         let dracula_line = &dracula_text.lines[0];
         assert_eq!(
@@ -2212,38 +2435,42 @@ mod tests {
     fn type_line_builtin_shows_only_current_page() {
         // 25 字内置赛文：每页 10 字，打满当前页（第 10 字）即翻到下一页，跟打区只显示当前页。
         let theme = Theme::preset(ThemePreset::Default);
-        let mut session = Session::new("一二三四五六七八九十甲乙丙丁戊己庚辛壬癸子丑寅卯辰");
+        let content = "一二三四五六七八九十甲乙丙丁戊己庚辛壬癸子丑寅卯辰";
+        let mut session = Session::new(content);
+        let text = builtin_text(content);
         // 打 5 字：仍在第一页，跟打区显示当前页已打的 5 字。
         session.type_text("一二三四五");
-        let text = type_line(&session, TextSource::Builtin { set: BUILTIN_SETS[0] }, theme, false);
-        assert_eq!(text.lines.len(), 1, "第一页应只有一行");
-        assert_eq!(text.lines[0].spans.len(), 5, "打 5 字应显示 5 字");
+        let rendered = type_line(&session, &text, theme, false);
+        assert_eq!(rendered.lines.len(), 1, "第一页应只有一行");
+        assert_eq!(rendered.lines[0].spans.len(), 5, "打 5 字应显示 5 字");
         // 打到 10 字：打满第一页，翻到第二页，跟打区显示第二页前 0 字（空输入提示）。
         session.type_text("六七八九十");
-        let text = type_line(&session, TextSource::Builtin { set: BUILTIN_SETS[0] }, theme, false);
-        assert_eq!(text.lines.len(), 1, "翻到第二页尚未打字时应显示提示行");
+        let rendered = type_line(&session, &text, theme, false);
+        assert_eq!(rendered.lines.len(), 1, "翻到第二页尚未打字时应显示提示行");
         // 打到 13 字：第二页已打 3 字，跟打区显示 3 字。
         session.type_text("甲乙丙");
-        let text = type_line(&session, TextSource::Builtin { set: BUILTIN_SETS[0] }, theme, false);
-        assert_eq!(text.lines.len(), 1, "第二页应只有一行");
-        assert_eq!(text.lines[0].spans.len(), 3, "打 13 字应翻页显示第 11-13 字");
+        let rendered = type_line(&session, &text, theme, false);
+        assert_eq!(rendered.lines.len(), 1, "第二页应只有一行");
+        assert_eq!(rendered.lines[0].spans.len(), 3, "打 13 字应翻页显示第 11-13 字");
     }
 
     #[test]
     fn original_line_builtin_shows_only_current_page() {
         // 25 字内置赛文：对照区只显示当前页 10 字，打满当前页（第 10 字）即翻到下一页。
         let theme = Theme::preset(ThemePreset::Default);
-        let mut session = Session::new("一二三四五六七八九十甲乙丙丁戊己庚辛壬癸子丑寅卯辰");
+        let content = "一二三四五六七八九十甲乙丙丁戊己庚辛壬癸子丑寅卯辰";
+        let mut session = Session::new(content);
+        let text = builtin_text(content);
         // 打 5 字：对照区显示第一页 10 字（前 5 已打对，后 5 未打到）。
         session.type_text("一二三四五");
-        let text = original_line(&session, TextSource::Builtin { set: BUILTIN_SETS[0] }, theme, false);
-        assert_eq!(text.lines.len(), 1, "第一页应只有一行");
-        assert_eq!(text.lines[0].spans.len(), 10, "对照区第一页应显示 10 字");
+        let rendered = original_line(&session, &text, theme, false);
+        assert_eq!(rendered.lines.len(), 1, "第一页应只有一行");
+        assert_eq!(rendered.lines[0].spans.len(), 10, "对照区第一页应显示 10 字");
         // 打到 10 字：打满第一页，翻到第二页，对照区显示第 11-20 字（10 字）。
         session.type_text("六七八九十");
-        let text = original_line(&session, TextSource::Builtin { set: BUILTIN_SETS[0] }, theme, false);
-        assert_eq!(text.lines.len(), 1, "第二页应只有一行");
-        assert_eq!(text.lines[0].spans.len(), 10, "对照区第二页应显示 10 字");
+        let rendered = original_line(&session, &text, theme, false);
+        assert_eq!(rendered.lines.len(), 1, "第二页应只有一行");
+        assert_eq!(rendered.lines[0].spans.len(), 10, "对照区第二页应显示 10 字");
     }
 
     #[test]
@@ -2252,7 +2479,7 @@ mod tests {
         let theme = Theme::preset(ThemePreset::Default);
         let mut session = Session::new("一二三四五六七八九十十一十");
         session.type_text("一二三四五六七八九十十一十");
-        let text = type_line(&session, TextSource::File, theme, false);
+        let text = type_line(&session, &file_text("一二三四五六七八九十十一十"), theme, false);
         assert_eq!(text.lines.len(), 1);
         assert_eq!(text.lines[0].spans.len(), 13);
     }
@@ -2262,7 +2489,7 @@ mod tests {
         // 空输入时显示提示行（不分多行、无空 span）。
         let theme = Theme::preset(ThemePreset::Default);
         let session = Session::new("一二三四五六七八九十");
-        let text = type_line(&session, TextSource::Builtin { set: BUILTIN_SETS[0] }, theme, false);
+        let text = type_line(&session, &builtin_text("一二三四五六七八九十"), theme, false);
         assert_eq!(text.lines.len(), 1, "空输入应只有一行提示");
     }
 
@@ -2273,15 +2500,21 @@ mod tests {
         // content_no_commas = "可以一个自己没有..."（词间无逗号）
         let set = BUILTIN_SETS[3]; // 常用词组前五百
         let no_commas = set.content_no_commas();
-        let boundaries = set.word_boundaries();
         let mut session = Session::new(no_commas.as_str());
+        let text = Text {
+            title: set.name().into(),
+            content: no_commas.clone(),
+            source: TextSource::Builtin { set },
+            word_boundaries: None,
+            shuffled: false,
+        };
         // 打第 1 个词「可以」（2 字）
         session.type_text("可以");
-        let text = type_line(&session, TextSource::Builtin { set }, theme, false);
-        assert_eq!(text.lines.len(), 1, "词组赛文应只有一行");
+        let rendered = type_line(&session, &text, theme, false);
+        assert_eq!(rendered.lines.len(), 1, "词组赛文应只有一行");
         // 第 1 个词 2 字 + 空格 + 第 2 个词的已打部分…跟打区只显示已打字符
         // 已打 2 字（第 1 词），应在 spans 中。第 2+ 词尚未打，跟打区无内容。
-        let typed_spans: Vec<_> = text.lines[0]
+        let typed_spans: Vec<_> = rendered.lines[0]
             .spans
             .iter()
             .filter(|s| !s.content.is_empty())
@@ -2304,19 +2537,26 @@ mod tests {
         let no_commas = set.content_no_commas();
         let boundaries = set.word_boundaries();
         let session = Session::new(no_commas.as_str());
-        let text = original_line(&session, TextSource::Builtin { set }, theme, false);
-        assert_eq!(text.lines.len(), 1, "词组赛文应只有一行");
+        let text = Text {
+            title: set.name().into(),
+            content: no_commas.clone(),
+            source: TextSource::Builtin { set },
+            word_boundaries: None,
+            shuffled: false,
+        };
+        let rendered = original_line(&session, &text, theme, false);
+        assert_eq!(rendered.lines.len(), 1, "词组赛文应只有一行");
         // 第 1 页 10 个词，词间 9 个空格 span
         let first_page_words = boundaries.len().min(BUILTIN_ITEMS_PER_PAGE);
         let word_chars: usize = boundaries.iter().take(first_page_words).map(|(s, e)| e - s).sum();
-        let space_spans = text.lines[0]
+        let space_spans = rendered.lines[0]
             .spans
             .iter()
             .filter(|s| s.content == " ")
             .count();
         assert_eq!(space_spans, first_page_words - 1, "第 1 页应有 {} 个词间空格", first_page_words - 1);
         // 非空格 span 数 = 第 1 页所有词的字符数
-        let non_space_spans = text.lines[0]
+        let non_space_spans = rendered.lines[0]
             .spans
             .iter()
             .filter(|s| s.content != " ")
@@ -2332,6 +2572,13 @@ mod tests {
         let no_commas = set.content_no_commas();
         let boundaries = set.word_boundaries();
         let mut session = Session::new(no_commas.as_str());
+        let text = Text {
+            title: set.name().into(),
+            content: no_commas.clone(),
+            source: TextSource::Builtin { set },
+            word_boundaries: None,
+            shuffled: false,
+        };
         // 打满第 1 页 10 个词的全部字符
         let first_page_char_count: usize = boundaries
             .iter()
@@ -2341,10 +2588,10 @@ mod tests {
         let first_page_chars: String = no_commas.chars().take(first_page_char_count).collect();
         session.type_text(&first_page_chars);
         // 此时 session.len() == first_page_char_count，应翻到第 2 页
-        let text = type_line(&session, TextSource::Builtin { set }, theme, false);
-        assert_eq!(text.lines.len(), 1, "翻到第 2 页应只有一行");
+        let rendered = type_line(&session, &text, theme, false);
+        assert_eq!(rendered.lines.len(), 1, "翻到第 2 页应只有一行");
         // 第 2 页尚未打字，应显示空输入提示
-        let placeholder_spans: Vec<_> = text.lines[0]
+        let placeholder_spans: Vec<_> = rendered.lines[0]
             .spans
             .iter()
             .filter(|s| s.content.contains("跟打区"))
@@ -2369,10 +2616,17 @@ mod tests {
         let first_page_chars: String = no_commas.chars().take(first_page_char_count).collect();
         session.type_text(&first_page_chars);
         // 对照区应显示第 2 页（第 11-20 词）
-        let text = original_line(&session, TextSource::Builtin { set }, theme, false);
-        assert_eq!(text.lines.len(), 1, "第 2 页应只有一行");
+        let word_text = Text {
+            title: set.name().into(),
+            content: no_commas.clone(),
+            source: TextSource::Builtin { set },
+            word_boundaries: None,
+            shuffled: false,
+        };
+        let rendered = original_line(&session, &word_text, theme, false);
+        assert_eq!(rendered.lines.len(), 1, "第 2 页应只有一行");
         let second_page_words = boundaries.len().min(BUILTIN_ITEMS_PER_PAGE);
-        let space_spans = text.lines[0]
+        let space_spans = rendered.lines[0]
             .spans
             .iter()
             .filter(|s| s.content == " ")
@@ -2473,6 +2727,8 @@ mod tests {
             title: "t".into(),
             content: "c".into(),
             source: TextSource::File,
+            word_boundaries: None,
+            shuffled: false,
         });
         app.open_login();
         app.submit_login();
@@ -2513,6 +2769,8 @@ mod tests {
             title: "t".into(),
             content: "c".into(),
             source: TextSource::File,
+            word_boundaries: None,
+            shuffled: false,
         });
         // 默认未登录（无 token、无环境变量）。
         assert!(app.token.is_none());
@@ -2533,6 +2791,8 @@ mod tests {
             source: TextSource::Online {
                 competition_type: CompetitionType::Jinbiao,
             },
+            word_boundaries: None,
+            shuffled: false,
         }
     }
 
@@ -2686,6 +2946,8 @@ mod tests {
             title: "t".into(),
             content: "你好".into(),
             source: TextSource::File,
+            word_boundaries: None,
+            shuffled: false,
         });
         app.session.type_text("你好");
         assert!(app.finish_typing().is_none());
@@ -2716,6 +2978,8 @@ mod tests {
             title: "t".into(),
             content: content.into(),
             source: TextSource::File,
+            word_boundaries: None,
+            shuffled: false,
         }
     }
 
@@ -2726,6 +2990,8 @@ mod tests {
             source: TextSource::Builtin {
                 set: BUILTIN_SETS[0],
             },
+            word_boundaries: None,
+            shuffled: false,
         }
     }
 
