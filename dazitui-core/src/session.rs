@@ -49,9 +49,13 @@ pub const GROUP_SIZE: usize = 10;
 /// 跟打会话状态机。
 ///
 /// 持有原文与当前已上屏的输入，通过 LCS 对齐逐字比对。
-/// `completed_groups` 跟踪已全对完成的组数（每组 `GROUP_SIZE` 字），
+/// `completed_groups` 跟踪已全对完成的组数，
 /// 用于内置赛文的组边界门槛：组内可自由打/退，但退格不可跨越已完成组边界。
 /// `group_gated` 为 true 时启用组边界门槛（内置赛文），为 false 时无门槛（离线/在线赛文）。
+///
+/// `group_bounds` 为预计算的每组字符范围 `[(start, end), ...]`（词组赛文用）。
+/// 非空时 `current_group_bounds` 按词组边界确定组的字符范围
+/// （每组 GROUP_SIZE 个词）；为空时回退到单字赛文逻辑（每组 GROUP_SIZE 字）。
 pub struct Session {
     original: Vec<char>,
     input: Vec<char>,
@@ -60,6 +64,7 @@ pub struct Session {
     edit_details: Vec<char>,
     completed_groups: usize,
     group_gated: bool,
+    group_bounds: Vec<(usize, usize)>,
 }
 
 impl Session {
@@ -70,6 +75,31 @@ impl Session {
 
     /// 以赛文原文初始化跟打会话，指定是否启用组边界门槛（内置赛文）。
     pub fn new_gated(original: &str, group_gated: bool) -> Self {
+        Self::new_gated_with_words(original, group_gated, &[])
+    }
+
+    /// 以赛文原文初始化跟打会话，指定组边界门槛及词组边界。
+    ///
+    /// `word_boundaries` 为词组赛文每个词的 `(char_start, char_end)` 范围。
+    /// 非空时按词组确定组边界（每组 `GROUP_SIZE` 个词）；为空时回退到单字逻辑。
+    pub fn new_gated_with_words(
+        original: &str,
+        group_gated: bool,
+        word_boundaries: &[(usize, usize)],
+    ) -> Self {
+        let group_bounds = if group_gated && !word_boundaries.is_empty() {
+            // 每 GROUP_SIZE 个词合并为一组的字符范围
+            word_boundaries
+                .chunks(GROUP_SIZE)
+                .map(|chunk| {
+                    let start = chunk.first().map(|b| b.0).unwrap_or(0);
+                    let end = chunk.last().map(|b| b.1).unwrap_or(0);
+                    (start, end)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         Self {
             original: original.chars().collect(),
             input: Vec::new(),
@@ -78,6 +108,7 @@ impl Session {
             edit_details: Vec::new(),
             completed_groups: 0,
             group_gated,
+            group_bounds,
         }
     }
 
@@ -219,11 +250,17 @@ impl Session {
 
     /// 是否已上屏完整篇原文。
     ///
-    /// 组边界门槛（内置赛文）：所有组全部全对才算完成（`completed_groups * GROUP_SIZE >= original.len()`）。
+    /// 组边界门槛（内置赛文）：所有组全部全对才算完成。
+    /// 词组赛文：`completed_groups >= group_bounds.len()`。
+    /// 单字赛文：`completed_groups * GROUP_SIZE >= original.len()`。
     /// 非门槛模式：上屏长度 ≥ 原文长度即完成。
     pub fn is_complete(&self) -> bool {
         if self.group_gated {
-            self.completed_groups * GROUP_SIZE >= self.original.len()
+            if !self.group_bounds.is_empty() {
+                self.completed_groups >= self.group_bounds.len()
+            } else {
+                self.completed_groups * GROUP_SIZE >= self.original.len()
+            }
         } else {
             self.input.len() >= self.original.len()
         }
@@ -234,16 +271,24 @@ impl Session {
         self.edits
     }
 
-    /// 已全对完成的组数（每组 `GROUP_SIZE` 字）。TUI 据此计算当前页起始。
+    /// 已全对完成的组数。TUI 据此计算当前页起始。
     pub fn completed_groups(&self) -> usize {
         self.completed_groups
     }
 
     /// 当前组的字符范围 `[start, end)`（`end` 尾组截断到原文长度）。
+    ///
+    /// 词组赛文（`group_bounds` 非空）：按词组边界确定，每组 `GROUP_SIZE` 个词。
+    /// 单字赛文（`group_bounds` 为空）：按字符索引，每组 `GROUP_SIZE` 字。
     fn current_group_bounds(&self) -> (usize, usize) {
-        let start = self.completed_groups * GROUP_SIZE;
-        let end = (start + GROUP_SIZE).min(self.original.len());
-        (start, end)
+        if let Some(&(s, e)) = self.group_bounds.get(self.completed_groups) {
+            let end = e.min(self.original.len());
+            (s, end)
+        } else {
+            let start = self.completed_groups * GROUP_SIZE;
+            let end = (start + GROUP_SIZE).min(self.original.len());
+            (start, end)
+        }
     }
 
     /// 对 input 与 original 做 LCS 对齐，返回 input 每个字符的对/错。

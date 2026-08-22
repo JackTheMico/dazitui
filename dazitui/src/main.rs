@@ -149,7 +149,10 @@ impl App {
         api: ApiClient,
         settings_store: SettingsStore,
     ) -> Self {
-        let session = Session::new_gated(&text.content, text.source.is_builtin());
+        let session = {
+            let wb = text.session_word_boundaries();
+            Session::new_gated_with_words(&text.content, text.source.is_builtin(), &wb)
+        };
         let settings = settings_store.load();
         // token 持久化仅用于请求携带；登录会话（session cookie）不持久化，
         // 故每次启动都需重新登录（方案 1）。即使加载到持久化 token 也不视为已登录。
@@ -279,7 +282,9 @@ impl App {
                 self.text = load_builtin_text_shuffled(set);
             }
         }
-        self.session = Session::new_gated(&self.text.content, self.text.source.is_builtin());
+        let wb = self.text.session_word_boundaries();
+        self.session =
+            Session::new_gated_with_words(&self.text.content, self.text.source.is_builtin(), &wb);
         self.start = Instant::now();
         self.state = AppState::Typing;
         self.browse_error = None;
@@ -382,7 +387,9 @@ impl App {
         } else {
             load_builtin_text(set)
         };
-        self.session = Session::new_gated(&self.text.content, self.text.source.is_builtin());
+        let wb = self.text.session_word_boundaries();
+        self.session =
+            Session::new_gated_with_words(&self.text.content, self.text.source.is_builtin(), &wb);
         self.start = Instant::now();
         self.state = AppState::Typing;
     }
@@ -414,8 +421,10 @@ impl App {
                     word_boundaries: None,
                     shuffled: false,
                 };
-                self.session =
-                    Session::new_gated(&self.text.content, self.text.source.is_builtin());
+                self.session = Session::new_gated(
+                    &self.text.content,
+                    self.text.source.is_builtin(),
+                );
                 self.start = Instant::now();
                 self.state = AppState::Typing;
                 self.online_loading = None;
@@ -2013,7 +2022,7 @@ mod tests {
         assert!(text.shuffled);
         let boundaries = text.word_boundaries.as_ref().unwrap();
         assert!(!boundaries.is_empty());
-        let session = Session::new_gated(&text.content, true);
+        let session = Session::new_gated_with_words(&text.content, true, boundaries);
         let rendered = original_line(&session, &text, theme, false);
         assert_eq!(rendered.lines.len(), 1, "乱序词组对照区应只有一行");
         let first_page_words = boundaries.len().min(BUILTIN_ITEMS_PER_PAGE);
@@ -2039,7 +2048,7 @@ mod tests {
         let set = BUILTIN_SETS[3]; // 常用词组前五百
         let text = load_builtin_text_shuffled(set);
         let boundaries = text.word_boundaries.as_ref().unwrap();
-        let mut session = Session::new_gated(&text.content, true);
+        let mut session = Session::new_gated_with_words(&text.content, true, boundaries);
         // 打第 1 个乱序词的全部字符
         let (ws, we) = boundaries[0];
         let first_word: String = text.content.chars().skip(ws).take(we - ws).collect();
@@ -2529,7 +2538,8 @@ mod tests {
         // content_no_commas = "可以一个自己没有..."（词间无逗号）
         let set = BUILTIN_SETS[3]; // 常用词组前五百
         let no_commas = set.content_no_commas();
-        let mut session = Session::new_gated(no_commas.as_str(), true);
+        let boundaries = set.word_boundaries();
+        let mut session = Session::new_gated_with_words(no_commas.as_str(), true, &boundaries);
         let text = Text {
             title: set.name().into(),
             content: no_commas.clone(),
@@ -2565,7 +2575,7 @@ mod tests {
         let set = BUILTIN_SETS[3]; // 常用词组前五百
         let no_commas = set.content_no_commas();
         let boundaries = set.word_boundaries();
-        let session = Session::new_gated(no_commas.as_str(), true);
+        let session = Session::new_gated_with_words(no_commas.as_str(), true, &boundaries);
         let text = Text {
             title: set.name().into(),
             content: no_commas.clone(),
@@ -2600,7 +2610,8 @@ mod tests {
         let set = BUILTIN_SETS[3]; // 常用词组前五百
         let no_commas = set.content_no_commas();
         let boundaries = set.word_boundaries();
-        let mut session = Session::new_gated(no_commas.as_str(), true);
+        let mut session =
+            Session::new_gated_with_words(no_commas.as_str(), true, &boundaries);
         let text = Text {
             title: set.name().into(),
             content: no_commas.clone(),
@@ -2630,13 +2641,56 @@ mod tests {
     }
 
     #[test]
+    fn type_line_word_set_no_premature_advance_after_5_two_char_words() {
+        // 回归：词组赛文每词 2 字，打 5 个词（= 10 字符）不应推进 completed_groups。
+        // 现状 bug：completed_groups 以字符计（每 10 字符推进），而渲染以词计（每 10 词翻页），
+        // 导致打 5 个词（10 字符）就翻页，跟打区变空白。
+        let theme = Theme::preset(ThemePreset::Default);
+        let set = BUILTIN_SETS[3]; // 常用词组前五百
+        let no_commas = set.content_no_commas();
+        let boundaries = set.word_boundaries();
+        let mut session =
+            Session::new_gated_with_words(no_commas.as_str(), true, &boundaries);
+        let text = Text {
+            title: set.name().into(),
+            content: no_commas.clone(),
+            source: TextSource::Builtin { set },
+            word_boundaries: None,
+            shuffled: false,
+        };
+        // 逐词打前 5 个词（模拟真实 IME 逐词上屏），每个词 2 字
+        for &(ws, we) in boundaries.iter().take(5) {
+            let word: String = no_commas.chars().skip(ws).take(we - ws).collect();
+            session.type_text(&word);
+        }
+        // 打了 5 个词 = 10 字符，但词组赛文一组应为 10 个词，不应推进
+        assert_eq!(
+            session.completed_groups(),
+            0,
+            "打 5 个词（10 字符）不应推进 completed_groups，一组应为 10 词"
+        );
+        // 跟打区应仍显示当前页（第 1-10 词），不应空白
+        let rendered = type_line(&session, &text, theme, false);
+        let non_placeholder: Vec<_> = rendered.lines[0]
+            .spans
+            .iter()
+            .filter(|s| !s.content.contains("跟打区") && s.content != " ")
+            .collect();
+        assert!(
+            !non_placeholder.is_empty(),
+            "打 5 个词后跟打区不应空白，应显示已打字符"
+        );
+    }
+
+    #[test]
     fn original_line_word_set_advances_page_after_10_words() {
         // 词组赛文对照区：10 个词全对后翻到第 2 组，显示第 11-20 词。
         let theme = Theme::preset(ThemePreset::Default);
         let set = BUILTIN_SETS[3]; // 常用词组前五百
         let no_commas = set.content_no_commas();
         let boundaries = set.word_boundaries();
-        let mut session = Session::new_gated(no_commas.as_str(), true);
+        let mut session =
+            Session::new_gated_with_words(no_commas.as_str(), true, &boundaries);
         // 打满第 1 组 10 个词的全部字符（全对）
         let first_page_char_count: usize = boundaries
             .iter()

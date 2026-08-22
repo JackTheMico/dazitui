@@ -42,6 +42,26 @@ pub struct Text {
     pub shuffled: bool,
 }
 
+impl Text {
+    /// 返回用于 Session 组边界计算的词组边界。
+    ///
+    /// 乱序词组赛文使用 `Text.word_boundaries`；顺序词组赛文回退到 `BuiltinSet::word_boundaries()`。
+    /// 非词组赛文返回空 Vec（Session 回退到单字逻辑：每组 GROUP_SIZE 字）。
+    pub fn session_word_boundaries(&self) -> Vec<(usize, usize)> {
+        if let Some(b) = &self.word_boundaries {
+            if !b.is_empty() {
+                return b.clone();
+            }
+        }
+        if let TextSource::Builtin { set } = self.source {
+            if set.is_words() {
+                return set.word_boundaries();
+            }
+        }
+        Vec::new()
+    }
+}
+
 /// 赛文来源：本地文件、内置赛文或 52dazi.cn 在线比赛。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TextSource {
