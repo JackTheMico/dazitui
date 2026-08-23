@@ -1134,6 +1134,26 @@ mod tests {
 
         server.join().unwrap();
     }
+
+    #[test]
+    #[ignore = "requires live 52dazi network access"]
+    fn real_gateway_connection() {
+        let client = ApiClient::new();
+        let res = client.login("invalid_user_test", "invalid_pass_test");
+        assert!(matches!(res, Err(ApiError::Server(_))));
+    }
+
+    #[test]
+    #[ignore = "requires live 52dazi network access"]
+    fn real_gateway_get_content() {
+        let client = ApiClient::new();
+        // 极速杯公开载文
+        let res = client.get_content_with_token("", CompetitionType::Jisu);
+        assert!(res.is_ok(), "极速杯载文应当成功: {res:?}");
+        let text = res.unwrap();
+        assert!(!text.content.is_empty(), "极速杯内容不应为空");
+        assert_eq!(text.title, "市井人间烟火的生活本真");
+    }
 }
 
 
