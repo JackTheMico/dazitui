@@ -158,7 +158,7 @@ impl App {
             Session::new_gated_with_words(&text.content, text.source.is_builtin(), &wb)
         };
         let settings = settings_store.load();
-        // 自动登录与会话恢复：若已有已持久化的会话则直接保持已登录；未登录时若有环境变量则尝试自动登录。
+        // 自动登录与会话恢复：若未登录且有环境变量则尝试自动登录。
         let login_notice =
             if !api.is_logged_in() && let Some((user, pass)) = env_credentials(|k| std::env::var(k).ok()) {
                 match api.login(&user, &pass) {
@@ -475,6 +475,10 @@ impl App {
             }
             Err(e) => {
                 let need_relogin = is_auth_failure(&e);
+                if need_relogin {
+                    self.api.logout();
+                    let _ = self.token_store.clear();
+                }
                 // 登录失效：主文案用友好提示，原始服务器错误降级为次要信息。
                 let (message, detail) = if need_relogin {
                     (
@@ -490,6 +494,7 @@ impl App {
                     detail,
                 }
             }
+
         }
     }
 }
@@ -861,11 +866,22 @@ fn themed_block(theme: Theme) -> Block<'static> {
 fn login_input(form: &mut LoginForm, key: KeyEvent) -> LoginAction {
     match key.code {
         KeyCode::Esc => LoginAction::Cancel,
-        KeyCode::Tab => {
+        KeyCode::Tab | KeyCode::Down => {
             form.focus = 1 - form.focus;
             LoginAction::None
         }
-        KeyCode::Enter => LoginAction::Submit,
+        KeyCode::BackTab | KeyCode::Up => {
+            form.focus = 0;
+            LoginAction::None
+        }
+        KeyCode::Enter => {
+            if form.focus == 0 && !form.username.is_empty() && form.password.is_empty() {
+                form.focus = 1;
+                LoginAction::None
+            } else {
+                LoginAction::Submit
+            }
+        }
         KeyCode::Backspace => {
             let field = if form.focus == 0 {
                 &mut form.username
@@ -887,6 +903,7 @@ fn login_input(form: &mut LoginForm, key: KeyEvent) -> LoginAction {
         _ => LoginAction::None,
     }
 }
+
 
 /// 密码遮蔽：每个字符显示为 `*`。
 fn mask_password(password: &str) -> String {
@@ -2740,7 +2757,12 @@ mod tests {
 
     #[test]
     fn login_input_enter_submits_esc_cancels() {
-        let mut form = LoginForm::default();
+        let mut form = LoginForm {
+            username: "alice".into(),
+            password: "secret".into(),
+            focus: 1,
+            ..Default::default()
+        };
         assert_eq!(
             login_input(&mut form, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             LoginAction::Submit
@@ -2750,6 +2772,45 @@ mod tests {
             LoginAction::Cancel
         );
     }
+
+    #[test]
+    fn login_input_enter_moves_to_password_when_empty() {
+        let mut form = LoginForm {
+            username: "alice".into(),
+            password: "".into(),
+            focus: 0,
+            ..Default::default()
+        };
+        assert_eq!(
+            login_input(&mut form, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            LoginAction::None
+        );
+        assert_eq!(form.focus, 1, "回车后应切换到密码输入框");
+    }
+
+    #[test]
+    fn perform_upload_auth_failure_clears_stale_token() {
+        let (port, handle) = mock_server(&[(
+            "/Api/Rank/uploadResult",
+            r#"{"error":1,"msg":"用户名不能为空！"}"#,
+        )]);
+        let store = temp_token_store();
+        store.save("stale-tok").unwrap();
+        let mut app = App::new_with(
+            online_text("你好"),
+            store.clone(),
+            ApiClient::with_base_url_and_store(&format!("http://127.0.0.1:{port}"), Some(store.clone())),
+            temp_settings_store(),
+        );
+        let stats = app.session.finish(Duration::from_secs(10));
+        let up = app.perform_upload(&stats, Duration::from_secs(10));
+        handle.join().unwrap();
+        assert!(matches!(up, UploadState::Failed { need_relogin: true, .. }));
+        assert!(!app.api.is_logged_in(), "客户端会话应被清理");
+        assert!(store.load().is_none(), "磁盘 token 应被清空");
+    }
+
+
 
     #[test]
     fn mask_password_hides_every_char() {
