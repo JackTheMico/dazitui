@@ -14,7 +14,9 @@ pub use settings::{
 #[cfg(feature = "online")]
 pub use online::auth::{env_credentials, is_auth_failure, should_auto_relogin};
 #[cfg(feature = "online")]
-pub use online::client::{ApiClient, ApiError, CompetitionText, LoginResult, RankResult};
+pub use online::client::{
+    ApiClient, ApiError, CompetitionText, LoginResult, RankResult, UploadOutcome,
+};
 #[cfg(feature = "online")]
 pub use online::protocol::{ProtocolError, build_request, decrypt, encrypt, parse_json};
 #[cfg(feature = "online")]
@@ -23,7 +25,7 @@ pub use online::share::{
     to_upload_stats,
 };
 #[cfg(feature = "online")]
-pub use online::token::TokenStore;
+pub use online::token::{AuthSession, TokenStore};
 
 /// 赛文：练习/比赛用的文字内容，来自本地文件或 52dazi.cn。
 #[derive(Debug, Clone, PartialEq, Eq)]
