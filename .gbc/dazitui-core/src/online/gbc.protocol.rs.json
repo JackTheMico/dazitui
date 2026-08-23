@@ -1,0 +1,36 @@
+{
+    "provides": {
+        "encrypt.matches_known_vector": {
+            "desc": "AES-128-CBC加密符合52dazi协议已知向量",
+            "test": "online::protocol::tests::encrypt_matches_known_vector_cn",
+            "executor": "cargo-dazitui",
+            "timeout_override": -1,
+            "heavy": 0,
+            "dependents": [],
+            "disabled": false
+        },
+        "build_request.encrypts_json": {
+            "desc": "将JSON请求对象打包加密为协议载荷",
+            "test": "online::protocol::tests::build_request_encrypts_json_object",
+            "executor": "cargo-dazitui",
+            "timeout_override": -1,
+            "heavy": 0,
+            "dependents": [
+                "dazitui-core/src/online/client.rs"
+            ],
+            "disabled": false
+        },
+        "parse_json.deserializes_typed": {
+            "desc": "解析解密后的JSON响应为类型化数据",
+            "test": "online::protocol::tests::parse_json_deserializes_into_typed_value",
+            "executor": "cargo-dazitui",
+            "timeout_override": -1,
+            "heavy": 0,
+            "dependents": [
+                "dazitui-core/src/online/client.rs"
+            ],
+            "disabled": false
+        }
+    },
+    "depends_on": []
+}

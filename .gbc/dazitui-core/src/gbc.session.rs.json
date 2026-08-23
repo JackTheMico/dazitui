@@ -1,0 +1,83 @@
+{
+    "provides": {
+        "Session::new.initial_groups_zero": {
+            "desc": "新会话已完成组数初始为0",
+            "test": "session::tests::completed_groups_starts_at_zero",
+            "executor": "cargo-dazitui",
+            "timeout_override": -1,
+            "heavy": 0,
+            "dependents": [
+                "dazitui/src/main.rs",
+                "dazitui-core/src/lib.rs"
+            ],
+            "disabled": false
+        },
+        "Session::type_char.marks_correct": {
+            "desc": "正确上屏字符标记为正确",
+            "test": "session::tests::all_correct_type_text_marks_every_char_correct",
+            "executor": "cargo-dazitui",
+            "timeout_override": -1,
+            "heavy": 0,
+            "dependents": [
+                "dazitui/src/main.rs"
+            ],
+            "disabled": false
+        },
+        "Session::type_char.marks_wrong": {
+            "desc": "错误上屏字符标记为错误",
+            "test": "session::tests::wrong_char_is_marked_wrong",
+            "executor": "cargo-dazitui",
+            "timeout_override": -1,
+            "heavy": 0,
+            "dependents": [
+                "dazitui/src/main.rs"
+            ],
+            "disabled": false
+        },
+        "Session::backspace.records_edit": {
+            "desc": "回改操作计入错字/回改统计",
+            "test": "session::tests::backspace_counts_as_edit",
+            "executor": "cargo-dazitui",
+            "timeout_override": -1,
+            "heavy": 0,
+            "dependents": [
+                "dazitui/src/main.rs"
+            ],
+            "disabled": false
+        },
+        "Session::backspace.locked_at_boundary": {
+            "desc": "回改不可跨越已完成组边界",
+            "test": "session::tests::backspace_locked_at_group_boundary",
+            "executor": "cargo-dazitui",
+            "timeout_override": -1,
+            "heavy": 0,
+            "dependents": [
+                "dazitui/src/main.rs"
+            ],
+            "disabled": false
+        },
+        "Session::is_complete.requires_all_correct": {
+            "desc": "只有所有组全对才判定完成",
+            "test": "session::tests::is_complete_requires_all_groups_correct",
+            "executor": "cargo-dazitui",
+            "timeout_override": -1,
+            "heavy": 0,
+            "dependents": [
+                "dazitui/src/main.rs"
+            ],
+            "disabled": false
+        },
+        "Session::finish.calculates_wpm": {
+            "desc": "结束时基于用时精确计算WPM",
+            "test": "session::tests::finish_all_correct_gives_correct_wpm",
+            "executor": "cargo-dazitui",
+            "timeout_override": -1,
+            "heavy": 0,
+            "dependents": [
+                "dazitui/src/main.rs"
+            ],
+            "disabled": false
+        }
+    },
+    "depends_on": []
+}

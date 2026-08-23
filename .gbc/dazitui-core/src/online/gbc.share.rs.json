@@ -1,0 +1,36 @@
+{
+    "provides": {
+        "build_upload_payload.maps_fields": {
+            "desc": "将会话统计转换为服务端上传载荷",
+            "test": "online::share::tests::build_upload_payload_maps_fields",
+            "executor": "cargo-dazitui",
+            "timeout_override": -1,
+            "heavy": 0,
+            "dependents": [],
+            "disabled": false
+        },
+        "format_share_text.formats_full_line": {
+            "desc": "格式化完整的排行榜分享文本",
+            "test": "online::share::tests::share_text_formats_full_line",
+            "executor": "cargo-dazitui",
+            "timeout_override": -1,
+            "heavy": 0,
+            "dependents": [
+                "dazitui/src/main.rs"
+            ],
+            "disabled": false
+        },
+        "osc52_clipboard.wraps_base64": {
+            "desc": "包装生成OSC 52剪贴板复制序列",
+            "test": "online::share::tests::osc52_clipboard_wraps_base64",
+            "executor": "cargo-dazitui",
+            "timeout_override": -1,
+            "heavy": 0,
+            "dependents": [
+                "dazitui/src/main.rs"
+            ],
+            "disabled": false
+        }
+    },
+    "depends_on": []
+}

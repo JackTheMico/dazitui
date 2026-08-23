@@ -1,0 +1,28 @@
+{
+    "provides": {
+        "is_auth_failure.detects_expired": {
+            "desc": "识别服务端返回的Token过期或需重新登录错误",
+            "test": "online::auth::tests::is_auth_failure_detects_login_expired_message",
+            "executor": "cargo-dazitui",
+            "timeout_override": -1,
+            "heavy": 0,
+            "dependents": [
+                "dazitui/src/main.rs",
+                "dazitui-core/src/online/client.rs"
+            ],
+            "disabled": false
+        },
+        "should_auto_relogin.requires_both": {
+            "desc": "综合凭据与错误类型判定是否触发自动重登",
+            "test": "online::auth::tests::should_auto_relogin_requires_both_conditions",
+            "executor": "cargo-dazitui",
+            "timeout_override": -1,
+            "heavy": 0,
+            "dependents": [
+                "dazitui/src/main.rs"
+            ],
+            "disabled": false
+        }
+    },
+    "depends_on": []
+}

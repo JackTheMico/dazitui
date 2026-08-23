@@ -1,0 +1,134 @@
+{
+    "provides": {},
+    "depends_on": [
+        {
+            "symbol": "dazitui-core/src/lib.rs:load_file",
+            "guarantees": [
+                "load_file.loads_content",
+                "load_file.rejects_empty"
+            ]
+        },
+        {
+            "symbol": "dazitui-core/src/lib.rs:load_builtin_text",
+            "guarantees": [
+                "load_builtin_text.strips_commas"
+            ]
+        },
+        {
+            "symbol": "dazitui-core/src/lib.rs:strip_punctuation",
+            "guarantees": [
+                "strip_punctuation.removes_punct"
+            ]
+        },
+        {
+            "symbol": "dazitui-core/src/lib.rs:strip_whitespace",
+            "guarantees": [
+                "strip_whitespace.removes_all"
+            ]
+        },
+        {
+            "symbol": "dazitui-core/src/lib.rs:shuffle",
+            "guarantees": [
+                "shuffle.preserves_multiset"
+            ]
+        },
+        {
+            "symbol": "dazitui-core/src/lib.rs:Text",
+            "guarantees": []
+        },
+        {
+            "symbol": "dazitui-core/src/lib.rs:TextSource",
+            "guarantees": []
+        },
+        {
+            "symbol": "dazitui-core/src/lib.rs:BuiltinSet",
+            "guarantees": []
+        },
+        {
+            "symbol": "dazitui-core/src/session.rs:Session",
+            "guarantees": [
+                "Session::new.initial_groups_zero",
+                "Session::type_char.marks_correct",
+                "Session::type_char.marks_wrong",
+                "Session::backspace.records_edit",
+                "Session::backspace.locked_at_boundary",
+                "Session::is_complete.requires_all_correct",
+                "Session::finish.calculates_wpm"
+            ]
+        },
+        {
+            "symbol": "dazitui-core/src/session.rs:CharStatus",
+            "guarantees": []
+        },
+        {
+            "symbol": "dazitui-core/src/session.rs:Stats",
+            "guarantees": []
+        },
+        {
+            "symbol": "dazitui-core/src/settings.rs:SettingsStore",
+            "guarantees": [
+                "SettingsStore::load.defaults_on_missing",
+                "SettingsStore::save.roundtrip"
+            ]
+        },
+        {
+            "symbol": "dazitui-core/src/settings.rs:ThemePreset",
+            "guarantees": [
+                "ThemePreset::rgb.exact_colors"
+            ]
+        },
+        {
+            "symbol": "dazitui-core/src/settings.rs:osc_font_size_sequence",
+            "guarantees": [
+                "osc_font_size_sequence.emits_kitty_osc50"
+            ]
+        },
+        {
+            "symbol": "dazitui-core/src/online/client.rs:ApiClient",
+            "guarantees": [
+                "ApiClient::login.parses_token",
+                "ApiClient::get_content.parses_fields",
+                "ApiClient::upload_result.parses_rank"
+            ]
+        },
+        {
+            "symbol": "dazitui-core/src/online/auth.rs:is_auth_failure",
+            "guarantees": [
+                "is_auth_failure.detects_expired"
+            ]
+        },
+        {
+            "symbol": "dazitui-core/src/online/auth.rs:should_auto_relogin",
+            "guarantees": [
+                "should_auto_relogin.requires_both"
+            ]
+        },
+        {
+            "symbol": "dazitui-core/src/online/auth.rs:env_credentials",
+            "guarantees": []
+        },
+        {
+            "symbol": "dazitui-core/src/online/token.rs:TokenStore",
+            "guarantees": [
+                "TokenStore::save_and_load.roundtrip",
+                "TokenStore::load.missing_is_logged_out"
+            ]
+        },
+        {
+            "symbol": "dazitui-core/src/online/share.rs:format_share_text",
+            "guarantees": [
+                "format_share_text.formats_full_line"
+            ]
+        },
+        {
+            "symbol": "dazitui-core/src/online/share.rs:osc52_clipboard",
+            "guarantees": [
+                "osc52_clipboard.wraps_base64"
+            ]
+        },
+        {
+            "symbol": "dazitui-core/src/online/share.rs:to_upload_stats",
+            "guarantees": []
+        }
+    ]
+}

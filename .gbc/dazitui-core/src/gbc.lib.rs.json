@@ -1,0 +1,96 @@
+{
+    "provides": {
+        "load_file.loads_content": {
+            "desc": "载入存在的文件并填充赛文元数据",
+            "test": "tests::loads_existing_file_into_text",
+            "executor": "cargo-dazitui",
+            "timeout_override": -1,
+            "heavy": 0,
+            "dependents": [
+                "dazitui/src/main.rs"
+            ],
+            "disabled": false
+        },
+        "load_file.rejects_empty": {
+            "desc": "空文件或纯空白文件返回空错误",
+            "test": "tests::empty_file_is_empty_error",
+            "executor": "cargo-dazitui",
+            "timeout_override": -1,
+            "heavy": 0,
+            "dependents": [
+                "dazitui/src/main.rs"
+            ],
+            "disabled": false
+        },
+        "load_builtin_text.strips_commas": {
+            "desc": "词组赛文载入时自动滤除逗号",
+            "test": "tests::word_sets_strip_commas_on_load",
+            "executor": "cargo-dazitui",
+            "timeout_override": -1,
+            "heavy": 0,
+            "dependents": [
+                "dazitui/src/main.rs"
+            ],
+            "disabled": false
+        },
+        "strip_punctuation.removes_punct": {
+            "desc": "滤除中文与 ASCII 标点符号",
+            "test": "tests::strip_punctuation_removes_cn_and_ascii_punct",
+            "executor": "cargo-dazitui",
+            "timeout_override": -1,
+            "heavy": 0,
+            "dependents": [
+                "dazitui/src/main.rs"
+            ],
+            "disabled": false
+        },
+        "strip_whitespace.removes_all": {
+            "desc": "滤除所有空白字符",
+            "test": "tests::strip_whitespace_removes_all_whitespace",
+            "executor": "cargo-dazitui",
+            "timeout_override": -1,
+            "heavy": 0,
+            "dependents": [
+                "dazitui/src/main.rs"
+            ],
+            "disabled": false
+        },
+        "shuffle.preserves_multiset": {
+            "desc": "赛文乱序打乱保持字符多重集不变",
+            "test": "tests::shuffled_char_set_preserves_multiset",
+            "executor": "cargo-dazitui",
+            "timeout_override": -1,
+            "heavy": 0,
+            "dependents": [
+                "dazitui/src/main.rs"
+            ],
+            "disabled": false
+        }
+    },
+    "depends_on": [
+        {
+            "symbol": "dazitui-core/src/session.rs:Session",
+            "guarantees": [
+                "Session::new.initial_groups_zero"
+            ]
+        },
+        {
+            "symbol": "dazitui-core/src/settings.rs:SettingsStore",
+            "guarantees": [
+                "SettingsStore::load.defaults_on_missing"
+            ]
+        },
+        {
+            "symbol": "dazitui-core/src/settings.rs:ThemePreset",
+            "guarantees": [
+                "ThemePreset::rgb.exact_colors"
+            ]
+        },
+        {
+            "symbol": "dazitui-core/src/settings.rs:osc_font_size_sequence",
+            "guarantees": [
+                "osc_font_size_sequence.emits_kitty_osc50"
+            ]
+        }
+    ]
+}

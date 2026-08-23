@@ -1,0 +1,52 @@
+{
+    "provides": {
+        "SettingsStore::load.defaults_on_missing": {
+            "desc": "配置文件缺失时回退到默认设置",
+            "test": "settings::tests::store_missing_file_returns_defaults",
+            "executor": "cargo-dazitui",
+            "timeout_override": -1,
+            "heavy": 0,
+            "dependents": [
+                "dazitui/src/main.rs",
+                "dazitui-core/src/lib.rs"
+            ],
+            "disabled": false
+        },
+        "SettingsStore::save.roundtrip": {
+            "desc": "配置存取序列化保持一致",
+            "test": "settings::tests::store_roundtrip",
+            "executor": "cargo-dazitui",
+            "timeout_override": -1,
+            "heavy": 0,
+            "dependents": [
+                "dazitui/src/main.rs"
+            ],
+            "disabled": false
+        },
+        "ThemePreset::rgb.exact_colors": {
+            "desc": "主题预设映射到精确RGB色值",
+            "test": "settings::tests::preset_catppuccin_rgb_exact",
+            "executor": "cargo-dazitui",
+            "timeout_override": -1,
+            "heavy": 0,
+            "dependents": [
+                "dazitui/src/main.rs",
+                "dazitui-core/src/lib.rs"
+            ],
+            "disabled": false
+        },
+        "osc_font_size_sequence.emits_kitty_osc50": {
+            "desc": "准确生成Kitty OSC 50字体缩放转义序列",
+            "test": "settings::tests::osc_font_size_sequence_emits_kitty_osc50",
+            "executor": "cargo-dazitui",
+            "timeout_override": -1,
+            "heavy": 0,
+            "dependents": [
+                "dazitui/src/main.rs",
+                "dazitui-core/src/lib.rs"
+            ],
+            "disabled": false
+        }
+    },
+    "depends_on": []
+}

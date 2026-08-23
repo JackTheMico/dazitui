@@ -1,0 +1,27 @@
+{
+    "provides": {
+        "TokenStore::save_and_load.roundtrip": {
+            "desc": "登录Token持久化与读取一致",
+            "test": "online::token::tests::save_writes_token_and_load_reads_it_back",
+            "executor": "cargo-dazitui",
+            "timeout_override": -1,
+            "heavy": 0,
+            "dependents": [
+                "dazitui/src/main.rs"
+            ],
+            "disabled": false
+        },
+        "TokenStore::load.missing_is_logged_out": {
+            "desc": "凭证文件缺失时判定为未登录",
+            "test": "online::token::tests::missing_file_is_logged_out",
+            "executor": "cargo-dazitui",
+            "timeout_override": -1,
+            "heavy": 0,
+            "dependents": [
+                "dazitui/src/main.rs"
+            ],
+            "disabled": false
+        }
+    },
+    "depends_on": []
+}

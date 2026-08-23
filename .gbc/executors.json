@@ -1,0 +1,17 @@
+{
+    "executors": {
+        "cargo-dazitui": {
+            "command": [
+                "cargo",
+                "test",
+                "{file}",
+                "--",
+                "--exact"
+            ],
+            "cwd": "/home/jackwy/codes/rime/dazitui",
+            "timeout": 30,
+            "env_ops": null,
+            "comment": null
+        }
+    }
+}

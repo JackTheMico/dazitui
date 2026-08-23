@@ -1,0 +1,57 @@
+{
+    "provides": {
+        "ApiClient::login.parses_token": {
+            "desc": "解析登录响应并提取Token",
+            "test": "online::client::tests::parse_login_returns_token",
+            "executor": "cargo-dazitui",
+            "timeout_override": -1,
+            "heavy": 0,
+            "dependents": [
+                "dazitui/src/main.rs"
+            ],
+            "disabled": false
+        },
+        "ApiClient::get_content.parses_fields": {
+            "desc": "解析比赛赛文及作者与字数等元数据",
+            "test": "online::client::tests::parse_content_extracts_content_title_author_word_num",
+            "executor": "cargo-dazitui",
+            "timeout_override": -1,
+            "heavy": 0,
+            "dependents": [
+                "dazitui/src/main.rs"
+            ],
+            "disabled": false
+        },
+        "ApiClient::upload_result.parses_rank": {
+            "desc": "解析成绩上传后的排名信息",
+            "test": "online::client::tests::parse_upload_object_msg_with_ranking",
+            "executor": "cargo-dazitui",
+            "timeout_override": -1,
+            "heavy": 0,
+            "dependents": [
+                "dazitui/src/main.rs"
+            ],
+            "disabled": false
+        }
+    },
+    "depends_on": [
+        {
+            "symbol": "dazitui-core/src/online/protocol.rs:build_request",
+            "guarantees": [
+                "build_request.encrypts_json"
+            ]
+        },
+        {
+            "symbol": "dazitui-core/src/online/protocol.rs:parse_json",
+            "guarantees": [
+                "parse_json.deserializes_typed"
+            ]
+        },
+        {
+            "symbol": "dazitui-core/src/online/auth.rs:is_auth_failure",
+            "guarantees": [
+                "is_auth_failure.detects_expired"
+            ]
+        }
+    ]
+}
