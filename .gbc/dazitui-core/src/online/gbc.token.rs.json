@@ -21,6 +21,15 @@
                 "dazitui/src/main.rs"
             ],
             "disabled": false
+        },
+        "AuthSession::save_and_load.roundtrip_with_cookie": {
+            "desc": "完整会话结构（Token与Cookie）持久化与读取一致",
+            "test": "online::token::tests::save_session_and_load_session_roundtrip_with_cookie",
+            "executor": "cargo-dazitui",
+            "timeout_override": -1,
+            "heavy": 0,
+            "dependents": [],
+            "disabled": false
         }
     },
     "depends_on": []

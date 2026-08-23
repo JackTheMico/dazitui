@@ -88,7 +88,9 @@
             "guarantees": [
                 "ApiClient::login.parses_token",
                 "ApiClient::get_content.parses_fields",
-                "ApiClient::upload_result.parses_rank"
+                "ApiClient::upload_result.parses_rank",
+                "ApiClient::session.persists_cookie_after_restart",
+                "ApiClient::upload_session.auto_retries_and_returns_outcome"
             ]
         },
         {
@@ -128,6 +130,10 @@
         },
         {
             "symbol": "dazitui-core/src/online/share.rs:to_upload_stats",
+            "guarantees": []
+        },
+        {
+            "symbol": "dazitui-core/src/lib.rs:UploadOutcome",
             "guarantees": []
         }
     ]

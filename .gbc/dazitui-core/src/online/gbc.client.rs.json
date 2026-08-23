@@ -32,6 +32,28 @@
                 "dazitui/src/main.rs"
             ],
             "disabled": false
+        },
+        "ApiClient::session.persists_cookie_after_restart": {
+            "desc": "重启后从持久化存储恢复并回传PHPSESSID会话Cookie（满足US4）",
+            "test": "online::client::tests::saved_session_cookie_persists_and_replays_after_restart",
+            "executor": "cargo-dazitui",
+            "timeout_override": -1,
+            "heavy": 0,
+            "dependents": [
+                "dazitui/src/main.rs"
+            ],
+            "disabled": false
+        },
+        "ApiClient::upload_session.auto_retries_and_returns_outcome": {
+            "desc": "一站式跟打成绩上传：自动构建载荷、失效自动重登并返回结构化分享文本",
+            "test": "online::client::tests::upload_session_auto_retries_and_returns_outcome",
+            "executor": "cargo-dazitui",
+            "timeout_override": -1,
+            "heavy": 0,
+            "dependents": [
+                "dazitui/src/main.rs"
+            ],
+            "disabled": false
         }
     },
     "depends_on": [

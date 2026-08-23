@@ -5,12 +5,11 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use dazitui_core::{
-    ApiClient, ApiError, BUILTIN_SETS, CharStatus, CompetitionType, FONT_SIZE_PT,
+    ApiClient, ApiError, AuthSession, BUILTIN_SETS, CharStatus, CompetitionType, FONT_SIZE_PT,
     LoadError, LoadOptions, Rgb, Session, Settings, SettingsStore, Stats, Text, TextSource,
-    Theme, TokenStore, build_upload_payload, env_credentials, format_share_text,
-    is_auth_failure, load_builtin_text, load_builtin_text_shuffled,
+    Theme, TokenStore, env_credentials, is_auth_failure, load_builtin_text, load_builtin_text_shuffled,
     load_text_from_file, load_text_from_file_with_options,
-    osc_font_size_sequence, osc52_clipboard, should_auto_relogin, to_upload_stats,
+    osc_font_size_sequence, osc52_clipboard,
 };
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -154,27 +153,18 @@ impl App {
             Session::new_gated_with_words(&text.content, text.source.is_builtin(), &wb)
         };
         let settings = settings_store.load();
-        // token 持久化仅用于请求携带；登录会话（session cookie）不持久化，
-        // 故每次启动都需重新登录（方案 1）。即使加载到持久化 token 也不视为已登录。
-        let saved_token = token_store.load();
-        let (token, logged_in, login_notice) =
-            if let Some((user, pass)) = env_credentials(|k| std::env::var(k).ok()) {
+        // 自动登录与会话恢复：若已有已持久化的会话则直接保持已登录；未登录时若有环境变量则尝试自动登录。
+        let login_notice =
+            if !api.is_logged_in() && let Some((user, pass)) = env_credentials(|k| std::env::var(k).ok()) {
                 match api.login(&user, &pass) {
-                    Ok(r) => {
-                        let _ = token_store.save(&r.token);
-                        (Some(r.token), true, Some("已通过环境变量登录".to_string()))
-                    }
-                    Err(e) => {
-                        (
-                        saved_token,
-                        false,
-                        Some(format!("自动登录失败: {}", api_error_text(&e))),
-                        )
-                    }
+                    Ok(_) => Some("已通过环境变量登录".to_string()),
+                    Err(e) => Some(format!("自动登录失败: {}", api_error_text(&e))),
                 }
             } else {
-                (saved_token, false, None)
+                None
             };
+        let logged_in = api.is_logged_in();
+        let token = api.current_token();
         Self {
             text,
             session,
@@ -402,17 +392,17 @@ impl App {
     /// 不做 token 有效性预探测：getBaseInfo 的 isLogin 恒为 0、无法反映登录态，
     /// token 有效性唯一由上传接口（uploadResult）真实校验，失败走「登录已失效」提示。
     fn download_online(&mut self, competition_type: CompetitionType) {
-        if !self.logged_in {
+        if !self.logged_in && !self.api.is_logged_in() {
             self.online_loading = None;
             self.online_error = Some("请先登录 52dazi（Ctrl-O）".to_string());
             return;
         }
-        let Some(token) = self.token.clone() else {
-            self.online_loading = None;
-            self.online_error = Some("请先登录 52dazi（Ctrl-O）".to_string());
-            return;
-        };
-        match self.api.get_content(&token, competition_type) {
+        if !self.api.is_logged_in() {
+            if let Some(token) = &self.token {
+                self.api.set_session(Some(AuthSession::from_token(token)));
+            }
+        }
+        match self.api.get_content(competition_type) {
             Ok(comp) => {
                 self.text = Text {
                     title: comp.title,
@@ -438,24 +428,8 @@ impl App {
     }
 
     /// 上传成绩并更新成绩视图状态（在线赛文完成跟打后调用）。
-    ///
-    /// 若上传失败因登录失效且配置了 `DAZITUI_USER`/`DAZITUI_PASS`，自动重新登录
-    /// 并重试上传一次；重试仍失败按原失败路径提示。
     fn do_upload(&mut self, stats: &Stats, elapsed: Duration) {
-        let mut upload = self.perform_upload(stats, elapsed);
-        let need_relogin = matches!(
-            &upload,
-            UploadState::Failed {
-                need_relogin: true,
-                ..
-            }
-        );
-        let credentials = env_credentials(|k| std::env::var(k).ok());
-        if should_auto_relogin(need_relogin, credentials.is_some())
-            && let Some((user, pass)) = credentials
-        {
-            upload = self.retry_after_relogin((user, pass), stats, elapsed);
-        }
+        let upload = self.perform_upload(stats, elapsed);
         self.state = AppState::Finished {
             stats: stats.clone(),
             upload,
@@ -485,33 +459,26 @@ impl App {
         }
     }
 
-    /// 执行上传：构造 payload → 调网关 → 处理结果（成功则写剪贴板）。纯状态产出，不修改自身。
+    /// 执行上传：调用 API 客户端一站式上传成绩（包含指标计算、payload 构建、网关通信、自动重登与分享文本生成）。
     fn perform_upload(&self, stats: &Stats, elapsed: Duration) -> UploadState {
-        if !self.logged_in {
+        if !self.logged_in && !self.api.is_logged_in() {
             return UploadState::Failed {
                 message: "未登录，无法上传成绩".to_string(),
                 need_relogin: true,
                 detail: None,
             };
         }
-        let Some(token) = self.token.clone() else {
-            return UploadState::Failed {
-                message: "未登录，无法上传成绩".to_string(),
-                need_relogin: true,
-                detail: None,
-            };
-        };
-        let upload = to_upload_stats(stats, elapsed);
-        let payload = build_upload_payload(&self.text, stats, &upload, elapsed);
-        match self.api.upload_result(&token, &payload) {
-            Ok(rank) => {
-                let ranking = rank.ranking.clone();
-                let rank_num = ranking.as_deref().and_then(|s| s.parse::<u32>().ok());
-                let share_text = format_share_text(&self.text.source, rank_num, &upload);
-                write_clipboard(&share_text);
+        if !self.api.is_logged_in() {
+            if let Some(token) = &self.token {
+                self.api.set_session(Some(AuthSession::from_token(token)));
+            }
+        }
+        match self.api.upload_session(&self.text, stats, elapsed) {
+            Ok(outcome) => {
+                write_clipboard(&outcome.share_text);
                 UploadState::Success {
-                    ranking,
-                    share_text,
+                    ranking: outcome.ranking,
+                    share_text: outcome.share_text,
                 }
             }
             Err(e) => {
@@ -534,6 +501,7 @@ impl App {
         }
     }
 }
+
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -1734,10 +1702,11 @@ mod tests {
 
     /// 测试用 App：临时 token/设置存储 + 不可达 API（无 token 文件时不发网络请求）。
     fn test_app(text: Text) -> App {
+        let store = temp_token_store();
         App::new_with(
             text,
-            temp_token_store(),
-            ApiClient::with_base_url("http://127.0.0.1:1"),
+            store.clone(),
+            ApiClient::with_base_url_and_store("http://127.0.0.1:1", Some(store)),
             temp_settings_store(),
         )
     }
@@ -3082,18 +3051,18 @@ mod tests {
     }
 
     #[test]
-    fn startup_with_saved_token_keeps_token_but_requires_relogin() {
-        // 持久化 token 仍被加载（用于请求携带），但会话不持久化——不视为已登录，需重新登录。
+    fn startup_with_saved_token_keeps_login() {
+        // 本地有已保存 session/token → 直接保持登录，满足 US4（免重复登录）。
         let store = temp_token_store();
         store.save("saved-token").unwrap();
         let app = App::new_with(
             file_text("你好"),
-            store,
-            ApiClient::with_base_url("http://127.0.0.1:1"), // 不发网络请求
+            store.clone(),
+            ApiClient::with_base_url_and_store("http://127.0.0.1:1", Some(store)), // 不发网络请求
             temp_settings_store(),
         );
         assert_eq!(app.token.as_deref(), Some("saved-token"));
-        assert!(!app.logged_in);
+        assert!(app.logged_in);
         assert!(app.login_notice.is_none());
     }
 
@@ -3108,8 +3077,8 @@ mod tests {
         )]);
         let mut app = App::new_with(
             online_text("旧赛文"),
-            store,
-            ApiClient::with_base_url(&format!("http://127.0.0.1:{port}")),
+            store.clone(),
+            ApiClient::with_base_url_and_store(&format!("http://127.0.0.1:{port}"), Some(store)),
             temp_settings_store(),
         );
         app.logged_in = true;
@@ -3131,8 +3100,8 @@ mod tests {
         store.save("tok").unwrap();
         let mut app = App::new_with(
             online_text("你好世界"),
-            store,
-            ApiClient::with_base_url("http://127.0.0.1:1"),
+            store.clone(),
+            ApiClient::with_base_url_and_store("http://127.0.0.1:1", Some(store)),
             temp_settings_store(),
         );
         app.logged_in = true;

@@ -103,6 +103,7 @@ pub fn build_upload_payload(
         "huiChe": 0,
         "jianShu": total_keys,
         "jianZhun": format!("{:.2}%", accuracy_pct),
+        "accuracy": accuracy_pct,
         "repeatNum": 0,
         "daCi": "0%",
         "wrongNum": stats.wrong_total,
@@ -111,7 +112,7 @@ pub fn build_upload_payload(
         "xuanChong": 0,
         "keyMethod": "0%",
         "challengeFlag": 0,
-        "isFirstSubmit": 0,
+        "isFirstSubmit": 1,
         "isGroupText": 0,
     })
 }
@@ -215,16 +216,16 @@ mod tests {
             key_length: 2.8,
         };
         let text = Text {
-            title: "锦标赛第3279期".into(),
+            title: "市井人间烟火的生活本真".into(),
             content: "你好世界".into(),
             source: TextSource::Online {
-                competition_type: CompetitionType::Jinbiao,
+                competition_type: CompetitionType::Jisu,
             },
             word_boundaries: None,
             shuffled: false,
         };
         let v = build_upload_payload(&text, &stats, &up, Duration::from_secs_f64(85.23));
-        assert_eq!(v["textTitle"], "锦标赛第3279期");
+        assert_eq!(v["textTitle"], "市井人间烟火的生活本真");
         assert_eq!(v["speed"], 85.2);
         assert_eq!(v["keystrokes"], 3.5);
         assert_eq!(v["maChang"], 2.8);
@@ -233,9 +234,12 @@ mod tests {
         assert_eq!(v["huiGai"], 1); // sample_stats edits=1
         assert_eq!(v["jianShu"], 140); // 100 + 40
         assert_eq!(v["wrongNum"], 3); // sample_stats wrong_total=3
+        assert_eq!(v["accuracy"], 100.0);
+        assert_eq!(v["jianZhun"], "100.00%");
         assert_eq!(v["challengeFlag"], 0);
-        assert_eq!(v["isFirstSubmit"], 0);
+        assert_eq!(v["isFirstSubmit"], 1);
     }
+
 
     #[test]
     fn build_upload_payload_includes_frontend_schema_fields() {
