@@ -22,8 +22,12 @@ use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 enum AppState {
     /// 跟打中。
     Typing,
-    /// 已出成绩（成绩视图），携带成绩与上传状态。
-    Finished { stats: Stats, upload: UploadState },
+    /// 已出成绩（成绩视图），携带成绩、上传状态与用时。
+    Finished {
+        stats: Stats,
+        upload: UploadState,
+        elapsed: Duration,
+    },
     /// 载文浏览：功能栏显示文件列表，可预览与载入。
     Browsing,
     /// 内置赛文浏览：功能栏显示套题列表，可载入。
@@ -31,6 +35,7 @@ enum AppState {
     /// 设置视图：切换主题等外观设置。
     Settings,
 }
+
 
 /// 设置视图焦点项下标。
 const FOCUS_THEME: usize = 0;
@@ -256,6 +261,11 @@ impl App {
                 self.logged_in = true;
                 self.login_form = None;
                 self.login_notice = Some("登录成功".to_string());
+                if let AppState::Finished { stats, elapsed, .. } = &self.state {
+                    let stats = stats.clone();
+                    let elapsed = *elapsed;
+                    self.do_upload(&stats, elapsed);
+                }
             }
             Err(e) => {
                 form.busy = false;
@@ -292,16 +302,19 @@ impl App {
             self.state = AppState::Finished {
                 stats: stats.clone(),
                 upload: UploadState::Uploading,
+                elapsed,
             };
             Some((stats, elapsed))
         } else {
             self.state = AppState::Finished {
                 stats,
                 upload: UploadState::NotApplicable,
+                elapsed,
             };
             None
         }
     }
+
 
     /// 进入载文浏览：扫描当前目录文本文件。
     fn open_browser(&mut self) {
@@ -433,8 +446,10 @@ impl App {
         self.state = AppState::Finished {
             stats: stats.clone(),
             upload,
+            elapsed,
         };
     }
+
 
     /// 用环境变量凭据重新登录并重试上传一次；重登失败时保留失败状态并附原始错误。
     fn retry_after_relogin(
@@ -925,7 +940,7 @@ fn list_text_files(dir: &Path) -> Vec<PathBuf> {
 }
 
 fn ui(frame: &mut Frame, app: &App) {
-    if let AppState::Finished { stats, upload } = &app.state {
+    if let AppState::Finished { stats, upload, .. } = &app.state {
         render_result_view(frame, app, stats, upload);
         return;
     }
@@ -1347,8 +1362,12 @@ fn render_result_view(frame: &mut Frame, app: &App, stats: &Stats, upload: &Uplo
     all.extend(upload_lines(upload, theme));
     all.push(Line::from(""));
     if app.text.is_online() {
-        // 在线赛文不支持重打，只能退出或载入其他赛文。
-        all.push(Line::from(" q 退出 | Ctrl-F 载文").fg(color(theme.muted)));
+        // 在线赛文不支持重打。若登录失效，提示 Ctrl-O 登录重试。
+        if let UploadState::Failed { need_relogin: true, .. } = upload {
+            all.push(Line::from(" Ctrl-O 登录并上传 | q 退出 | Ctrl-F 载文").fg(color(theme.muted)));
+        } else {
+            all.push(Line::from(" q 退出 | Ctrl-F 载文").fg(color(theme.muted)));
+        }
     } else {
         all.push(Line::from(" 按任意键重打 | q 退出").fg(color(theme.muted)));
     }
@@ -1398,12 +1417,13 @@ fn upload_lines(upload: &UploadState, theme: Theme) -> Vec<Line<'static>> {
                 lines.push(Line::from(format!(" 原始错误: {d}")).fg(color(theme.muted)));
             }
             if *need_relogin {
-                lines.push(Line::from(" 请按 Ctrl-O 重新登录").fg(color(theme.warn)));
+                lines.push(Line::from(" 请按 Ctrl-O 重新登录（登录后自动重试上传）").fg(color(theme.warn)));
             }
             lines
         }
     }
 }
+
 
 /// 内置赛文每页显示的单位数（单字赛文每页 10 字，词组赛文每页 10 个词）。
 const BUILTIN_ITEMS_PER_PAGE: usize = dazitui_core::GROUP_SIZE;
@@ -3192,4 +3212,46 @@ mod tests {
             }
         );
     }
+
+    #[test]
+    fn submit_login_retries_pending_upload_in_finished_state() {
+        let (port, handle) = mock_server(&[
+            (
+                "/Api/User/login",
+                r#"{"error":0,"msg":{"token":"fresh-token"}}"#,
+            ),
+            (
+                "/Api/Rank/uploadResult",
+                r#"{"error":0,"msg":{"ranking":1,"rankTips":"第1名"}}"#,
+            ),
+        ]);
+        let mut app = test_app(online_text("你好世界"));
+        app.api = ApiClient::with_base_url(&format!("http://127.0.0.1:{port}"));
+        let stats = app.session.finish(Duration::from_secs(30));
+        app.state = AppState::Finished {
+            stats: stats.clone(),
+            upload: UploadState::Failed {
+                message: "登录已失效，请重新登录".to_string(),
+                need_relogin: true,
+                detail: Some("用户名不能为空！".to_string()),
+            },
+            elapsed: Duration::from_secs(30),
+        };
+        app.open_login();
+        if let Some(form) = app.login_form.as_mut() {
+            form.username = "alice".to_string();
+            form.password = "secret".to_string();
+        }
+        app.submit_login();
+        handle.join().unwrap();
+        assert_eq!(app.token.as_deref(), Some("fresh-token"));
+        assert!(matches!(
+            &app.state,
+            AppState::Finished {
+                upload: UploadState::Success { ranking, .. },
+                ..
+            } if ranking.as_deref() == Some("1")
+        ));
+    }
 }
+

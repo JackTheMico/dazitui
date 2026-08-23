@@ -354,6 +354,23 @@ impl ApiClient {
         ))
     }
 
+    /// 校验 token 是否有效（通过 getBaseInfo 的 isLogin 字段探测）。
+    pub fn validate_token(&self, token: &str) -> Result<bool, ApiError> {
+        let body = encrypt_value(&Value::Object(base_fields(Some(token))));
+        let resp = self.post("Api/System/getBaseInfo", &body)?;
+        let obj: Map<String, Value> = parse_api_response(&resp)?;
+        let is_login = obj.get("isLogin").and_then(Value::as_i64).unwrap_or(0);
+        Ok(is_login == 1)
+    }
+
+    /// 校验当前会话是否处于有效登录态。
+    pub fn validate_current_session(&self) -> Result<bool, ApiError> {
+        let Some(token) = self.current_token() else {
+            return Ok(false);
+        };
+        self.validate_token(&token)
+    }
+
     /// 上传成绩（`payload` 为业务字段，公共字段与 token 自动合并）。
     pub fn upload_result(&self, token: &str, payload: &Value) -> Result<RankResult, ApiError> {
         let body = upload_payload(token, payload);
@@ -1154,6 +1171,46 @@ mod tests {
         assert!(!text.content.is_empty(), "极速杯内容不应为空");
         assert_eq!(text.title, "市井人间烟火的生活本真");
     }
+
+    #[test]
+    #[ignore = "requires live 52dazi network access"]
+    fn real_gateway_upload_test() {
+        let client = ApiClient::new();
+        println!("Current token: {:?}", client.current_token());
+        let text = client.get_content(CompetitionType::Jisu).expect("get_content failed");
+        let stats = Stats {
+            wpm: 60.0,
+            typed_chars: text.content.chars().count(),
+            correct_chars: text.content.chars().count(),
+            wrong_chars: 0,
+            edits: 0,
+            wrong_total: 0,
+            key_frequency: vec![("a".into(), 100)],
+            edit_details: Vec::new(),
+        };
+        let upload_stats = crate::online::share::to_upload_stats(&stats, Duration::from_secs(60));
+        let payload = crate::online::share::build_upload_payload(&Text {
+            title: text.title.clone(),
+            content: text.content.clone(),
+            source: crate::TextSource::Online { competition_type: CompetitionType::Jisu },
+            word_boundaries: None,
+            shuffled: false,
+        }, &stats, &upload_stats, Duration::from_secs(60));
+        println!("Generated payload: {}", serde_json::to_string_pretty(&payload).unwrap());
+
+        if let Some(token) = client.current_token() {
+            let base_info_body = encrypt_value(&Value::Object(base_fields(Some(&token))));
+            let base_info_resp = client.post("Api/System/getBaseInfo", &base_info_body);
+            println!("getBaseInfo with token response: {base_info_resp:?}");
+            let res = client.upload_result(&token, &payload);
+            println!("Upload result with current token: {res:?}");
+        }
+
+        let bogus_res = client.upload_result("bogus_123", &payload);
+        println!("Upload result with bogus token: {bogus_res:?}");
+    }
 }
+
+
 
 
