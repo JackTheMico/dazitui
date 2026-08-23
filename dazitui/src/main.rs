@@ -450,31 +450,8 @@ impl App {
         };
     }
 
-
-    /// 用环境变量凭据重新登录并重试上传一次；重登失败时保留失败状态并附原始错误。
-    fn retry_after_relogin(
-        &mut self,
-        credentials: (String, String),
-        stats: &Stats,
-        elapsed: Duration,
-    ) -> UploadState {
-        let (user, pass) = credentials;
-        match self.api.login(&user, &pass) {
-            Ok(r) => {
-                let _ = self.token_store.save(&r.token);
-                self.token = Some(r.token);
-                self.logged_in = true;
-                self.perform_upload(stats, elapsed)
-            }
-            Err(e) => UploadState::Failed {
-                message: "自动重登失败，请手动重新登录".to_string(),
-                need_relogin: true,
-                detail: Some(api_error_text(&e)),
-            },
-        }
-    }
-
     /// 执行上传：调用 API 客户端一站式上传成绩（包含指标计算、payload 构建、网关通信、自动重登与分享文本生成）。
+
     fn perform_upload(&self, stats: &Stats, elapsed: Duration) -> UploadState {
         if !self.logged_in && !self.api.is_logged_in() {
             return UploadState::Failed {
@@ -3156,65 +3133,8 @@ mod tests {
     }
 
     #[test]
-    fn retry_after_relogin_relogins_and_uploads() {
-        // 自动重登成功：token 更新为新值，并重试上传成功。
-        let (port, handle) = mock_server(&[
-            (
-                "/Api/User/login",
-                r#"{"error":0,"msg":{"token":"new-tok"}}"#,
-            ),
-            (
-                "/Api/Rank/uploadResult",
-                r#"{"error":0,"msg":{"ranking":5,"rankTips":"恭喜获得第5名"}}"#,
-            ),
-        ]);
-        let mut app = test_app(online_text("你好世界"));
-        app.token = Some("old-tok".into());
-        app.api = ApiClient::with_base_url(&format!("http://127.0.0.1:{port}"));
-        let stats = app.session.finish(Duration::from_secs(40));
-        let up = app.retry_after_relogin(
-            ("user".into(), "pass".into()),
-            &stats,
-            Duration::from_secs(40),
-        );
-        handle.join().unwrap();
-        assert_eq!(app.token.as_deref(), Some("new-tok"));
-        assert!(matches!(
-            &up,
-            UploadState::Success { ranking, .. } if ranking.as_deref() == Some("5")
-        ));
-    }
-
-    #[test]
-    fn retry_after_relogin_failed_login_keeps_failure() {
-        // 自动重登失败：保留失败状态、附重登原始错误，token 不变。
-        let (port, handle) = mock_server(&[(
-            "/Api/User/login",
-            r#"{"error":1,"msg":"您的用户名或密码错误！"}"#,
-        )]);
-        let mut app = test_app(online_text("你好世界"));
-        app.token = Some("old-tok".into());
-        app.api = ApiClient::with_base_url(&format!("http://127.0.0.1:{port}"));
-        let stats = app.session.finish(Duration::from_secs(10));
-        let up = app.retry_after_relogin(
-            ("user".into(), "pass".into()),
-            &stats,
-            Duration::from_secs(10),
-        );
-        handle.join().unwrap();
-        assert_eq!(app.token.as_deref(), Some("old-tok"));
-        assert_eq!(
-            up,
-            UploadState::Failed {
-                message: "自动重登失败，请手动重新登录".to_string(),
-                need_relogin: true,
-                detail: Some("您的用户名或密码错误！".to_string()),
-            }
-        );
-    }
-
-    #[test]
     fn submit_login_retries_pending_upload_in_finished_state() {
+
         let (port, handle) = mock_server(&[
             (
                 "/Api/User/login",
