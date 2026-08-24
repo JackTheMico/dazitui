@@ -2688,7 +2688,7 @@ fn render_result_view(
         ),
     ];
 
-    let mut datasets = vec![
+    let datasets = vec![
         Dataset::default()
             .name("WPM 速度")
             .marker(Marker::Braille)
@@ -2696,16 +2696,6 @@ fn render_result_view(
             .style(Style::default().fg(palette.accent).bg(palette.bg))
             .data(speed_data),
     ];
-    if !error_data.is_empty() {
-        datasets.push(
-            Dataset::default()
-                .name("打错点")
-                .marker(Marker::Dot)
-                .graph_type(GraphType::Scatter)
-                .style(Style::default().fg(palette.error).bg(palette.bg))
-                .data(&error_data),
-        );
-    }
 
     let max_y_label_width = y_labels
         .iter()
@@ -5258,6 +5248,35 @@ mod tests {
         assert!(clean_chart.contains("人"), "图表区应包含错字'人'");
         assert!(clean_chart.contains("民"), "图表区应包含错字'民'");
         assert!(clean_chart.contains("•"), "图表区应包含打错点标记");
+    }
+
+    #[test]
+    fn render_result_view_error_dot_count_matches_actual_error_count() {
+        let mut app = test_app(file_text("一二三四五六"));
+        app.session.type_text_at("一二", Duration::from_secs(1));
+        app.session.type_text_at("错", Duration::from_secs(2));
+        app.session.type_text_at("误", Duration::from_secs(3));
+        app.session.type_text_at("五六", Duration::from_secs(4));
+        app.finish_typing();
+
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| ui(f, &app)).unwrap();
+        let buffer = terminal.backend().buffer();
+
+        let mut dot_count = 0;
+        for y in 4..23 {
+            for x in 0..buffer.area.width {
+                if buffer[(x, y)].symbol() == "•" {
+                    dot_count += 1;
+                }
+            }
+        }
+        assert_eq!(
+            dot_count, 2,
+            "打错 2 个字，图表区应恰好渲染 2 个打错红点，实际渲染了 {}",
+            dot_count
+        );
     }
 
     #[test]
