@@ -629,7 +629,8 @@ mod tests {
             }
             // 最后一个词的结尾 = content_no_commas 的字符数
             assert_eq!(
-                boundaries.last().unwrap().1, char_count,
+                boundaries.last().unwrap().1,
+                char_count,
                 "{} 最后一个词的结尾应等于去逗号后的字符数",
                 set.name()
             );
@@ -697,7 +698,8 @@ mod tests {
             let mut shuf_sorted = shuffled.clone();
             shuf_sorted.sort_unstable();
             assert_eq!(
-                orig_sorted, shuf_sorted,
+                orig_sorted,
+                shuf_sorted,
                 "{} 乱序后字符多重集不一致",
                 set.name()
             );
@@ -740,7 +742,8 @@ mod tests {
             let mut shuf_sorted = shuffled_words.clone();
             shuf_sorted.sort_unstable();
             assert_eq!(
-                orig_sorted, shuf_sorted,
+                orig_sorted,
+                shuf_sorted,
                 "{} 乱序后词组多重集不一致",
                 set.name()
             );
@@ -778,7 +781,8 @@ mod tests {
                 prev_end = end;
             }
             assert_eq!(
-                prev_end, total_chars,
+                prev_end,
+                total_chars,
                 "{} 乱序边界未覆盖全部 content",
                 set.name()
             );
@@ -792,7 +796,8 @@ mod tests {
             let ordered = load_builtin_text(set);
             let shuffled = load_builtin_text_shuffled(set);
             assert_ne!(
-                ordered.content, shuffled.content,
+                ordered.content,
+                shuffled.content,
                 "{} 乱序后内容与顺序版完全相同（极低概率，可能乱序未生效）",
                 set.name()
             );

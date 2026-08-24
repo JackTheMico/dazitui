@@ -41,15 +41,26 @@ pub fn to_upload_stats(stats: &Stats, elapsed: Duration) -> UploadStats {
 /// 分享文本：`极速杯 第5名 · WPM 85.2 · 击键 3.5 · 码长 2.8`。
 ///
 /// `rank` 为 `None` 时省略排名（如离线赛文）。
-pub fn format_share_text(source: &TextSource, rank: Option<u32>, stats: &UploadStats) -> String {
+/// `input_method` 非空时在末尾追加 ` · <输入法>`。
+pub fn format_share_text(
+    source: &TextSource,
+    rank: Option<u32>,
+    stats: &UploadStats,
+    input_method: &str,
+) -> String {
     let name = match source {
         TextSource::File => "本地",
         TextSource::Builtin { set } => set.name(),
         TextSource::Online { competition_type } => competition_type.name(),
     };
     let rank_part = rank.map(|r| format!(" 第{r}名")).unwrap_or_default();
+    let im_part = if input_method.is_empty() {
+        String::new()
+    } else {
+        format!(" · {input_method}")
+    };
     format!(
-        "{name}{rank_part} · WPM {:.1} · 击键 {:.1} · 码长 {:.1}",
+        "{name}{rank_part} · WPM {:.1} · 击键 {:.1} · 码长 {:.1}{im_part}",
         stats.speed, stats.keystrokes, stats.key_length
     )
 }
@@ -66,10 +77,11 @@ pub fn format_time(elapsed: Duration) -> String {
 ///
 /// 字段名与前端 `resultPostData`（app.js 中的 vuex getter）逐项对齐：
 /// dazitui 不采集的字段用与前端一致的兜底值——`repeatNum`/`xuanChong`=0、
-/// `daCi`/`keyMethod`="0%"、`inputMethod`/`challengeFlag`/`isFirstSubmit`/`isGroupText`
+/// `daCi`/`keyMethod`="0%"、`challengeFlag`/`isFirstSubmit`/`isGroupText`
 /// 沿用前端默认 0 / 空串。可采集字段：
 /// - `jianZhun`（击准率）= 正确字数 / 已上屏字数，百分比字符串（与前端 `e.accuracy+"%"` 同构）；
 /// - `wrongNum`/`jianShu`/`backspace`/`huiGai` 仍来自 `Stats`。
+/// - `inputMethod` 来自用户配置的输入法名称。
 ///
 /// 缺字段会让服务端字段对齐校验失败（错误信息可表现为 token/username 解析异常），
 /// 故即便本端无法采集某些指标，也按前端 schema 输出兜底值。
@@ -78,6 +90,7 @@ pub fn build_upload_payload(
     stats: &Stats,
     upload: &UploadStats,
     elapsed: Duration,
+    input_method: &str,
 ) -> Value {
     let total_keys: u32 = stats.key_frequency.iter().map(|(_, n)| n).sum();
     let backspace: u32 = stats
@@ -107,7 +120,7 @@ pub fn build_upload_payload(
         "repeatNum": 0,
         "daCi": "0%",
         "wrongNum": stats.wrong_total,
-        "inputMethod": "",
+        "inputMethod": input_method,
         "backspace": backspace,
         "xuanChong": 0,
         "keyMethod": "0%",
@@ -177,7 +190,7 @@ mod tests {
         let source = TextSource::Online {
             competition_type: CompetitionType::Jisu,
         };
-        let text = format_share_text(&source, Some(5), &up);
+        let text = format_share_text(&source, Some(5), &up, "");
         assert_eq!(text, "极速杯 第5名 · WPM 85.2 · 击键 3.5 · 码长 2.8");
     }
 
@@ -189,7 +202,7 @@ mod tests {
             key_length: 2.8,
         };
         let source = TextSource::File;
-        let text = format_share_text(&source, None, &up);
+        let text = format_share_text(&source, None, &up, "");
         assert_eq!(text, "本地 · WPM 85.2 · 击键 3.5 · 码长 2.8");
     }
 
@@ -224,7 +237,7 @@ mod tests {
             word_boundaries: None,
             shuffled: false,
         };
-        let v = build_upload_payload(&text, &stats, &up, Duration::from_secs_f64(85.23));
+        let v = build_upload_payload(&text, &stats, &up, Duration::from_secs_f64(85.23), "");
         assert_eq!(v["textTitle"], "市井人间烟火的生活本真");
         assert_eq!(v["speed"], 85.2);
         assert_eq!(v["keystrokes"], 3.5);
@@ -239,7 +252,6 @@ mod tests {
         assert_eq!(v["challengeFlag"], 0);
         assert_eq!(v["isFirstSubmit"], 1);
     }
-
 
     #[test]
     fn build_upload_payload_includes_frontend_schema_fields() {
@@ -260,7 +272,7 @@ mod tests {
             word_boundaries: None,
             shuffled: false,
         };
-        let v = build_upload_payload(&text, &stats, &up, Duration::from_secs(60));
+        let v = build_upload_payload(&text, &stats, &up, Duration::from_secs(60), "");
         // 五个之前缺失的新字段：jianZhun / repeatNum / daCi / xuanChong / keyMethod
         assert!(v.get("jianZhun").is_some(), "缺 jianZhun: {v}");
         assert!(v.get("repeatNum").is_some(), "缺 repeatNum: {v}");
@@ -300,7 +312,7 @@ mod tests {
             word_boundaries: None,
             shuffled: false,
         };
-        let v = build_upload_payload(&text, &stats, &up, Duration::from_secs(1));
+        let v = build_upload_payload(&text, &stats, &up, Duration::from_secs(1), "");
         assert_eq!(v["jianZhun"], "0.00%");
     }
 
@@ -320,7 +332,7 @@ mod tests {
             word_boundaries: None,
             shuffled: false,
         };
-        let v = build_upload_payload(&text, &stats, &up, Duration::from_secs(1));
+        let v = build_upload_payload(&text, &stats, &up, Duration::from_secs(1), "");
         assert_eq!(v["backspace"], 7);
         assert_eq!(v["jianShu"], 147); // 140 + 7
     }
@@ -332,5 +344,69 @@ mod tests {
         assert_eq!(seq, "\x1b]52;c;5L2g5aW9\x07");
         // 空文本也是合法序列
         assert_eq!(osc52_clipboard(""), "\x1b]52;c;\x07");
+    }
+
+    #[test]
+    fn share_text_appends_input_method_when_configured() {
+        let up = UploadStats {
+            speed: 85.2,
+            keystrokes: 3.5,
+            key_length: 2.8,
+        };
+        let source = TextSource::Online {
+            competition_type: CompetitionType::Jisu,
+        };
+        let text = format_share_text(&source, Some(5), &up, "虎码");
+        assert_eq!(text, "极速杯 第5名 · WPM 85.2 · 击键 3.5 · 码长 2.8 · 虎码");
+    }
+
+    #[test]
+    fn share_text_no_suffix_when_no_input_method() {
+        let up = UploadStats {
+            speed: 85.2,
+            keystrokes: 3.5,
+            key_length: 2.8,
+        };
+        let source = TextSource::File;
+        let text = format_share_text(&source, None, &up, "");
+        assert_eq!(text, "本地 · WPM 85.2 · 击键 3.5 · 码长 2.8");
+    }
+
+    #[test]
+    fn build_upload_payload_carries_input_method() {
+        let stats = sample_stats();
+        let up = UploadStats {
+            speed: 85.2,
+            keystrokes: 3.5,
+            key_length: 2.8,
+        };
+        let text = Text {
+            title: "t".into(),
+            content: "你好".into(),
+            source: TextSource::File,
+            word_boundaries: None,
+            shuffled: false,
+        };
+        let v = build_upload_payload(&text, &stats, &up, Duration::from_secs(10), "虎码");
+        assert_eq!(v["inputMethod"], "虎码");
+    }
+
+    #[test]
+    fn build_upload_payload_empty_input_method_when_not_set() {
+        let stats = sample_stats();
+        let up = UploadStats {
+            speed: 0.0,
+            keystrokes: 0.0,
+            key_length: 0.0,
+        };
+        let text = Text {
+            title: "t".into(),
+            content: "c".into(),
+            source: TextSource::File,
+            word_boundaries: None,
+            shuffled: false,
+        };
+        let v = build_upload_payload(&text, &stats, &up, Duration::from_secs(1), "");
+        assert_eq!(v["inputMethod"], "");
     }
 }

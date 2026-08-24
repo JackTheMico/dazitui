@@ -137,7 +137,7 @@ impl Theme {
 }
 
 /// 应用外观设置。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
     /// 主题预设。
     pub theme: ThemePreset,
@@ -147,6 +147,9 @@ pub struct Settings {
     pub bold: bool,
     /// 字体设置开关（尽力而为的 OSC 尝试）。
     pub font: bool,
+    /// 输入法名称（上传与分享携带）；空串表示不配置（显示「无」）。
+    /// 最多 20 字符（遵守 52dazi 协议限制）。
+    pub input_method: String,
 }
 
 impl Settings {
@@ -154,10 +157,18 @@ impl Settings {
     pub const RATIO_MIN: u8 = 30;
     /// 对照区占比的合法上限（%）。
     pub const RATIO_MAX: u8 = 80;
+    /// 输入法名称的最大长度（字符数，遵守 52dazi 协议限制）。
+    pub const INPUT_METHOD_MAX_CHARS: usize = 20;
 
     /// 校验并修正占比到合法范围。
     pub fn clamp_ratio(ratio: u8) -> u8 {
         ratio.clamp(Self::RATIO_MIN, Self::RATIO_MAX)
+    }
+
+    /// 截断输入法名称到最多 20 字符；空白字符串视为空串。
+    pub fn clamp_input_method(s: &str) -> String {
+        let trimmed = s.trim();
+        trimmed.chars().take(Self::INPUT_METHOD_MAX_CHARS).collect()
     }
 }
 
@@ -168,6 +179,7 @@ impl Default for Settings {
             reference_ratio: 62,
             bold: false,
             font: false,
+            input_method: String::new(),
         }
     }
 }
@@ -215,11 +227,12 @@ impl SettingsStore {
             std::fs::create_dir_all(parent)?;
         }
         let content = format!(
-            "theme={}\nreference_ratio={}\nbold={}\nfont={}\n",
+            "theme={}\nreference_ratio={}\nbold={}\nfont={}\ninput_method={}\n",
             settings.theme.as_str(),
             settings.reference_ratio,
             settings.bold,
             settings.font,
+            settings.input_method,
         );
         std::fs::write(&self.path, content)
     }
@@ -252,6 +265,9 @@ impl SettingsStore {
                 }
                 "bold" => settings.bold = value == "true",
                 "font" => settings.font = value == "true",
+                "input_method" => {
+                    settings.input_method = Settings::clamp_input_method(value);
+                }
                 _ => {}
             }
         }
@@ -342,6 +358,7 @@ mod tests {
         assert_eq!(s.reference_ratio, 62);
         assert!(!s.bold);
         assert!(!s.font);
+        assert_eq!(s.input_method, "");
     }
 
     #[test]
@@ -354,6 +371,23 @@ mod tests {
     }
 
     #[test]
+    fn clamp_input_method_truncates_to_20_chars() {
+        // 21 个汉字 → 截断到 20
+        let long = "虎码虎码虎码虎码虎码虎码虎码虎码虎码虎码虎";
+        let result = Settings::clamp_input_method(long);
+        assert_eq!(result.chars().count(), 20);
+        // 20 个字符原样保留
+        let exact = "虎码虎码虎码虎码虎码虎码虎码虎码虎码虎码";
+        assert_eq!(Settings::clamp_input_method(exact), exact);
+    }
+
+    #[test]
+    fn clamp_input_method_trims_whitespace_only_to_empty() {
+        assert_eq!(Settings::clamp_input_method("   "), "");
+        assert_eq!(Settings::clamp_input_method(""), "");
+    }
+
+    #[test]
     fn store_roundtrip() {
         let store = SettingsStore::new(temp_path("roundtrip"));
         let s = Settings {
@@ -361,6 +395,7 @@ mod tests {
             reference_ratio: 70,
             bold: true,
             font: false,
+            input_method: "虎码".to_string(),
         };
         store.save(&s).unwrap();
         assert_eq!(store.load(), s);
@@ -387,6 +422,7 @@ mod tests {
         assert_eq!(s.reference_ratio, 62);
         assert!(!s.bold);
         assert!(s.font);
+        assert_eq!(s.input_method, ""); // 缺省时为空串
         let _ = std::fs::remove_file(store.path());
     }
 
@@ -407,6 +443,37 @@ mod tests {
         store.save(&Settings::default()).unwrap();
         assert_eq!(store.load(), Settings::default());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn store_input_method_missing_key_defaults_to_empty() {
+        // 旧 settings 文件不含 input_method 行，读取后应为空串
+        let store = SettingsStore::new(temp_path("old_format"));
+        std::fs::write(store.path(), "theme=default\nbold=false\nfont=false\n").unwrap();
+        assert_eq!(store.load().input_method, "");
+        let _ = std::fs::remove_file(store.path());
+    }
+
+    #[test]
+    fn store_input_method_too_long_is_truncated() {
+        let store = SettingsStore::new(temp_path("too_long"));
+        // 21 字符的值存入文件
+        let long = "虎码虎码虎码虎码虎码虎码虎码虎码虎码虎码虎";
+        std::fs::write(store.path(), format!("input_method={long}\n")).unwrap();
+        let loaded = store.load();
+        assert_eq!(loaded.input_method.chars().count(), 20);
+        let _ = std::fs::remove_file(store.path());
+    }
+
+    #[test]
+    fn store_input_method_roundtrip_chinese() {
+        let store = SettingsStore::new(temp_path("im_roundtrip"));
+        let mut s = Settings::default();
+        s.input_method = "空明码并击".to_string();
+        store.save(&s).unwrap();
+        let loaded = store.load();
+        assert_eq!(loaded.input_method, "空明码并击");
+        let _ = std::fs::remove_file(store.path());
     }
 
     #[test]

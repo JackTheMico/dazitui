@@ -133,8 +133,8 @@ impl Session {
         if self.group_gated {
             let (group_start, group_end) = self.current_group_bounds();
             if self.input.len() >= group_end && group_end > group_start {
-                let all_correct = (group_start..group_end)
-                    .all(|i| self.input.get(i) == Some(&self.original[i]));
+                let all_correct =
+                    (group_start..group_end).all(|i| self.input.get(i) == Some(&self.original[i]));
                 if all_correct {
                     self.completed_groups += 1;
                 }

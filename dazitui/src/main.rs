@@ -6,10 +6,9 @@ use std::time::{Duration, Instant};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use dazitui_core::{
     ApiClient, ApiError, AuthSession, BUILTIN_SETS, CharStatus, CompetitionType, FONT_SIZE_PT,
-    LoadError, LoadOptions, Rgb, Session, Settings, SettingsStore, Stats, Text, TextSource,
-    Theme, TokenStore, env_credentials, is_auth_failure, load_builtin_text, load_builtin_text_shuffled,
-    load_text_from_file, load_text_from_file_with_options,
-    osc_font_size_sequence, osc52_clipboard,
+    LoadError, LoadOptions, Rgb, Session, Settings, SettingsStore, Stats, Text, TextSource, Theme,
+    TokenStore, env_credentials, is_auth_failure, load_builtin_text, load_builtin_text_shuffled,
+    load_text_from_file, load_text_from_file_with_options, osc_font_size_sequence, osc52_clipboard,
 };
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -36,14 +35,68 @@ enum AppState {
     Settings,
 }
 
-
 /// 设置视图焦点项下标。
 const FOCUS_THEME: usize = 0;
 const FOCUS_RATIO: usize = 1;
 const FOCUS_BOLD: usize = 2;
 const FOCUS_FONT: usize = 3;
+const FOCUS_INPUT_METHOD: usize = 4;
 /// 设置视图焦点项总数。
-const SETTINGS_FOCUS_COUNT: usize = 4;
+const SETTINGS_FOCUS_COUNT: usize = 5;
+
+/// 输入法预设列表（顺序即轮转顺序）。
+/// 最后一项「自定义」表示用户自行输入任意名称。
+const INPUT_METHOD_PRESETS: &[&str] = &[
+    "", // 无（空串）
+    "虎码",
+    "五笔86",
+    "五笔98",
+    "小鹤音形",
+    "仓颉",
+    "郑码",
+    "宇浩",
+    "双拼",
+    "全拼",
+    "空明码并击",
+    "拼读并击",
+    "麓鸣并击",
+    "虎码并击",
+    "自定义", // 末项：打开自定义弹窗
+];
+
+/// 预设中「自定义」项的标签。
+const INPUT_METHOD_CUSTOM: &str = "自定义";
+
+/// 当前输入法在预设列表中是否精确匹配某个预设（排除自定义）。
+fn input_method_preset_index(im: &str) -> usize {
+    INPUT_METHOD_PRESETS
+        .iter()
+        .position(|&p| p == im && p != INPUT_METHOD_CUSTOM)
+        .unwrap_or(INPUT_METHOD_PRESETS.len() - 1) // 未命中 → 「自定义」下标
+}
+
+/// 输入法设置项的显示标签。
+fn input_method_display(im: &str) -> &str {
+    if im.is_empty() { "无" } else { im }
+}
+
+/// 向前轮转输入法预设（← 键），返回下一个预设值（不含「自定义」末项逻辑，由调用方处理弹窗）。
+fn cycle_input_method_prev(current: &str) -> String {
+    let idx = input_method_preset_index(current);
+    let prev = if idx == 0 {
+        INPUT_METHOD_PRESETS.len() - 1
+    } else {
+        idx - 1
+    };
+    INPUT_METHOD_PRESETS[prev].to_string()
+}
+
+/// 向后轮转输入法预设（→ 键），返回下一个预设值。
+fn cycle_input_method_next(current: &str) -> String {
+    let idx = input_method_preset_index(current);
+    let next = (idx + 1) % INPUT_METHOD_PRESETS.len();
+    INPUT_METHOD_PRESETS[next].to_string()
+}
 
 /// 成绩视图里的成绩上传状态（在线赛文完成跟打后自动上传）。
 #[derive(Debug, Clone, PartialEq)]
@@ -105,7 +158,7 @@ struct App {
     settings: Settings,
     /// 设置持久化存储。
     settings_store: SettingsStore,
-    /// 设置视图当前焦点项（FOCUS_THEME/FOCUS_RATIO/FOCUS_BOLD/FOCUS_FONT）。
+    /// 设置视图当前焦点项（FOCUS_THEME/FOCUS_RATIO/FOCUS_BOLD/FOCUS_FONT/FOCUS_INPUT_METHOD）。
     settings_focus: usize,
     /// 内置赛文浏览中的乱序开关（`true` = 载入时打乱顺序）。
     builtin_shuffle: bool,
@@ -113,6 +166,8 @@ struct App {
     /// 乱序开时存乱序版预览（避免每帧重新随机导致闪烁），关时存顺序版预览。
     /// 在 `open_builtin_browser` 与 Up/Down/s 按键时重新生成。
     builtin_preview: Option<(String, String)>,
+    /// 自定义输入法名称弹窗（`None` = 未打开）。
+    input_method_modal: Option<InputMethodModal>,
 }
 
 /// 登录模态框输入状态。
@@ -134,6 +189,53 @@ enum LoginAction {
     None,
     Submit,
     Cancel,
+}
+
+/// 自定义输入法模态框按键动作。
+#[derive(Debug, PartialEq, Eq)]
+enum InputMethodModalAction {
+    None,
+    Save(String),
+    Cancel,
+}
+
+/// 自定义输入法名称弹窗状态。
+#[derive(Debug, Default)]
+struct InputMethodModal {
+    /// 当前正在编辑的文本。
+    input: String,
+}
+
+impl InputMethodModal {
+    /// 新建弹窗，预填当前自定义值（若为「无」或预设，则置空）。
+    fn new(current: &str) -> Self {
+        // 预设值（包括空串）在弹窗中置空，让用户从头输入；真正的自定义值预填
+        let prefill = if INPUT_METHOD_PRESETS.contains(&current) {
+            String::new()
+        } else {
+            current.to_string()
+        };
+        Self { input: prefill }
+    }
+
+    /// 追加字符（自动截断到 20 字符）。
+    fn push_char(&mut self, c: char) {
+        if self.input.chars().count() < Settings::INPUT_METHOD_MAX_CHARS {
+            self.input.push(c);
+        }
+    }
+
+    /// 删除末字符（Backspace）。
+    fn pop_char(&mut self) {
+        let mut chars = self.input.chars();
+        chars.next_back();
+        self.input = chars.as_str().to_string();
+    }
+
+    /// 保存：返回最终值（空串或截断后的值）。
+    fn commit(&self) -> String {
+        Settings::clamp_input_method(&self.input)
+    }
 }
 
 impl App {
@@ -159,15 +261,16 @@ impl App {
         };
         let settings = settings_store.load();
         // 自动登录与会话恢复：若未登录且有环境变量则尝试自动登录。
-        let login_notice =
-            if !api.is_logged_in() && let Some((user, pass)) = env_credentials(|k| std::env::var(k).ok()) {
-                match api.login(&user, &pass) {
-                    Ok(_) => Some("已通过环境变量登录".to_string()),
-                    Err(e) => Some(format!("自动登录失败: {}", api_error_text(&e))),
-                }
-            } else {
-                None
-            };
+        let login_notice = if !api.is_logged_in()
+            && let Some((user, pass)) = env_credentials(|k| std::env::var(k).ok())
+        {
+            match api.login(&user, &pass) {
+                Ok(_) => Some("已通过环境变量登录".to_string()),
+                Err(e) => Some(format!("自动登录失败: {}", api_error_text(&e))),
+            }
+        } else {
+            None
+        };
         let logged_in = api.is_logged_in();
         let token = api.current_token();
         Self {
@@ -194,6 +297,7 @@ impl App {
             settings_focus: FOCUS_THEME,
             builtin_shuffle: false,
             builtin_preview: None,
+            input_method_modal: None,
         }
     }
 
@@ -315,7 +419,6 @@ impl App {
         }
     }
 
-
     /// 进入载文浏览：扫描当前目录文本文件。
     fn open_browser(&mut self) {
         self.browse_files = list_text_files(&std::env::current_dir().unwrap_or_default());
@@ -371,11 +474,12 @@ impl App {
                 let no_commas = set.content_no_commas();
                 let boundaries = set.word_boundaries();
                 let chars: Vec<char> = no_commas.chars().collect();
-                (set.name().to_string(), builtin_word_preview(&boundaries, &chars))
+                (
+                    set.name().to_string(),
+                    builtin_word_preview(&boundaries, &chars),
+                )
             }
-            Some(&set) => {
-                (set.name().to_string(), builtin_char_preview(set.content()))
-            }
+            Some(&set) => (set.name().to_string(), builtin_char_preview(set.content())),
             None => ("预览".to_string(), "（无内置赛文）".to_string()),
         });
     }
@@ -424,10 +528,8 @@ impl App {
                     word_boundaries: None,
                     shuffled: false,
                 };
-                self.session = Session::new_gated(
-                    &self.text.content,
-                    self.text.source.is_builtin(),
-                );
+                self.session =
+                    Session::new_gated(&self.text.content, self.text.source.is_builtin());
                 self.start = Instant::now();
                 self.state = AppState::Typing;
                 self.online_loading = None;
@@ -465,7 +567,10 @@ impl App {
                 self.api.set_session(Some(AuthSession::from_token(token)));
             }
         }
-        match self.api.upload_session(&self.text, stats, elapsed) {
+        match self
+            .api
+            .upload_session(&self.text, stats, elapsed, &self.settings.input_method)
+        {
             Ok(outcome) => {
                 write_clipboard(&outcome.share_text);
                 UploadState::Success {
@@ -494,11 +599,9 @@ impl App {
                     detail,
                 }
             }
-
         }
     }
 }
-
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -567,6 +670,22 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                     }
                     continue;
                 }
+                // 自定义输入法弹窗打开时优先处理其按键。
+                if let Some(modal) = app.input_method_modal.as_mut() {
+                    let action = input_method_modal_input(modal, key);
+                    match action {
+                        InputMethodModalAction::Cancel => {
+                            app.input_method_modal = None;
+                        }
+                        InputMethodModalAction::Save(value) => {
+                            app.input_method_modal = None;
+                            app.settings.input_method = value;
+                            let _ = app.settings_store.save(&app.settings);
+                        }
+                        InputMethodModalAction::None => {}
+                    }
+                    continue;
+                }
                 if is_toggle_sidebar(key) {
                     app.sidebar_visible = !app.sidebar_visible;
                     continue;
@@ -611,10 +730,10 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                             }
                             continue;
                         }
-                    handle_key(&mut app.session, key);
-                    if app.session.is_complete() {
-                        finish_and_maybe_upload(&mut app, terminal)?;
-                    }
+                        handle_key(&mut app.session, key);
+                        if app.session.is_complete() {
+                            finish_and_maybe_upload(&mut app, terminal)?;
+                        }
                     }
                     AppState::Finished { .. } => {
                         // 离线赛文：任意键重打同一篇；在线赛文不支持重打。
@@ -681,7 +800,27 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                                         emit_font_osc();
                                     }
                                 }
+                                FOCUS_INPUT_METHOD => {
+                                    let next = if forward {
+                                        cycle_input_method_next(&app.settings.input_method)
+                                    } else {
+                                        cycle_input_method_prev(&app.settings.input_method)
+                                    };
+                                    // 「自定义」预设的弹窗由 Enter 键触发，此处只轮转选中
+                                    app.settings.input_method = next;
+                                    let _ = app.settings_store.save(&app.settings);
+                                }
                                 _ => {}
+                            }
+                        }
+                        KeyCode::Enter => {
+                            // 输入法行且当前为「自定义」或已有自定义名称时打开弹窗
+                            if app.settings_focus == FOCUS_INPUT_METHOD
+                                && input_method_preset_index(&app.settings.input_method)
+                                    == INPUT_METHOD_PRESETS.len() - 1
+                            {
+                                app.input_method_modal =
+                                    Some(InputMethodModal::new(&app.settings.input_method));
                             }
                         }
                         KeyCode::Esc => app.state = AppState::Typing,
@@ -904,6 +1043,22 @@ fn login_input(form: &mut LoginForm, key: KeyEvent) -> LoginAction {
     }
 }
 
+/// 处理自定义输入法模态框按键，返回动作。
+fn input_method_modal_input(modal: &mut InputMethodModal, key: KeyEvent) -> InputMethodModalAction {
+    match key.code {
+        KeyCode::Esc => InputMethodModalAction::Cancel,
+        KeyCode::Enter => InputMethodModalAction::Save(modal.commit()),
+        KeyCode::Backspace => {
+            modal.pop_char();
+            InputMethodModalAction::None
+        }
+        KeyCode::Char(c) => {
+            modal.push_char(c);
+            InputMethodModalAction::None
+        }
+        _ => InputMethodModalAction::None,
+    }
+}
 
 /// 密码遮蔽：每个字符显示为 `*`。
 fn mask_password(password: &str) -> String {
@@ -1006,6 +1161,9 @@ fn ui(frame: &mut Frame, app: &App) {
     if let Some(form) = &app.login_form {
         render_login_modal(frame, form, app.theme());
     }
+    if let Some(modal) = &app.input_method_modal {
+        render_input_method_modal(frame, modal, app.theme());
+    }
 }
 
 /// 登录模态框：居中弹层，用户名 + 遮蔽密码。
@@ -1039,6 +1197,27 @@ fn render_login_modal(frame: &mut Frame, form: &LoginForm, theme: Theme) {
     frame.render_widget(
         Paragraph::new(lines)
             .block(themed_block(theme).title(" 登录 "))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+/// 自定义输入法名称弹窗：居中弹层，单行文本输入。
+fn render_input_method_modal(frame: &mut Frame, modal: &InputMethodModal, theme: Theme) {
+    let area = centered_rect(frame.area(), 50, 7);
+    frame.render_widget(Clear, area);
+    let remaining = Settings::INPUT_METHOD_MAX_CHARS - modal.input.chars().count();
+    let lines = vec![
+        Line::from(" 自定义输入法 ").bold(),
+        Line::from(""),
+        Line::from(format!(" ▸ {}", modal.input)),
+        Line::from(""),
+        Line::from(format!(" 还可输入 {remaining} 字").fg(color(theme.muted))),
+        Line::from(" Enter 保存 | Esc 取消").fg(color(theme.muted)),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(themed_block(theme).title(" 自定义输入法 "))
             .wrap(Wrap { trim: false }),
         area,
     );
@@ -1191,10 +1370,7 @@ fn render_preview(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 }
 
 /// 词组赛文预览：取前 `BUILTIN_ITEMS_PER_PAGE` 个词，词间加空格。
-fn builtin_word_preview(
-    boundaries: &[(usize, usize)],
-    chars: &[char],
-) -> String {
+fn builtin_word_preview(boundaries: &[(usize, usize)], chars: &[char]) -> String {
     let preview_words = boundaries.len().min(BUILTIN_ITEMS_PER_PAGE);
     let mut preview = String::new();
     for (i, &(ws, we)) in boundaries.iter().take(preview_words).enumerate() {
@@ -1214,7 +1390,11 @@ fn builtin_word_preview(
 /// 单字赛文预览：取前 400 字，超长则加省略号。
 fn builtin_char_preview(content: &str) -> String {
     let chars: Vec<char> = content.chars().take(400).collect();
-    let dot = if content.chars().count() > 400 { "…" } else { "" };
+    let dot = if content.chars().count() > 400 {
+        "…"
+    } else {
+        ""
+    };
     format!("{}{dot}", chars.iter().collect::<String>())
 }
 
@@ -1234,15 +1414,22 @@ fn render_builtin_preview(frame: &mut Frame, app: &App, area: ratatui::layout::R
     if is_words {
         lines.push(Line::from(body));
     } else {
-        for chunk in body.chars().collect::<Vec<char>>().chunks(BUILTIN_ITEMS_PER_PAGE) {
+        for chunk in body
+            .chars()
+            .collect::<Vec<char>>()
+            .chunks(BUILTIN_ITEMS_PER_PAGE)
+        {
             lines.push(Line::from(chunk.iter().collect::<String>()));
         }
     }
     lines.push(Line::from(""));
-    let shuffle_label = if app.builtin_shuffle { "[x] 乱序" } else { "[ ] 乱序" };
+    let shuffle_label = if app.builtin_shuffle {
+        "[x] 乱序"
+    } else {
+        "[ ] 乱序"
+    };
     lines.push(
-        Line::from(format!(" Enter 载入 | s {shuffle_label} | Esc 取消 "))
-            .fg(color(theme.muted)),
+        Line::from(format!(" Enter 载入 | s {shuffle_label} | Esc 取消 ")).fg(color(theme.muted)),
     );
     frame.render_widget(
         Paragraph::new(lines)
@@ -1282,6 +1469,12 @@ fn render_settings(frame: &mut Frame, app: &App) {
         focus == FOCUS_FONT,
         theme,
     ));
+    lines.push(settings_row(
+        "输入法",
+        input_method_display(&app.settings.input_method),
+        focus == FOCUS_INPUT_METHOD,
+        theme,
+    ));
 
     lines.push(Line::from(""));
     // 主题预览：用当前主题的对/错色渲染示意文字。
@@ -1295,7 +1488,7 @@ fn render_settings(frame: &mut Frame, app: &App) {
         Paragraph::new(lines)
             .block(themed_block(theme).title(" 设置 "))
             .wrap(Wrap { trim: false }),
-        centered_rect(frame.area(), 60, 14),
+        centered_rect(frame.area(), 60, 16),
     );
 }
 
@@ -1357,8 +1550,13 @@ fn render_result_view(frame: &mut Frame, app: &App, stats: &Stats, upload: &Uplo
     all.push(Line::from(""));
     if app.text.is_online() {
         // 在线赛文不支持重打。若登录失效，提示 Ctrl-O 登录重试。
-        if let UploadState::Failed { need_relogin: true, .. } = upload {
-            all.push(Line::from(" Ctrl-O 登录并上传 | q 退出 | Ctrl-F 载文").fg(color(theme.muted)));
+        if let UploadState::Failed {
+            need_relogin: true, ..
+        } = upload
+        {
+            all.push(
+                Line::from(" Ctrl-O 登录并上传 | q 退出 | Ctrl-F 载文").fg(color(theme.muted)),
+            );
         } else {
             all.push(Line::from(" q 退出 | Ctrl-F 载文").fg(color(theme.muted)));
         }
@@ -1411,13 +1609,14 @@ fn upload_lines(upload: &UploadState, theme: Theme) -> Vec<Line<'static>> {
                 lines.push(Line::from(format!(" 原始错误: {d}")).fg(color(theme.muted)));
             }
             if *need_relogin {
-                lines.push(Line::from(" 请按 Ctrl-O 重新登录（登录后自动重试上传）").fg(color(theme.warn)));
+                lines.push(
+                    Line::from(" 请按 Ctrl-O 重新登录（登录后自动重试上传）").fg(color(theme.warn)),
+                );
             }
             lines
         }
     }
 }
-
 
 /// 内置赛文每页显示的单位数（单字赛文每页 10 字，词组赛文每页 10 个词）。
 const BUILTIN_ITEMS_PER_PAGE: usize = dazitui_core::GROUP_SIZE;
@@ -1504,12 +1703,7 @@ fn build_word_type_spans(
 ///
 /// 内置赛文只显示当前页：单字赛文每页 10 字、词组赛文每页 10 个词（词间加空格、去逗号）；
 /// 打完当前页自动翻页；其余来源显示全文（由终端宽度自动折行）。
-fn original_line(
-    session: &Session,
-    text: &Text,
-    theme: Theme,
-    bold: bool,
-) -> TextLines<'static> {
+fn original_line(session: &Session, text: &Text, theme: Theme, bold: bool) -> TextLines<'static> {
     let source = text.source;
     if let TextSource::Builtin { set } = source {
         if set.is_words() {
@@ -1522,8 +1716,7 @@ fn original_line(
                 }
             };
             let page_start_word = builtin_page_start(session);
-            let page_end_word =
-                (page_start_word + BUILTIN_ITEMS_PER_PAGE).min(boundaries.len());
+            let page_end_word = (page_start_word + BUILTIN_ITEMS_PER_PAGE).min(boundaries.len());
             if page_start_word >= boundaries.len() {
                 return TextLines::default();
             }
@@ -1580,12 +1773,7 @@ fn original_line(
 ///
 /// 内置赛文只显示当前页：单字赛文每页 10 字、词组赛文每页 10 个词（词间加空格、去逗号）；
 /// 打完当前页自动翻页；其余来源显示全文（由终端宽度自动折行）。
-fn type_line(
-    session: &Session,
-    text: &Text,
-    theme: Theme,
-    bold: bool,
-) -> TextLines<'static> {
+fn type_line(session: &Session, text: &Text, theme: Theme, bold: bool) -> TextLines<'static> {
     let source = text.source;
     if let TextSource::Builtin { set } = source {
         if set.is_words() {
@@ -1604,8 +1792,7 @@ fn type_line(
                 );
             }
             let page_start_word = builtin_page_start(session);
-            let page_end_word =
-                (page_start_word + BUILTIN_ITEMS_PER_PAGE).min(boundaries.len());
+            let page_end_word = (page_start_word + BUILTIN_ITEMS_PER_PAGE).min(boundaries.len());
             if page_start_word >= boundaries.len() {
                 return TextLines::default();
             }
@@ -1964,7 +2151,10 @@ mod tests {
         app.refresh_builtin_preview();
         assert!(!app.builtin_shuffle, "再按 s 后乱序开关应为关");
         let (title, _) = app.builtin_preview.as_ref().unwrap();
-        assert!(!title.contains("乱序"), "乱序关时预览标题不应含「（乱序）」");
+        assert!(
+            !title.contains("乱序"),
+            "乱序关时预览标题不应含「（乱序）」"
+        );
     }
 
     #[test]
@@ -1987,11 +2177,11 @@ mod tests {
         let content_before = app.text.content.clone();
         app.restart();
         assert!(app.text.shuffled, "重打后仍应 shuffled=true");
-        assert!(app.text.title.contains("乱序"), "重打后标题仍含「（乱序）」");
-        assert_ne!(
-            app.text.content, content_before,
-            "重打应产生新的乱序排列"
+        assert!(
+            app.text.title.contains("乱序"),
+            "重打后标题仍含「（乱序）」"
         );
+        assert_ne!(app.text.content, content_before, "重打应产生新的乱序排列");
         assert_eq!(app.session.len(), 0, "重打后 session 应清空");
         assert!(matches!(app.state, AppState::Typing));
     }
@@ -2015,13 +2205,20 @@ mod tests {
             .filter(|s| s.content == " ")
             .count();
         assert_eq!(space_spans, first_page_words - 1, "乱序第 1 页词间空格数");
-        let word_chars: usize = boundaries.iter().take(first_page_words).map(|(s, e)| e - s).sum();
+        let word_chars: usize = boundaries
+            .iter()
+            .take(first_page_words)
+            .map(|(s, e)| e - s)
+            .sum();
         let non_space_spans = rendered.lines[0]
             .spans
             .iter()
             .filter(|s| s.content != " ")
             .count();
-        assert_eq!(non_space_spans, word_chars, "乱序第 1 页非空格 span 数应等于词字符数");
+        assert_eq!(
+            non_space_spans, word_chars,
+            "乱序第 1 页非空格 span 数应等于词字符数"
+        );
     }
 
     #[test]
@@ -2222,8 +2419,9 @@ mod tests {
 
     #[test]
     fn move_focus_wraps_around() {
-        assert_eq!(move_focus(0, -1), 3);
-        assert_eq!(move_focus(3, 1), 0);
+        // SETTINGS_FOCUS_COUNT = 5（主题/占比/粗体/字体/输入法）
+        assert_eq!(move_focus(0, -1), 4); // 第 0 项向前 → 末项（4）
+        assert_eq!(move_focus(4, 1), 0); // 末项向后 → 第 0 项
         assert_eq!(move_focus(0, 1), 1);
         assert_eq!(move_focus(2, -1), 1);
     }
@@ -2241,6 +2439,133 @@ mod tests {
         assert_eq!(area_ratios(62), (62, 38));
         assert_eq!(area_ratios(0), (30, 70)); // 越界截断
         assert_eq!(area_ratios(100), (80, 20)); // 越界截断
+    }
+
+    #[test]
+    fn input_method_display_empty_shows_wu() {
+        assert_eq!(input_method_display(""), "无");
+        assert_eq!(input_method_display("虎码"), "虎码");
+    }
+
+    #[test]
+    fn cycle_input_method_next_from_empty_is_first_preset() {
+        // 空串（「无」）向后轮转 → 「虎码」（第 1 项）
+        assert_eq!(cycle_input_method_next(""), "虎码");
+    }
+
+    #[test]
+    fn cycle_input_method_next_wraps_last_to_empty() {
+        // 末项「自定义」向后轮转 → 「无」（空串，即第 0 项）
+        let last = INPUT_METHOD_CUSTOM;
+        let result = cycle_input_method_next(last);
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn cycle_input_method_prev_from_empty_wraps_to_last() {
+        // 「无」向前轮转 → 末项「自定义」
+        let result = cycle_input_method_prev("");
+        assert_eq!(result, INPUT_METHOD_CUSTOM);
+    }
+
+    #[test]
+    fn cycle_input_method_prev_from_huma_is_empty() {
+        // 「虎码」向前轮转 → 「无」（空串）
+        assert_eq!(cycle_input_method_prev("虎码"), "");
+    }
+
+    #[test]
+    fn cycle_input_method_unknown_falls_to_custom_slot_then_wraps() {
+        // 自定义值（不在预设）→ 视为「自定义」末项下标，next → 第 0 项「无」
+        let result = cycle_input_method_next("我的专属输入法");
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn input_method_modal_new_prefills_custom_and_clears_preset() {
+        assert_eq!(InputMethodModal::new("").input, "");
+        assert_eq!(InputMethodModal::new("虎码").input, "");
+        assert_eq!(InputMethodModal::new("自定义").input, "");
+        assert_eq!(InputMethodModal::new("我的自定义码").input, "我的自定义码");
+    }
+
+    #[test]
+    fn input_method_modal_push_char_clamps_to_20_chars() {
+        let mut modal = InputMethodModal::default();
+        for _ in 0..25 {
+            modal.push_char('字');
+        }
+        assert_eq!(modal.input.chars().count(), 20);
+        assert_eq!(modal.input, "字".repeat(20));
+    }
+
+    #[test]
+    fn input_method_modal_pop_char_removes_last_unicode_char() {
+        let mut modal = InputMethodModal::new("虎码输入");
+        modal.pop_char();
+        assert_eq!(modal.input, "虎码输");
+        modal.pop_char();
+        assert_eq!(modal.input, "虎码");
+        modal.pop_char();
+        modal.pop_char();
+        modal.pop_char(); // popping empty doesn't panic
+        assert_eq!(modal.input, "");
+    }
+
+    #[test]
+    fn input_method_modal_commit_trims_and_returns_empty_for_blanks() {
+        let mut modal = InputMethodModal::default();
+        assert_eq!(modal.commit(), "");
+        modal.input = "   ".into();
+        assert_eq!(modal.commit(), "");
+        modal.input = "  小鹤双拼  ".into();
+        assert_eq!(modal.commit(), "小鹤双拼");
+    }
+
+    #[test]
+    fn input_method_modal_input_actions() {
+        let mut modal = InputMethodModal::default();
+        // 输入字符
+        assert_eq!(
+            input_method_modal_input(
+                &mut modal,
+                KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)
+            ),
+            InputMethodModalAction::None
+        );
+        assert_eq!(
+            input_method_modal_input(
+                &mut modal,
+                KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE)
+            ),
+            InputMethodModalAction::None
+        );
+        assert_eq!(modal.input, "ab");
+
+        // 退格
+        assert_eq!(
+            input_method_modal_input(
+                &mut modal,
+                KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)
+            ),
+            InputMethodModalAction::None
+        );
+        assert_eq!(modal.input, "a");
+
+        // 回车保存
+        assert_eq!(
+            input_method_modal_input(
+                &mut modal,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+            ),
+            InputMethodModalAction::Save("a".into())
+        );
+
+        // Esc 取消
+        assert_eq!(
+            input_method_modal_input(&mut modal, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            InputMethodModalAction::Cancel
+        );
     }
 
     #[test]
@@ -2432,7 +2757,11 @@ mod tests {
         session.type_text("甲乙丙");
         let rendered = type_line(&session, &text, theme, false);
         assert_eq!(rendered.lines.len(), 1, "第二组应只有一行");
-        assert_eq!(rendered.lines[0].spans.len(), 3, "打 13 字应翻页显示第 11-13 字");
+        assert_eq!(
+            rendered.lines[0].spans.len(),
+            3,
+            "打 13 字应翻页显示第 11-13 字"
+        );
     }
 
     #[test]
@@ -2445,8 +2774,16 @@ mod tests {
         // 打 10 字但第 10 字打错 → 组未全对 → 不翻页
         session.type_text("一二三四五六七八九X");
         let rendered = type_line(&session, &text, theme, false);
-        assert_eq!(rendered.lines[0].spans.len(), 10, "组内打错仍应显示当前组 10 字");
-        assert_eq!(session.completed_groups(), 0, "有错字不应推进 completed_groups");
+        assert_eq!(
+            rendered.lines[0].spans.len(),
+            10,
+            "组内打错仍应显示当前组 10 字"
+        );
+        assert_eq!(
+            session.completed_groups(),
+            0,
+            "有错字不应推进 completed_groups"
+        );
     }
 
     #[test]
@@ -2486,12 +2823,20 @@ mod tests {
         session.type_text("一二三四五");
         let rendered = original_line(&session, &text, theme, false);
         assert_eq!(rendered.lines.len(), 1, "第一组应只有一行");
-        assert_eq!(rendered.lines[0].spans.len(), 10, "对照区第一组应显示 10 字");
+        assert_eq!(
+            rendered.lines[0].spans.len(),
+            10,
+            "对照区第一组应显示 10 字"
+        );
         // 打到 10 字（全对）：第一组全对，翻到第二组，对照区显示第 11-20 字（10 字）。
         session.type_text("六七八九十");
         let rendered = original_line(&session, &text, theme, false);
         assert_eq!(rendered.lines.len(), 1, "第二组应只有一行");
-        assert_eq!(rendered.lines[0].spans.len(), 10, "对照区第二组应显示 10 字");
+        assert_eq!(
+            rendered.lines[0].spans.len(),
+            10,
+            "对照区第二组应显示 10 字"
+        );
     }
 
     #[test]
@@ -2500,7 +2845,12 @@ mod tests {
         let theme = Theme::preset(ThemePreset::Default);
         let mut session = Session::new("一二三四五六七八九十十一十");
         session.type_text("一二三四五六七八九十十一十");
-        let text = type_line(&session, &file_text("一二三四五六七八九十十一十"), theme, false);
+        let text = type_line(
+            &session,
+            &file_text("一二三四五六七八九十十一十"),
+            theme,
+            false,
+        );
         assert_eq!(text.lines.len(), 1);
         assert_eq!(text.lines[0].spans.len(), 13);
     }
@@ -2510,7 +2860,12 @@ mod tests {
         // 空输入时显示提示行（不分多行、无空 span）。
         let theme = Theme::preset(ThemePreset::Default);
         let session = Session::new_gated("一二三四五六七八九十", true);
-        let text = type_line(&session, &builtin_text("一二三四五六七八九十"), theme, false);
+        let text = type_line(
+            &session,
+            &builtin_text("一二三四五六七八九十"),
+            theme,
+            false,
+        );
         assert_eq!(text.lines.len(), 1, "空输入应只有一行提示");
     }
 
@@ -2570,20 +2925,32 @@ mod tests {
         assert_eq!(rendered.lines.len(), 1, "词组赛文应只有一行");
         // 第 1 页 10 个词，词间 9 个空格 span
         let first_page_words = boundaries.len().min(BUILTIN_ITEMS_PER_PAGE);
-        let word_chars: usize = boundaries.iter().take(first_page_words).map(|(s, e)| e - s).sum();
+        let word_chars: usize = boundaries
+            .iter()
+            .take(first_page_words)
+            .map(|(s, e)| e - s)
+            .sum();
         let space_spans = rendered.lines[0]
             .spans
             .iter()
             .filter(|s| s.content == " ")
             .count();
-        assert_eq!(space_spans, first_page_words - 1, "第 1 页应有 {} 个词间空格", first_page_words - 1);
+        assert_eq!(
+            space_spans,
+            first_page_words - 1,
+            "第 1 页应有 {} 个词间空格",
+            first_page_words - 1
+        );
         // 非空格 span 数 = 第 1 页所有词的字符数
         let non_space_spans = rendered.lines[0]
             .spans
             .iter()
             .filter(|s| s.content != " ")
             .count();
-        assert_eq!(non_space_spans, word_chars, "非空格 span 数应等于第 1 页词字符数");
+        assert_eq!(
+            non_space_spans, word_chars,
+            "非空格 span 数应等于第 1 页词字符数"
+        );
     }
 
     #[test]
@@ -2593,8 +2960,7 @@ mod tests {
         let set = BUILTIN_SETS[3]; // 常用词组前五百
         let no_commas = set.content_no_commas();
         let boundaries = set.word_boundaries();
-        let mut session =
-            Session::new_gated_with_words(no_commas.as_str(), true, &boundaries);
+        let mut session = Session::new_gated_with_words(no_commas.as_str(), true, &boundaries);
         let text = Text {
             title: set.name().into(),
             content: no_commas.clone(),
@@ -2620,7 +2986,10 @@ mod tests {
             .iter()
             .filter(|s| s.content.contains("跟打区"))
             .collect();
-        assert!(!placeholder_spans.is_empty(), "翻到第 2 组未打字时应显示提示行");
+        assert!(
+            !placeholder_spans.is_empty(),
+            "翻到第 2 组未打字时应显示提示行"
+        );
     }
 
     #[test]
@@ -2632,8 +3001,7 @@ mod tests {
         let set = BUILTIN_SETS[3]; // 常用词组前五百
         let no_commas = set.content_no_commas();
         let boundaries = set.word_boundaries();
-        let mut session =
-            Session::new_gated_with_words(no_commas.as_str(), true, &boundaries);
+        let mut session = Session::new_gated_with_words(no_commas.as_str(), true, &boundaries);
         let text = Text {
             title: set.name().into(),
             content: no_commas.clone(),
@@ -2672,8 +3040,7 @@ mod tests {
         let set = BUILTIN_SETS[3]; // 常用词组前五百
         let no_commas = set.content_no_commas();
         let boundaries = set.word_boundaries();
-        let mut session =
-            Session::new_gated_with_words(no_commas.as_str(), true, &boundaries);
+        let mut session = Session::new_gated_with_words(no_commas.as_str(), true, &boundaries);
         // 打满第 1 组 10 个词的全部字符（全对）
         let first_page_char_count: usize = boundaries
             .iter()
@@ -2700,7 +3067,12 @@ mod tests {
             .iter()
             .filter(|s| s.content == " ")
             .count();
-        assert_eq!(space_spans, second_page_words - 1, "第 2 页应有 {} 个词间空格", second_page_words - 1);
+        assert_eq!(
+            space_spans,
+            second_page_words - 1,
+            "第 2 页应有 {} 个词间空格",
+            second_page_words - 1
+        );
     }
 
     #[test]
@@ -2796,21 +3168,28 @@ mod tests {
         )]);
         let store = temp_token_store();
         store.save("stale-tok").unwrap();
-        let mut app = App::new_with(
+        let app = App::new_with(
             online_text("你好"),
             store.clone(),
-            ApiClient::with_base_url_and_store(&format!("http://127.0.0.1:{port}"), Some(store.clone())),
+            ApiClient::with_base_url_and_store(
+                &format!("http://127.0.0.1:{port}"),
+                Some(store.clone()),
+            ),
             temp_settings_store(),
         );
         let stats = app.session.finish(Duration::from_secs(10));
         let up = app.perform_upload(&stats, Duration::from_secs(10));
         handle.join().unwrap();
-        assert!(matches!(up, UploadState::Failed { need_relogin: true, .. }));
+        assert!(matches!(
+            up,
+            UploadState::Failed {
+                need_relogin: true,
+                ..
+            }
+        ));
         assert!(!app.api.is_logged_in(), "客户端会话应被清理");
         assert!(store.load().is_none(), "磁盘 token 应被清空");
     }
-
-
 
     #[test]
     fn mask_password_hides_every_char() {
@@ -3195,7 +3574,6 @@ mod tests {
 
     #[test]
     fn submit_login_retries_pending_upload_in_finished_state() {
-
         let (port, handle) = mock_server(&[
             (
                 "/Api/User/login",
@@ -3235,4 +3613,3 @@ mod tests {
         ));
     }
 }
-

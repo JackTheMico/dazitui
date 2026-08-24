@@ -222,7 +222,6 @@ fn upload_payload(token: &str, payload: &Value) -> String {
     encrypt_value(&Value::Object(m))
 }
 
-
 /// 52dazi 客户端（深模块：封装会话持久化、Cookie 回传、自动重登与上传全流程）。
 #[derive(Debug, Clone)]
 pub struct ApiClient {
@@ -281,16 +280,15 @@ impl ApiClient {
 
     /// 获取当前登录 token。
     pub fn current_token(&self) -> Option<String> {
-        self.session
-            .lock()
-            .ok()
-            .and_then(|s| s.as_ref().and_then(|x| {
+        self.session.lock().ok().and_then(|s| {
+            s.as_ref().and_then(|x| {
                 if x.token.is_empty() {
                     None
                 } else {
                     Some(x.token.clone())
                 }
-            }))
+            })
+        })
     }
 
     /// 获取当前完整会话（token + cookie）。
@@ -333,7 +331,10 @@ impl ApiClient {
     }
 
     /// 按比赛类型载入赛文（自动使用当前登录 token）。
-    pub fn get_content(&self, competition_type: CompetitionType) -> Result<CompetitionText, ApiError> {
+    pub fn get_content(
+        &self,
+        competition_type: CompetitionType,
+    ) -> Result<CompetitionText, ApiError> {
         let token = self
             .current_token()
             .ok_or_else(|| ApiError::Server("请先登录 52dazi".into()))?;
@@ -387,12 +388,14 @@ impl ApiClient {
         text: &Text,
         stats: &Stats,
         elapsed: Duration,
+        input_method: &str,
     ) -> Result<UploadOutcome, ApiError> {
         let token = self
             .current_token()
             .ok_or_else(|| ApiError::Server("未登录，无法上传成绩".into()))?;
         let upload_stats = super::share::to_upload_stats(stats, elapsed);
-        let payload = super::share::build_upload_payload(text, stats, &upload_stats, elapsed);
+        let payload =
+            super::share::build_upload_payload(text, stats, &upload_stats, elapsed, input_method);
         let rank_res = match self.upload_result(&token, &payload) {
             Ok(r) => Ok(r),
             Err(e) => {
@@ -406,6 +409,7 @@ impl ApiClient {
                                 stats,
                                 &upload_stats,
                                 elapsed,
+                                input_method,
                             );
                             self.upload_result(&new_login.token, &new_payload)
                         } else {
@@ -421,7 +425,8 @@ impl ApiClient {
         }?;
         let ranking = rank_res.ranking.clone();
         let rank_num = ranking.as_deref().and_then(|s| s.parse::<u32>().ok());
-        let share_text = super::share::format_share_text(&text.source, rank_num, &upload_stats);
+        let share_text =
+            super::share::format_share_text(&text.source, rank_num, &upload_stats, input_method);
         Ok(UploadOutcome {
             ranking,
             share_text,
@@ -441,7 +446,9 @@ impl ApiClient {
         {
             req = req.header("Cookie", &cookie);
         }
-        let mut resp = req.send(body).map_err(|e| ApiError::Transport(e.to_string()))?;
+        let mut resp = req
+            .send(body)
+            .map_err(|e| ApiError::Transport(e.to_string()))?;
         let new_cookie = resp
             .headers()
             .get("set-cookie")
@@ -465,7 +472,6 @@ impl ApiClient {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -476,7 +482,10 @@ mod tests {
             .header("Set-Cookie", "PHPSESSID=test12345; path=/")
             .body(())
             .unwrap();
-        let cookie_str = resp.headers().get("set-cookie").and_then(|v| v.to_str().ok());
+        let cookie_str = resp
+            .headers()
+            .get("set-cookie")
+            .and_then(|v| v.to_str().ok());
         assert_eq!(cookie_str, Some("PHPSESSID=test12345; path=/"));
     }
 
@@ -512,7 +521,10 @@ mod tests {
         let r = parse_content_response(body).unwrap();
         assert_eq!(r.title, "市井人间烟火的生活本真");
         assert_eq!(r.content, "市井人间烟火，是最真实的生活本真");
-        assert_eq!(r.word_num, "市井人间烟火，是最真实的生活本真".chars().count());
+        assert_eq!(
+            r.word_num,
+            "市井人间烟火，是最真实的生活本真".chars().count()
+        );
     }
 
     #[test]
@@ -901,11 +913,7 @@ mod tests {
                 "应为 uploadResult: {req}"
             );
             // body 是请求头 \r\n\r\n 之后的部分
-            let body = req
-                .split("\r\n\r\n")
-                .nth(1)
-                .unwrap_or("")
-                .to_string();
+            let body = req.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
             assert!(!body.is_empty(), "请求体为空");
             // 解密 AES-CBC 加密的请求体（前端格式）
             let plaintext = super::super::protocol::decrypt(&body);
@@ -919,10 +927,27 @@ mod tests {
             assert_eq!(v["token"], "tok-9");
             // 业务字段：前端 resultPostData 完整 schema（含新补的字段）
             for key in [
-                "textTitle", "speed", "keystrokes", "maChang", "wordNum", "typingTime",
-                "huiGai", "huiChe", "jianShu", "jianZhun", "accuracy", "repeatNum", "daCi",
-                "wrongNum", "inputMethod", "backspace", "xuanChong", "keyMethod",
-                "challengeFlag", "isFirstSubmit", "isGroupText",
+                "textTitle",
+                "speed",
+                "keystrokes",
+                "maChang",
+                "wordNum",
+                "typingTime",
+                "huiGai",
+                "huiChe",
+                "jianShu",
+                "jianZhun",
+                "accuracy",
+                "repeatNum",
+                "daCi",
+                "wrongNum",
+                "inputMethod",
+                "backspace",
+                "xuanChong",
+                "keyMethod",
+                "challengeFlag",
+                "isFirstSubmit",
+                "isGroupText",
             ] {
                 assert!(
                     v.get(key).is_some(),
@@ -1039,7 +1064,8 @@ mod tests {
         });
 
         // 第一次运行：登录并保存
-        let client1 = ApiClient::with_base_url_and_store(&format!("http://{addr}"), Some(store.clone()));
+        let client1 =
+            ApiClient::with_base_url_and_store(&format!("http://{addr}"), Some(store.clone()));
         let login_res = client1.login("alice", "pass").unwrap();
         assert_eq!(login_res.token, "tok-live");
         assert!(client1.is_logged_in());
@@ -1061,9 +1087,9 @@ mod tests {
 
     #[test]
     fn upload_session_auto_retries_and_returns_outcome() {
+        use crate::TextSource;
         use std::io::{Read, Write};
         use std::net::TcpListener;
-        use crate::TextSource;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1123,7 +1149,9 @@ mod tests {
         let text = Text {
             title: "极速杯第100期".into(),
             content: "打字练习测试".into(),
-            source: TextSource::Online { competition_type: CompetitionType::Jisu },
+            source: TextSource::Online {
+                competition_type: CompetitionType::Jisu,
+            },
             word_boundaries: None,
             shuffled: false,
         };
@@ -1138,7 +1166,9 @@ mod tests {
             edit_details: Vec::new(),
         };
 
-        let outcome = client.upload_session(&text, &stats, Duration::from_secs(10)).unwrap();
+        let outcome = client
+            .upload_session(&text, &stats, Duration::from_secs(10), "")
+            .unwrap();
         assert_eq!(outcome.ranking.as_deref(), Some("3"));
         assert!(outcome.share_text.contains("第3名"));
         assert!(outcome.share_text.contains("WPM 92.5"));
@@ -1177,7 +1207,9 @@ mod tests {
     fn real_gateway_upload_test() {
         let client = ApiClient::new();
         println!("Current token: {:?}", client.current_token());
-        let text = client.get_content(CompetitionType::Jisu).expect("get_content failed");
+        let text = client
+            .get_content(CompetitionType::Jisu)
+            .expect("get_content failed");
         let stats = Stats {
             wpm: 60.0,
             typed_chars: text.content.chars().count(),
@@ -1189,14 +1221,25 @@ mod tests {
             edit_details: Vec::new(),
         };
         let upload_stats = crate::online::share::to_upload_stats(&stats, Duration::from_secs(60));
-        let payload = crate::online::share::build_upload_payload(&Text {
-            title: text.title.clone(),
-            content: text.content.clone(),
-            source: crate::TextSource::Online { competition_type: CompetitionType::Jisu },
-            word_boundaries: None,
-            shuffled: false,
-        }, &stats, &upload_stats, Duration::from_secs(60));
-        println!("Generated payload: {}", serde_json::to_string_pretty(&payload).unwrap());
+        let payload = crate::online::share::build_upload_payload(
+            &Text {
+                title: text.title.clone(),
+                content: text.content.clone(),
+                source: crate::TextSource::Online {
+                    competition_type: CompetitionType::Jisu,
+                },
+                word_boundaries: None,
+                shuffled: false,
+            },
+            &stats,
+            &upload_stats,
+            Duration::from_secs(60),
+            "",
+        );
+        println!(
+            "Generated payload: {}",
+            serde_json::to_string_pretty(&payload).unwrap()
+        );
 
         if let Some(token) = client.current_token() {
             let base_info_body = encrypt_value(&Value::Object(base_fields(Some(&token))));
@@ -1210,7 +1253,3 @@ mod tests {
         println!("Upload result with bogus token: {bogus_res:?}");
     }
 }
-
-
-
-
