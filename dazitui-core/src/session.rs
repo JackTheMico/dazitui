@@ -25,14 +25,9 @@ pub struct TypeResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ErrorType {
     /// 与原文不一致的错字（typed: 输入的字符, expected: 期望的原文对应位置字符）。
-    Mismatch {
-        typed: char,
-        expected: Option<char>,
-    },
+    Mismatch { typed: char, expected: Option<char> },
     /// 回改（退格删除的字符）。
-    Backspace {
-        deleted: char,
-    },
+    Backspace { deleted: char },
 }
 
 /// 打错点信息（发生时间 + 当时即时 WPM + 错误类型）。
@@ -178,10 +173,7 @@ impl Session {
             let error = if is_match {
                 None
             } else {
-                Some(ErrorType::Mismatch {
-                    typed: c,
-                    expected,
-                })
+                Some(ErrorType::Mismatch { typed: c, expected })
             };
             self.events.push(TypingEvent {
                 elapsed,
@@ -772,12 +764,20 @@ mod tests {
         assert_eq!(stats.speed_samples[0], (0.0, 0.0));
 
         // 第 1 秒样本
-        let s1 = stats.speed_samples.iter().find(|(t, _)| (*t - 1.0).abs() < 1e-3).unwrap();
+        let s1 = stats
+            .speed_samples
+            .iter()
+            .find(|(t, _)| (*t - 1.0).abs() < 1e-3)
+            .unwrap();
         // 2 字 / 1s * 60 = 120 WPM
         assert!((s1.1 - 120.0).abs() < 1.0);
 
         // 第 4 秒样本（暂停阶段：在 [2.0, 4.0] 窗口内只有 2.0s 时的输入，窗口内无新字增量）
-        let s4 = stats.speed_samples.iter().find(|(t, _)| (*t - 4.0).abs() < 1e-3).unwrap();
+        let s4 = stats
+            .speed_samples
+            .iter()
+            .find(|(t, _)| (*t - 4.0).abs() < 1e-3)
+            .unwrap();
         assert_eq!(s4.1, 0.0);
     }
 
@@ -810,12 +810,7 @@ mod tests {
         // 错误点 2：Backspace
         let ep2 = &stats.error_points[1];
         assert!((ep2.time_secs - 2.5).abs() < 1e-3);
-        assert_eq!(
-            ep2.error_type,
-            ErrorType::Backspace {
-                deleted: '四',
-            }
-        );
+        assert_eq!(ep2.error_type, ErrorType::Backspace { deleted: '四' });
     }
 
     #[test]

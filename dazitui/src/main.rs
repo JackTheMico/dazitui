@@ -5,17 +5,19 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use dazitui_core::{
-    ApiClient, ApiError, AuthSession, BUILTIN_SETS, CharStatus, CompetitionType, FONT_SIZE_PT,
-    LoadError, LoadOptions, Rgb, Session, Settings, SettingsStore, Stats, Text, TextSource, Theme,
-    TokenStore, env_credentials, is_auth_failure, load_builtin_text, load_builtin_text_shuffled,
-    load_text_from_file, load_text_from_file_with_options, osc_font_size_sequence, osc52_clipboard,
+    ApiClient, ApiError, AuthSession, BUILTIN_SETS, CharStatus, CompetitionType, ErrorType,
+    FONT_SIZE_PT, LoadError, LoadOptions, Rgb, Session, Settings, SettingsStore, Stats, Text,
+    TextSource, Theme, TokenStore, env_credentials, format_time, is_auth_failure,
+    load_builtin_text, load_builtin_text_shuffled, load_text_from_file,
+    load_text_from_file_with_options, osc_font_size_sequence, osc52_clipboard,
 };
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::prelude::Stylize;
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span, Text as TextLines};
-use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Axis, Block, Chart, Clear, Dataset, GraphType, Paragraph, Wrap};
 
 /// 跟打应用状态。
 enum AppState {
@@ -553,7 +555,6 @@ impl App {
     }
 
     /// 执行上传：调用 API 客户端一站式上传成绩（包含指标计算、payload 构建、网关通信、自动重登与分享文本生成）。
-
     fn perform_upload(&self, stats: &Stats, elapsed: Duration) -> UploadState {
         if !self.logged_in && !self.api.is_logged_in() {
             return UploadState::Failed {
@@ -730,7 +731,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                             }
                             continue;
                         }
-                        handle_key(&mut app.session, key);
+                        handle_key(&mut app.session, key, app.start.elapsed());
                         if app.session.is_complete() {
                             finish_and_maybe_upload(&mut app, terminal)?;
                         }
@@ -829,7 +830,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
             }
             Event::Paste(committed) => {
                 if matches!(app.state, AppState::Typing) {
-                    app.session.type_text(&committed);
+                    app.session.type_text_at(&committed, app.start.elapsed());
                     if app.session.is_complete() {
                         finish_and_maybe_upload(&mut app, terminal)?;
                     }
@@ -897,16 +898,16 @@ fn is_toggle_sidebar(key: KeyEvent) -> bool {
     key.code == KeyCode::Tab
 }
 
-/// 处理跟打键：退格回改，可打印字符上屏；同时记录按键频率。
-fn handle_key(session: &mut Session, key: KeyEvent) {
+/// 处理跟打键：退格回改，可打印字符上屏；同时记录按键频率与时序事件。
+fn handle_key(session: &mut Session, key: KeyEvent, elapsed: Duration) {
     match key.code {
         KeyCode::Backspace => {
             session.record_key("Backspace");
-            session.backspace();
+            session.backspace_at(elapsed);
         }
         KeyCode::Char(c) => {
             session.record_key(&c.to_string());
-            session.type_text(&c.to_string());
+            session.type_text_at(&c.to_string(), elapsed);
         }
         _ => {}
     }
@@ -1122,8 +1123,13 @@ fn list_text_files(dir: &Path) -> Vec<PathBuf> {
 }
 
 fn ui(frame: &mut Frame, app: &App) {
-    if let AppState::Finished { stats, upload, .. } = &app.state {
-        render_result_view(frame, app, stats, upload);
+    if let AppState::Finished {
+        stats,
+        upload,
+        elapsed,
+    } = &app.state
+    {
+        render_result_view(frame, app, stats, upload, *elapsed);
         return;
     }
     if matches!(app.state, AppState::Settings) {
@@ -1541,74 +1547,242 @@ fn on_off(v: bool) -> &'static str {
     if v { "开" } else { "关" }
 }
 
-/// 全屏成绩视图：WPM/错字/回改/按键频率 + 上传状态（在线赛文）。
-fn render_result_view(frame: &mut Frame, app: &App, stats: &Stats, upload: &UploadState) {
+/// 全屏成绩视图：WPM/错字/用时摘要卡片 + WPM 速度折线图与打错标记 + 错字时间线明细 + 导航快捷键。
+fn render_result_view(
+    frame: &mut Frame,
+    app: &App,
+    stats: &Stats,
+    upload: &UploadState,
+    elapsed: Duration,
+) {
     let theme = app.theme();
-    let lines = vec![
-        Line::from(format!(" 成绩 — {} ", app.text.title)).bold(),
-        Line::from(""),
-        Line::from(format!(" WPM:        {:.1}", stats.wpm)),
-        Line::from(format!(
-            " 正确字数:   {} / {}",
-            stats.correct_chars,
-            app.text.content.chars().count()
-        )),
-        Line::from(format!(
-            " 错字:       {}（不一致 {} + 回改 {}）",
-            stats.wrong_total, stats.wrong_chars, stats.edits
-        )),
-        Line::from(format!(
-            " 回改明细:   {}",
-            if stats.edit_details.is_empty() {
-                "无".to_string()
+    let total_area = frame.area();
+
+    // 1. 顶部成绩摘要
+    let mut summary_lines = vec![Line::from(vec![
+        Span::raw(" WPM: "),
+        Span::styled(
+            format!("{:.1}", stats.wpm),
+            Style::default().bold().fg(color(theme.accent)),
+        ),
+        Span::raw("   正确字数: "),
+        Span::styled(
+            format!(
+                "{}/{}",
+                stats.correct_chars,
+                app.text.content.chars().count()
+            ),
+            Style::default().bold(),
+        ),
+        Span::raw("   错字: "),
+        Span::styled(
+            format!(
+                "{} (不一致 {} + 回改 {})",
+                stats.wrong_total, stats.wrong_chars, stats.edits
+            ),
+            Style::default().fg(if stats.wrong_total > 0 {
+                color(theme.wrong)
             } else {
-                stats.edit_details.iter().collect::<String>()
-            }
-        )),
-        Line::from(""),
-        Line::from(" 按键频率:").bold(),
-    ];
-    let mut freq_lines = stats
-        .key_frequency
-        .iter()
-        .map(|(k, n)| Line::from(format!("   {k:<12} {n}")))
-        .collect::<Vec<_>>();
-    if freq_lines.is_empty() {
-        freq_lines.push(Line::from("   （无按键记录）"));
+                color(theme.correct)
+            }),
+        ),
+        Span::raw("   用时: "),
+        Span::styled(format_time(elapsed), Style::default().bold()),
+    ])];
+    if !stats.edit_details.is_empty() {
+        let details: String = stats.edit_details.iter().collect();
+        summary_lines.push(Line::from(format!(" 回改明细: {details}")));
     }
-    let mut all = lines;
-    all.extend(freq_lines);
-    // 上传状态（在线赛文；离线赛文不显示）。
-    all.extend(upload_lines(upload, theme));
-    all.push(Line::from(""));
-    if app.text.is_online() {
-        // 在线赛文不支持重打。若登录失效，提示 Ctrl-O 登录重试。
+    // 上传状态（在线赛文；离线赛文不显示）
+    summary_lines.extend(upload_lines(upload, theme));
+
+    // 计算顶部高度
+    let summary_height = if matches!(upload, UploadState::NotApplicable) {
+        if stats.edit_details.is_empty() { 3 } else { 4 }
+    } else {
+        if stats.edit_details.is_empty() { 5 } else { 6 }
+    };
+
+    // 2. 错字时间线行生成
+    let mut timeline_lines = Vec::new();
+    if stats.error_points.is_empty() {
+        timeline_lines.push(Line::from(" 全对无错字").fg(color(theme.correct)));
+    } else {
+        let max_show = 4;
+        for ep in stats.error_points.iter().take(max_show) {
+            match &ep.error_type {
+                ErrorType::Mismatch { typed, expected } => {
+                    timeline_lines.push(
+                        Line::from(format!(
+                            "   [{:04.1}s] 错字: '{}' (期望'{}') · WPM {:.1}",
+                            ep.time_secs,
+                            typed,
+                            expected
+                                .map(|c| c.to_string())
+                                .unwrap_or_else(|| "?".into()),
+                            ep.wpm
+                        ))
+                        .fg(color(theme.wrong)),
+                    );
+                }
+                ErrorType::Backspace { deleted } => {
+                    timeline_lines.push(
+                        Line::from(format!(
+                            "   [{:04.1}s] 回改: '{}' · WPM {:.1}",
+                            ep.time_secs, deleted, ep.wpm
+                        ))
+                        .fg(color(theme.warn)),
+                    );
+                }
+            }
+        }
+        if stats.error_points.len() > max_show {
+            timeline_lines.push(
+                Line::from(format!(
+                    "   ... 共有 {} 处错字与回改",
+                    stats.error_points.len()
+                ))
+                .fg(color(theme.muted)),
+            );
+        }
+    }
+    let timeline_height = (timeline_lines.len() as u16 + 2).min(8);
+
+    // 3. 底部操作提示
+    let hint_line = if app.text.is_online() {
         if let UploadState::Failed {
             need_relogin: true, ..
         } = upload
         {
-            all.push(
-                Line::from(" Esc 返回 | Ctrl-O 登录并上传 | Ctrl-F 载文 | Ctrl-B 内置赛文 | q 退出")
-                    .fg(color(theme.muted)),
-            );
+            Line::from(" Esc 返回 | Ctrl-O 登录并上传 | Ctrl-F 载文 | Ctrl-B 内置赛文 | q 退出")
+                .fg(color(theme.muted))
         } else {
-            all.push(
-                Line::from(" Esc 返回 | Ctrl-F 载文 | Ctrl-B 内置赛文 | q 退出")
-                    .fg(color(theme.muted)),
-            );
+            Line::from(" Esc 返回 | Ctrl-F 载文 | Ctrl-B 内置赛文 | q 退出").fg(color(theme.muted))
         }
     } else {
-        all.push(
-            Line::from(" Esc 返回 | Enter/r 重打 | Ctrl-F 载文 | Ctrl-B 内置赛文 | q 退出")
-                .fg(color(theme.muted)),
+        Line::from(" Esc 返回 | Enter/r 重打 | Ctrl-F 载文 | Ctrl-B 内置赛文 | q 退出")
+            .fg(color(theme.muted))
+    };
+
+    // 极小终端降级展示
+    if total_area.height < 14 {
+        let [top_area, bottom_area] =
+            Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(total_area);
+        let mut all_lines = summary_lines;
+        all_lines.push(Line::from(""));
+        all_lines.extend(timeline_lines);
+        frame.render_widget(
+            Paragraph::new(all_lines)
+                .block(themed_block(theme).title(format!(" 成绩 — {} ", app.text.title)))
+                .wrap(Wrap { trim: false }),
+            top_area,
+        );
+        frame.render_widget(Paragraph::new(hint_line), bottom_area);
+        return;
+    }
+
+    let [summary_area, chart_area, timeline_area, hint_area] = Layout::vertical([
+        Constraint::Length(summary_height),
+        Constraint::Min(6),
+        Constraint::Length(timeline_height),
+        Constraint::Length(1),
+    ])
+    .areas(total_area);
+
+    frame.render_widget(
+        Paragraph::new(summary_lines)
+            .block(themed_block(theme).title(format!(" 成绩 — {} ", app.text.title)))
+            .wrap(Wrap { trim: false }),
+        summary_area,
+    );
+
+    // 绘制 Chart
+    let speed_data = &stats.speed_samples;
+    let error_data: Vec<(f64, f64)> = stats
+        .error_points
+        .iter()
+        .map(|p| (p.time_secs, p.wpm))
+        .collect();
+
+    let max_x = speed_data
+        .last()
+        .map(|s| s.0)
+        .unwrap_or(0.0)
+        .max(elapsed.as_secs_f64())
+        .max(5.0);
+    let max_y_sample = speed_data.iter().map(|s| s.1).fold(0.0, f64::max);
+    let max_y_error = error_data.iter().map(|s| s.1).fold(0.0, f64::max);
+    let max_y = (max_y_sample.max(max_y_error).max(stats.wpm).max(30.0) * 1.15).ceil();
+
+    let x_labels = vec![
+        Span::styled("0s", Style::default().fg(color(theme.muted))),
+        Span::styled(
+            format!("{:.1}s", max_x / 2.0),
+            Style::default().fg(color(theme.muted)),
+        ),
+        Span::styled(
+            format!("{:.1}s", max_x),
+            Style::default().fg(color(theme.muted)),
+        ),
+    ];
+    let y_labels = vec![
+        Span::styled("0", Style::default().fg(color(theme.muted))),
+        Span::styled(
+            format!("{:.0}", max_y / 2.0),
+            Style::default().fg(color(theme.muted)),
+        ),
+        Span::styled(
+            format!("{:.0}", max_y),
+            Style::default().fg(color(theme.muted)),
+        ),
+    ];
+
+    let mut datasets = vec![
+        Dataset::default()
+            .name("WPM 速度")
+            .marker(Marker::Braille)
+            .graph_type(GraphType::Line)
+            .style(Style::default().fg(color(theme.accent)))
+            .data(speed_data),
+    ];
+    if !error_data.is_empty() {
+        datasets.push(
+            Dataset::default()
+                .name("打错点")
+                .marker(Marker::Dot)
+                .graph_type(GraphType::Scatter)
+                .style(Style::default().fg(color(theme.wrong)))
+                .data(&error_data),
         );
     }
+
+    let chart = Chart::new(datasets)
+        .block(themed_block(theme).title(" WPM 速度曲线 "))
+        .x_axis(
+            Axis::default()
+                .title("时间")
+                .style(Style::default().fg(color(theme.muted)))
+                .bounds([0.0, max_x])
+                .labels(x_labels),
+        )
+        .y_axis(
+            Axis::default()
+                .title("WPM")
+                .style(Style::default().fg(color(theme.muted)))
+                .bounds([0.0, max_y])
+                .labels(y_labels),
+        );
+
+    frame.render_widget(chart, chart_area);
+
     frame.render_widget(
-        Paragraph::new(all)
-            .block(themed_block(theme).title(" 成绩 "))
+        Paragraph::new(timeline_lines)
+            .block(themed_block(theme).title(" 错字时间线 "))
             .wrap(Wrap { trim: false }),
-        frame.area(),
+        timeline_area,
     );
+
+    frame.render_widget(Paragraph::new(hint_line), hint_area);
 }
 
 /// 成绩视图里的上传状态行（纯函数，供渲染与测试）。
@@ -2334,14 +2508,17 @@ mod tests {
         handle_key(
             &mut session,
             KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+            Duration::ZERO,
         );
         handle_key(
             &mut session,
             KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+            Duration::ZERO,
         );
         handle_key(
             &mut session,
             KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+            Duration::ZERO,
         );
         let stats = session.finish(Duration::from_secs(60));
         assert_eq!(stats.key_frequency[0], ("n".to_string(), 2));
@@ -2353,11 +2530,11 @@ mod tests {
         let mut session = Session::new("你好世界");
         session.type_text("你好");
         let mut key = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
-        handle_key(&mut session, key);
+        handle_key(&mut session, key, Duration::ZERO);
         assert_eq!(session.len(), 1);
         assert_eq!(session.edit_count(), 1);
         key = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
-        handle_key(&mut session, key);
+        handle_key(&mut session, key, Duration::ZERO);
         assert_eq!(session.len(), 2);
     }
 
@@ -3758,5 +3935,64 @@ mod tests {
         let space = KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE);
         assert!(!handle_finished_key(&mut app, space));
         assert!(matches!(app.state, AppState::Finished { .. }));
+    }
+
+    // ---- Issue #40 / #41 速度图表与错字时间线渲染测试 ----
+
+    #[test]
+    fn render_result_view_renders_chart_and_errors() {
+        let mut app = test_app(file_text("你好世界"));
+        app.session.type_text_at("你", Duration::from_secs(1));
+        app.session.type_text_at("四", Duration::from_secs(2));
+        app.session.backspace_at(Duration::from_secs_f64(2.5));
+        app.session.type_text_at("好", Duration::from_secs(3));
+        app.session.type_text_at("世", Duration::from_secs(4));
+        app.session.type_text_at("界", Duration::from_secs(5));
+        app.finish_typing();
+
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| ui(f, &app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let content = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let clean_content = content.replace(' ', "");
+        assert!(clean_content.contains("成绩"));
+        assert!(clean_content.contains("WPM速度曲线"));
+        assert!(clean_content.contains("错字时间线"));
+        assert!(clean_content.contains("回改:'四'"));
+        assert!(clean_content.contains("Esc返回"));
+    }
+
+    #[test]
+    fn render_result_view_compact_mode_for_small_terminals() {
+        let mut app = test_app(file_text("你好世界"));
+        app.finish_typing();
+
+        let backend = ratatui::backend::TestBackend::new(60, 10);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| ui(f, &app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let content = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let clean_content = content.replace(' ', "");
+        assert!(clean_content.contains("成绩"));
+        assert!(clean_content.contains("Esc返回"));
     }
 }
