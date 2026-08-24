@@ -3,6 +3,7 @@ use std::path::Path;
 mod db;
 mod lttb;
 mod scheme;
+mod segmenter;
 mod session;
 mod settings;
 
@@ -15,6 +16,7 @@ pub use db::{
 };
 pub use lttb::lttb_downsample;
 pub use scheme::SchemeDict;
+pub use segmenter::{WordIndex, WordToken};
 pub use session::{CharStatus, ErrorPoint, ErrorType, GROUP_SIZE, Session, Stats, TypeResult};
 pub use settings::{
     FONT_SIZE_PT, Rgb, Settings, SettingsStore, Theme, ThemePreset, osc_font_size_sequence,
@@ -70,6 +72,15 @@ impl Text {
             return set.word_boundaries();
         }
         Vec::new()
+    }
+
+    /// 构建当前赛文的分词倒排索引（支持内置词组赛文原生词边界与通用/在线赛文 Jieba 分词）。
+    pub fn build_word_index(&self) -> WordIndex {
+        let is_builtin_words = match self.source {
+            TextSource::Builtin { set } => set.is_words(),
+            _ => false,
+        };
+        WordIndex::build(&self.content, is_builtin_words)
     }
 }
 

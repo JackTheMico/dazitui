@@ -9,6 +9,7 @@ arboard = "3"
 base64 = { version = "0.22", optional = true }
 cbc = { version = "0.1", features = ["alloc"], optional = true }
 rand = "0.9"
+jieba-rs = "0.7"
 rusqlite = { version = "0.31", features = ["bundled"] }
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }

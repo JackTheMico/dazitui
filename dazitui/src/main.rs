@@ -117,6 +117,30 @@ impl HeatmapSource {
     }
 }
 
+/// 错字/错词排行榜焦点。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ErrorRankingFocus {
+    #[default]
+    Chars, // 高频错字榜
+    Words, // 高频错词榜
+}
+
+impl ErrorRankingFocus {
+    fn toggle(self) -> Self {
+        match self {
+            Self::Chars => Self::Words,
+            Self::Words => Self::Chars,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Chars => "高频错字榜",
+            Self::Words => "高频错词榜",
+        }
+    }
+}
+
 /// 统计视图状态。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct StatsViewState {
@@ -124,6 +148,9 @@ struct StatsViewState {
     wpm_range: WpmChartRange,
     heatmap_layout: HeatmapLayout,
     heatmap_source: HeatmapSource,
+    error_ranking_focus: ErrorRankingFocus,
+    char_scroll: usize,
+    word_scroll: usize,
 }
 
 /// 将 core 的 ThemePreset 映射为 ratatui_themes 的 ThemePalette。
@@ -801,6 +828,7 @@ impl App {
                 &self.settings.input_method,
             );
             let session_id = session_record.id.clone();
+            let word_index = self.text.build_word_index();
             let errors: Vec<ErrorRecordItem> = stats
                 .error_points
                 .iter()
@@ -812,13 +840,17 @@ impl App {
                         }
                         ErrorType::Backspace { deleted } => (None, Some(*deleted), "Backspace"),
                     };
+                    let target_word = target_char
+                        .and_then(|ch| word_index.find_word_containing_char(ch))
+                        .or_else(|| word_index.get_word_at(idx))
+                        .map(|w| w.to_string());
                     ErrorRecordItem::new(
                         &session_id,
                         ep.time_secs,
                         idx as u32,
                         target_char,
                         actual_char,
-                        None,
+                        target_word,
                         error_type_str,
                     )
                 })
@@ -1350,6 +1382,54 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                             KeyCode::Char('m') | KeyCode::Char('M') => {
                                 stats_state.heatmap_source = stats_state.heatmap_source.next();
                             }
+                            KeyCode::Char('t') | KeyCode::Char('T') => {
+                                stats_state.error_ranking_focus =
+                                    stats_state.error_ranking_focus.toggle();
+                            }
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                match stats_state.error_ranking_focus {
+                                    ErrorRankingFocus::Chars => {
+                                        stats_state.char_scroll =
+                                            stats_state.char_scroll.saturating_sub(1);
+                                    }
+                                    ErrorRankingFocus::Words => {
+                                        stats_state.word_scroll =
+                                            stats_state.word_scroll.saturating_sub(1);
+                                    }
+                                }
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                match stats_state.error_ranking_focus {
+                                    ErrorRankingFocus::Chars => {
+                                        stats_state.char_scroll =
+                                            stats_state.char_scroll.saturating_add(1);
+                                    }
+                                    ErrorRankingFocus::Words => {
+                                        stats_state.word_scroll =
+                                            stats_state.word_scroll.saturating_add(1);
+                                    }
+                                }
+                            }
+                            KeyCode::PageUp => match stats_state.error_ranking_focus {
+                                ErrorRankingFocus::Chars => {
+                                    stats_state.char_scroll =
+                                        stats_state.char_scroll.saturating_sub(10);
+                                }
+                                ErrorRankingFocus::Words => {
+                                    stats_state.word_scroll =
+                                        stats_state.word_scroll.saturating_sub(10);
+                                }
+                            },
+                            KeyCode::PageDown => match stats_state.error_ranking_focus {
+                                ErrorRankingFocus::Chars => {
+                                    stats_state.char_scroll =
+                                        stats_state.char_scroll.saturating_add(10);
+                                }
+                                ErrorRankingFocus::Words => {
+                                    stats_state.word_scroll =
+                                        stats_state.word_scroll.saturating_add(10);
+                                }
+                            },
                             KeyCode::Esc => app.state = AppState::Typing,
                             _ => {}
                         }
@@ -2699,7 +2779,15 @@ fn render_stats_view(frame: &mut Frame, app: &App, stats_state: &StatsViewState)
             stats_state.heatmap_source,
             &palette,
         ),
-        StatsTab::ErrorRanking => render_error_ranking_tab(frame, app, body_area, &palette),
+        StatsTab::ErrorRanking => render_error_ranking_tab(
+            frame,
+            app,
+            body_area,
+            stats_state.error_ranking_focus,
+            stats_state.char_scroll,
+            stats_state.word_scroll,
+            &palette,
+        ),
     }
 
     // 3. 底部快捷键提示
@@ -2711,7 +2799,7 @@ fn render_stats_view(frame: &mut Frame, app: &App, stats_state: &StatsViewState)
             " 1/2/3 切换选项卡 | l 切换键盘布局(斜列/直列) | m 切换数据视角(方案/物理) | Esc 返回跟打 | Ctrl-E 设置 | Ctrl-Q 退出 "
         }
         StatsTab::ErrorRanking => {
-            " 1/2/3 切换选项卡 | ↑↓ 滚动查看 | Esc 返回跟打 | Ctrl-E 设置 | Ctrl-Q 退出 "
+            " 1/2/3 切换选项卡 | t 切换字/词焦点 | ↑↓/PgUp/PgDn 滚动浏览 | Esc 返回跟打 | Ctrl-E 设置 | Ctrl-Q 退出 "
         }
     };
     let hint_title = Line::from(vec![Span::styled(
@@ -3276,27 +3364,250 @@ fn render_heatmap_tab(
     );
 }
 
-/// Tab 3: 高频错字与错词排行榜占位。
-fn render_error_ranking_tab(frame: &mut Frame, _app: &App, area: Rect, palette: &ThemePalette) {
-    let title = Line::from(vec![Span::styled(
-        " 高频错字与错词排行榜 ",
+/// Tab 3: 高频错字与错词排行榜双列滚动表格。
+fn render_error_ranking_tab(
+    frame: &mut Frame,
+    _app: &App,
+    area: Rect,
+    focus: ErrorRankingFocus,
+    char_scroll: usize,
+    word_scroll: usize,
+    palette: &ThemePalette,
+) {
+    let db = StatsDb::with_default_path().ok();
+    let top_chars = db
+        .as_ref()
+        .and_then(|d| d.get_top_mistyped_chars(50).ok())
+        .unwrap_or_default();
+    let top_words = db
+        .as_ref()
+        .and_then(|d| d.get_top_mistyped_words(50).ok())
+        .unwrap_or_default();
+
+    let [info_area, table_area] =
+        Layout::vertical([Constraint::Length(4), Constraint::Min(0)]).areas(area);
+
+    // 1. 顶部概要卡片
+    let total_unique_chars = top_chars.len();
+    let total_unique_words = top_words.len();
+    let total_char_errors: u32 = top_chars.iter().map(|c| c.error_count).sum();
+    let total_word_errors: u32 = top_words.iter().map(|w| w.error_count).sum();
+
+    let focus_badge = focus.label();
+    let info_lines = vec![
+        Line::from(vec![
+            Span::styled(" 当前聚焦: ", Style::default().fg(palette.muted)),
+            Span::styled(
+                format!("[{focus_badge} (按 t 切换)]"),
+                Style::default().bold().fg(palette.accent),
+            ),
+            Span::raw("    "),
+            Span::styled(" 高频错字数: ", Style::default().fg(palette.muted)),
+            Span::styled(
+                format!("{total_unique_chars} 种 (累计 {total_char_errors} 次)"),
+                Style::default().bold().fg(palette.fg),
+            ),
+            Span::raw("    "),
+            Span::styled(" 高频错词数: ", Style::default().fg(palette.muted)),
+            Span::styled(
+                format!("{total_unique_words} 组 (累计 {total_word_errors} 次)"),
+                Style::default().bold().fg(palette.success),
+            ),
+        ]),
+        Line::from(vec![Span::styled(
+            " 提示：支持使用 ↑ / ↓ 单行滚动，PgUp / PgDn 快速翻页；按 t 切换左右榜单焦点。",
+            Style::default().fg(palette.muted),
+        )]),
+    ];
+
+    let info_title = Line::from(vec![Span::styled(
+        " 错字与错词数据总览 ",
         Style::default().bold().fg(palette.accent),
     )]);
-    let lines = vec![
-        Line::from(""),
-        Line::from(Span::styled(
-            " 高频错字与错词排行榜双列滚动表格分析",
-            Style::default().fg(palette.muted),
-        )),
-        Line::from(""),
-        Line::from(Span::styled(
-            " 提示：按 1 切换回速度趋势图，按 2 切换至键位热力图。",
-            Style::default().fg(palette.fg),
-        )),
-    ];
     frame.render_widget(
-        Paragraph::new(lines).block(themed_block(palette, true).title(title)),
-        area,
+        Paragraph::new(info_lines).block(themed_block(palette, true).title(info_title)),
+        info_area,
+    );
+
+    // 2. 双列左右均分表格区
+    let [left_col, right_col] =
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .areas(table_area);
+
+    let is_char_focused = focus == ErrorRankingFocus::Chars;
+    let is_word_focused = focus == ErrorRankingFocus::Words;
+
+    // 左列：高频错字榜
+    let char_title = Line::from(vec![Span::styled(
+        if is_char_focused {
+            " ▶ 高频错字排行榜 (Top 50) "
+        } else {
+            "   高频错字排行榜 (Top 50) "
+        },
+        if is_char_focused {
+            Style::default().bold().fg(palette.accent)
+        } else {
+            Style::default().fg(palette.fg)
+        },
+    )]);
+
+    let mut char_lines = Vec::new();
+    // 表头
+    char_lines.push(Line::from(vec![
+        Span::styled(" 排名 ", Style::default().bold().fg(palette.muted)),
+        Span::styled(" 错字 ", Style::default().bold().fg(palette.accent)),
+        Span::styled("   高频误打 ", Style::default().bold().fg(palette.warning)),
+        Span::styled("   累计错次 ", Style::default().bold().fg(palette.error)),
+    ]));
+    char_lines.push(Line::from(Span::styled(
+        " ───────────────────────────────────────────────────",
+        Style::default().fg(palette.muted),
+    )));
+
+    if top_chars.is_empty() {
+        char_lines.push(Line::from(""));
+        char_lines.push(Line::from(Span::styled(
+            "   暂无错字记录，继续保持！",
+            Style::default().fg(palette.success),
+        )));
+    } else {
+        let visible_capacity = left_col.height.saturating_sub(4) as usize;
+        let max_scroll = top_chars.len().saturating_sub(visible_capacity);
+        let actual_scroll = char_scroll.min(max_scroll);
+
+        for (idx, stat) in top_chars
+            .iter()
+            .skip(actual_scroll)
+            .take(visible_capacity)
+            .enumerate()
+        {
+            let rank = actual_scroll + idx + 1;
+            let rank_badge = match rank {
+                1 => Span::styled(
+                    " #1 ",
+                    Style::default()
+                        .bold()
+                        .fg(palette.accent)
+                        .bg(palette.selection),
+                ),
+                2 => Span::styled(" #2 ", Style::default().bold().fg(palette.warning)),
+                3 => Span::styled(" #3 ", Style::default().bold().fg(palette.success)),
+                _ => Span::styled(format!(" #{rank:<2}"), Style::default().fg(palette.muted)),
+            };
+
+            let actual_display = match stat.top_actual_char {
+                Some(c) => format!("'{}'", c),
+                None => "-".to_string(),
+            };
+
+            char_lines.push(Line::from(vec![
+                rank_badge,
+                Span::styled(
+                    format!("   '{}' ", stat.target_char),
+                    Style::default().bold().fg(palette.fg),
+                ),
+                Span::styled(
+                    format!("      {:^4} ", actual_display),
+                    Style::default().fg(palette.warning),
+                ),
+                Span::styled(
+                    format!("      {:>4} 次", stat.error_count),
+                    Style::default().bold().fg(palette.error),
+                ),
+            ]));
+        }
+    }
+
+    frame.render_widget(
+        Paragraph::new(char_lines).block(themed_block(palette, is_char_focused).title(char_title)),
+        left_col,
+    );
+
+    // 右列：高频错词榜
+    let word_title = Line::from(vec![Span::styled(
+        if is_word_focused {
+            " ▶ 高频错词排行榜 (Top 50) "
+        } else {
+            "   高频错词排行榜 (Top 50) "
+        },
+        if is_word_focused {
+            Style::default().bold().fg(palette.accent)
+        } else {
+            Style::default().fg(palette.fg)
+        },
+    )]);
+
+    let mut word_lines = Vec::new();
+    // 表头
+    word_lines.push(Line::from(vec![
+        Span::styled(" 排名 ", Style::default().bold().fg(palette.muted)),
+        Span::styled(" 归因错词 ", Style::default().bold().fg(palette.accent)),
+        Span::styled(
+            "      累计错误频次 ",
+            Style::default().bold().fg(palette.fg),
+        ),
+        Span::styled(
+            "   影响练习场次 ",
+            Style::default().bold().fg(palette.warning),
+        ),
+    ]));
+    word_lines.push(Line::from(Span::styled(
+        " ───────────────────────────────────────────────────",
+        Style::default().fg(palette.muted),
+    )));
+
+    if top_words.is_empty() {
+        word_lines.push(Line::from(""));
+        word_lines.push(Line::from(Span::styled(
+            "   暂无错词记录，词汇跟打非常准确！",
+            Style::default().fg(palette.success),
+        )));
+    } else {
+        let visible_capacity = right_col.height.saturating_sub(4) as usize;
+        let max_scroll = top_words.len().saturating_sub(visible_capacity);
+        let actual_scroll = word_scroll.min(max_scroll);
+
+        for (idx, stat) in top_words
+            .iter()
+            .skip(actual_scroll)
+            .take(visible_capacity)
+            .enumerate()
+        {
+            let rank = actual_scroll + idx + 1;
+            let rank_badge = match rank {
+                1 => Span::styled(
+                    " #1 ",
+                    Style::default()
+                        .bold()
+                        .fg(palette.accent)
+                        .bg(palette.selection),
+                ),
+                2 => Span::styled(" #2 ", Style::default().bold().fg(palette.warning)),
+                3 => Span::styled(" #3 ", Style::default().bold().fg(palette.success)),
+                _ => Span::styled(format!(" #{rank:<2}"), Style::default().fg(palette.muted)),
+            };
+
+            word_lines.push(Line::from(vec![
+                rank_badge,
+                Span::styled(
+                    format!("   {:<8}", stat.target_word),
+                    Style::default().bold().fg(palette.fg),
+                ),
+                Span::styled(
+                    format!("          {:>4} 次", stat.error_count),
+                    Style::default().bold().fg(palette.error),
+                ),
+                Span::styled(
+                    format!("          {:>4} 场", stat.affected_sessions),
+                    Style::default().fg(palette.warning),
+                ),
+            ]));
+        }
+    }
+
+    frame.render_widget(
+        Paragraph::new(word_lines).block(themed_block(palette, is_word_focused).title(word_title)),
+        right_col,
     );
 }
 
@@ -6784,6 +7095,7 @@ mod tests {
             wpm_range: WpmChartRange::Recent30,
             heatmap_layout: HeatmapLayout::Staggered,
             heatmap_source: HeatmapSource::SchemeProjected,
+            ..Default::default()
         });
 
         let backend = ratatui::backend::TestBackend::new(100, 30);
@@ -6848,6 +7160,7 @@ mod tests {
             wpm_range: WpmChartRange::Recent30,
             heatmap_layout: HeatmapLayout::Staggered,
             heatmap_source: HeatmapSource::SchemeProjected,
+            ..Default::default()
         });
         let backend = ratatui::backend::TestBackend::new(100, 30);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -6871,6 +7184,7 @@ mod tests {
             wpm_range: WpmChartRange::Recent30,
             heatmap_layout: HeatmapLayout::Ortholinear,
             heatmap_source: HeatmapSource::RawKeypress,
+            ..Default::default()
         });
         let backend_ortho = ratatui::backend::TestBackend::new(100, 30);
         let mut terminal_ortho = ratatui::Terminal::new(backend_ortho).unwrap();
@@ -6893,6 +7207,9 @@ mod tests {
             wpm_range: WpmChartRange::Recent30,
             heatmap_layout: HeatmapLayout::Staggered,
             heatmap_source: HeatmapSource::SchemeProjected,
+            error_ranking_focus: ErrorRankingFocus::Chars,
+            char_scroll: 0,
+            word_scroll: 0,
         });
         let backend_err = ratatui::backend::TestBackend::new(100, 30);
         let mut terminal_err = ratatui::Terminal::new(backend_err).unwrap();
@@ -6906,7 +7223,9 @@ mod tests {
             })
             .collect();
         let clean3 = full_text3.replace(' ', "");
-        assert!(clean3.contains("高频错字与错词排行榜"));
+        assert!(clean3.contains("错字与错词数据总览"));
+        assert!(clean3.contains("高频错字排行榜"));
+        assert!(clean3.contains("高频错词排行榜"));
     }
 
     #[test]
@@ -6916,5 +7235,11 @@ mod tests {
 
         assert_eq!(HeatmapSource::SchemeProjected.next(), HeatmapSource::RawKeypress);
         assert_eq!(HeatmapSource::RawKeypress.next(), HeatmapSource::SchemeProjected);
+    }
+
+    #[test]
+    fn error_ranking_focus_toggle() {
+        assert_eq!(ErrorRankingFocus::Chars.toggle(), ErrorRankingFocus::Words);
+        assert_eq!(ErrorRankingFocus::Words.toggle(), ErrorRankingFocus::Chars);
     }
 }
