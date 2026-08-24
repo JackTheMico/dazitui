@@ -6,54 +6,79 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 /// 内置主题预设。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ThemePreset {
-    /// 默认配色（复刻原有绿/红/黄/灰）。
-    Default,
-    /// Catppuccin Mocha。
-    Catppuccin,
+    /// Catppuccin Mocha（默认）。
+    #[default]
+    CatppuccinMocha,
+    /// Tokyo Night。
+    TokyoNight,
+    /// Nord。
+    Nord,
     /// Dracula。
     Dracula,
     /// Gruvbox（dark）。
     Gruvbox,
+    /// Rosé Pine。
+    RosePine,
+    /// Kanagawa。
+    Kanagawa,
+    /// One Dark。
+    OneDark,
 }
 
 impl ThemePreset {
     /// 全部预设，按设置视图展示顺序排列。
-    pub const ALL: [ThemePreset; 4] = [
-        ThemePreset::Default,
-        ThemePreset::Catppuccin,
+    pub const ALL: [ThemePreset; 8] = [
+        ThemePreset::CatppuccinMocha,
+        ThemePreset::TokyoNight,
+        ThemePreset::Nord,
         ThemePreset::Dracula,
         ThemePreset::Gruvbox,
+        ThemePreset::RosePine,
+        ThemePreset::Kanagawa,
+        ThemePreset::OneDark,
     ];
 
     /// 预设显示名（用于设置视图）。
     pub fn name(&self) -> &'static str {
         match self {
-            Self::Default => "默认",
-            Self::Catppuccin => "Catppuccin",
+            Self::CatppuccinMocha => "Catppuccin Mocha",
+            Self::TokyoNight => "Tokyo Night",
+            Self::Nord => "Nord",
             Self::Dracula => "Dracula",
-            Self::Gruvbox => "Gruvbox",
+            Self::Gruvbox => "Gruvbox Dark",
+            Self::RosePine => "Rosé Pine",
+            Self::Kanagawa => "Kanagawa",
+            Self::OneDark => "One Dark",
         }
     }
 
     /// 序列化标识（用于 settings 文件）。
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::Default => "default",
-            Self::Catppuccin => "catppuccin",
+            Self::CatppuccinMocha => "catppuccin-mocha",
+            Self::TokyoNight => "tokyo-night",
+            Self::Nord => "nord",
             Self::Dracula => "dracula",
             Self::Gruvbox => "gruvbox",
+            Self::RosePine => "rose-pine",
+            Self::Kanagawa => "kanagawa",
+            Self::OneDark => "one-dark",
         }
     }
 
     /// 从字符串解析（忽略大小写与首尾空白）；未知值返回 `None`。
     pub fn parse(s: &str) -> Option<Self> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "default" => Some(Self::Default),
-            "catppuccin" => Some(Self::Catppuccin),
+        match s.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+            "default" | "catppuccin" | "catppuccin-mocha" => Some(Self::CatppuccinMocha),
+            "tokyo-night" | "tokyonight" => Some(Self::TokyoNight),
+            "nord" => Some(Self::Nord),
             "dracula" => Some(Self::Dracula),
-            "gruvbox" => Some(Self::Gruvbox),
+            "gruvbox" | "gruvbox-dark" => Some(Self::Gruvbox),
+            "rose-pine" | "rosepine" => Some(Self::RosePine),
+            "kanagawa" => Some(Self::Kanagawa),
+            "one-dark" | "onedark" => Some(Self::OneDark),
             _ => None,
         }
     }
@@ -100,21 +125,29 @@ impl Theme {
     /// 返回某预设的内置调色板。
     pub fn preset(p: ThemePreset) -> Self {
         match p {
-            ThemePreset::Default => Self {
-                text: Rgb(255, 255, 255),
-                correct: Rgb(0, 255, 0),
-                wrong: Rgb(255, 0, 0),
-                accent: Rgb(0, 255, 0),
-                warn: Rgb(255, 255, 0),
-                muted: Rgb(128, 128, 128),
-            },
-            ThemePreset::Catppuccin => Self {
+            ThemePreset::CatppuccinMocha => Self {
                 text: Rgb(0xcd, 0xd6, 0xf4),
                 correct: Rgb(0xa6, 0xe3, 0xa1),
                 wrong: Rgb(0xf3, 0x8b, 0xa8),
                 accent: Rgb(0x89, 0xb4, 0xfa),
                 warn: Rgb(0xf9, 0xe2, 0xaf),
                 muted: Rgb(0x6c, 0x70, 0x86),
+            },
+            ThemePreset::TokyoNight => Self {
+                text: Rgb(192, 202, 245),
+                correct: Rgb(158, 206, 106),
+                wrong: Rgb(247, 118, 142),
+                accent: Rgb(122, 162, 247),
+                warn: Rgb(224, 175, 104),
+                muted: Rgb(86, 95, 137),
+            },
+            ThemePreset::Nord => Self {
+                text: Rgb(236, 239, 244),
+                correct: Rgb(163, 190, 140),
+                wrong: Rgb(191, 97, 106),
+                accent: Rgb(136, 192, 208),
+                warn: Rgb(235, 203, 139),
+                muted: Rgb(76, 86, 106),
             },
             ThemePreset::Dracula => Self {
                 text: Rgb(0xf8, 0xf8, 0xf2),
@@ -131,6 +164,30 @@ impl Theme {
                 accent: Rgb(0x83, 0xa5, 0x98),
                 warn: Rgb(0xfa, 0xbd, 0x2f),
                 muted: Rgb(0x92, 0x83, 0x74),
+            },
+            ThemePreset::RosePine => Self {
+                text: Rgb(224, 222, 244),
+                correct: Rgb(156, 207, 216),
+                wrong: Rgb(235, 111, 146),
+                accent: Rgb(235, 188, 186),
+                warn: Rgb(246, 193, 119),
+                muted: Rgb(110, 106, 134),
+            },
+            ThemePreset::Kanagawa => Self {
+                text: Rgb(220, 215, 186),
+                correct: Rgb(118, 148, 106),
+                wrong: Rgb(195, 64, 67),
+                accent: Rgb(126, 156, 216),
+                warn: Rgb(255, 160, 102),
+                muted: Rgb(114, 113, 105),
+            },
+            ThemePreset::OneDark => Self {
+                text: Rgb(171, 178, 191),
+                correct: Rgb(152, 195, 121),
+                wrong: Rgb(224, 108, 117),
+                accent: Rgb(97, 175, 239),
+                warn: Rgb(229, 192, 123),
+                muted: Rgb(92, 99, 112),
             },
         }
     }
@@ -175,7 +232,7 @@ impl Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            theme: ThemePreset::Default,
+            theme: ThemePreset::CatppuccinMocha,
             reference_ratio: 62,
             bold: false,
             font: false,
@@ -290,7 +347,7 @@ mod tests {
 
     #[test]
     fn preset_catppuccin_rgb_exact() {
-        let t = Theme::preset(ThemePreset::Catppuccin);
+        let t = Theme::preset(ThemePreset::CatppuccinMocha);
         assert_eq!(t.text, Rgb(0xcd, 0xd6, 0xf4));
         assert_eq!(t.correct, Rgb(0xa6, 0xe3, 0xa1));
         assert_eq!(t.wrong, Rgb(0xf3, 0x8b, 0xa8));
@@ -322,12 +379,25 @@ mod tests {
     }
 
     #[test]
-    fn preset_default_keeps_original_palette() {
-        let t = Theme::preset(ThemePreset::Default);
-        assert_eq!(t.correct, Rgb(0, 255, 0));
-        assert_eq!(t.wrong, Rgb(255, 0, 0));
-        assert_eq!(t.warn, Rgb(255, 255, 0));
-        assert_eq!(t.muted, Rgb(128, 128, 128));
+    fn preset_tokyo_night_rgb_exact() {
+        let t = Theme::preset(ThemePreset::TokyoNight);
+        assert_eq!(t.text, Rgb(192, 202, 245));
+        assert_eq!(t.correct, Rgb(158, 206, 106));
+        assert_eq!(t.wrong, Rgb(247, 118, 142));
+        assert_eq!(t.accent, Rgb(122, 162, 247));
+        assert_eq!(t.warn, Rgb(224, 175, 104));
+        assert_eq!(t.muted, Rgb(86, 95, 137));
+    }
+
+    #[test]
+    fn preset_nord_rgb_exact() {
+        let t = Theme::preset(ThemePreset::Nord);
+        assert_eq!(t.text, Rgb(236, 239, 244));
+        assert_eq!(t.correct, Rgb(163, 190, 140));
+        assert_eq!(t.wrong, Rgb(191, 97, 106));
+        assert_eq!(t.accent, Rgb(136, 192, 208));
+        assert_eq!(t.warn, Rgb(235, 203, 139));
+        assert_eq!(t.muted, Rgb(76, 86, 106));
     }
 
     #[test]
@@ -337,7 +407,15 @@ mod tests {
         }
         assert_eq!(
             ThemePreset::parse("  CATPPUCCIN "),
-            Some(ThemePreset::Catppuccin)
+            Some(ThemePreset::CatppuccinMocha)
+        );
+        assert_eq!(
+            ThemePreset::parse("default"),
+            Some(ThemePreset::CatppuccinMocha)
+        );
+        assert_eq!(
+            ThemePreset::parse("TOKYO_NIGHT"),
+            Some(ThemePreset::TokyoNight)
         );
         assert_eq!(ThemePreset::parse("solarized"), None);
         assert_eq!(ThemePreset::parse(""), None);
@@ -345,16 +423,16 @@ mod tests {
 
     #[test]
     fn preset_next_and_prev_wrap_around() {
-        assert_eq!(ThemePreset::Default.next(), ThemePreset::Catppuccin);
-        assert_eq!(ThemePreset::Gruvbox.next(), ThemePreset::Default);
-        assert_eq!(ThemePreset::Default.prev(), ThemePreset::Gruvbox);
-        assert_eq!(ThemePreset::Catppuccin.prev(), ThemePreset::Default);
+        assert_eq!(ThemePreset::CatppuccinMocha.next(), ThemePreset::TokyoNight);
+        assert_eq!(ThemePreset::OneDark.next(), ThemePreset::CatppuccinMocha);
+        assert_eq!(ThemePreset::CatppuccinMocha.prev(), ThemePreset::OneDark);
+        assert_eq!(ThemePreset::TokyoNight.prev(), ThemePreset::CatppuccinMocha);
     }
 
     #[test]
     fn settings_defaults() {
         let s = Settings::default();
-        assert_eq!(s.theme, ThemePreset::Default);
+        assert_eq!(s.theme, ThemePreset::CatppuccinMocha);
         assert_eq!(s.reference_ratio, 62);
         assert!(!s.bold);
         assert!(!s.font);
@@ -468,8 +546,10 @@ mod tests {
     #[test]
     fn store_input_method_roundtrip_chinese() {
         let store = SettingsStore::new(temp_path("im_roundtrip"));
-        let mut s = Settings::default();
-        s.input_method = "空明码并击".to_string();
+        let s = Settings {
+            input_method: "空明码并击".to_string(),
+            ..Default::default()
+        };
         store.save(&s).unwrap();
         let loaded = store.load();
         assert_eq!(loaded.input_method, "空明码并击");

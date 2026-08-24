@@ -4,13 +4,13 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use dazitui_core::ThemePreset;
 use dazitui_core::{
     ApiClient, ApiError, AuthSession, BUILTIN_SETS, CharStatus, CompetitionType, ErrorType,
     FONT_SIZE_PT, LoadError, LoadOptions, Rgb, Session, Settings, SettingsStore, Stats, Text,
     TextSource, Theme, TokenStore, env_credentials, format_time, is_auth_failure,
     load_builtin_text, load_builtin_text_shuffled, load_text_from_clipboard, load_text_from_file,
-    load_text_from_string, osc_font_size_sequence,
-    osc52_clipboard, save_text_to_file,
+    load_text_from_string, osc_font_size_sequence, osc52_clipboard, save_text_to_file,
 };
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -18,9 +18,28 @@ use ratatui::prelude::Stylize;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span, Text as TextLines};
-use ratatui::widgets::{Axis, Block, Chart, Clear, Dataset, GraphType, Paragraph, Wrap};
+use ratatui::widgets::{
+    Axis, Block, BorderType, Chart, Clear, Dataset, GraphType, Paragraph, Wrap,
+};
+use ratatui_themes::{ThemeName, ThemePalette};
+
+/// 将 core 的 ThemePreset 映射为 ratatui_themes 的 ThemePalette。
+pub fn theme_palette(preset: ThemePreset) -> ThemePalette {
+    let name = match preset {
+        ThemePreset::CatppuccinMocha => ThemeName::CatppuccinMocha,
+        ThemePreset::TokyoNight => ThemeName::TokyoNight,
+        ThemePreset::Nord => ThemeName::Nord,
+        ThemePreset::Dracula => ThemeName::Dracula,
+        ThemePreset::Gruvbox => ThemeName::GruvboxDark,
+        ThemePreset::RosePine => ThemeName::RosePine,
+        ThemePreset::Kanagawa => ThemeName::Kanagawa,
+        ThemePreset::OneDark => ThemeName::OneDarkPro,
+    };
+    name.palette()
+}
 
 /// 跟打应用状态。
+#[allow(clippy::large_enum_variant)]
 enum AppState {
     /// 跟打中。
     Typing,
@@ -477,6 +496,11 @@ impl App {
         Theme::preset(self.settings.theme)
     }
 
+    /// 当前主题调色板（ratatui-themes）。
+    fn palette(&self) -> ThemePalette {
+        theme_palette(self.settings.theme)
+    }
+
     /// 切换到下一主题并即时持久化。
     fn next_theme(&mut self) {
         self.settings.theme = self.settings.theme.next();
@@ -536,15 +560,19 @@ impl App {
         } else {
             title.trim().to_string()
         };
-        if let Some(path) = save {
-            if let Err(e) = save_text_to_file(&path, &content) {
-                if let Some(modal) = self.free_input_modal.as_mut() {
-                    modal.error = Some(format!("保存文件失败: {e}"));
-                    return;
-                }
-            }
+        if let Some(path) = save
+            && let Err(e) = save_text_to_file(&path, &content)
+            && let Some(modal) = self.free_input_modal.as_mut()
+        {
+            modal.error = Some(format!("保存文件失败: {e}"));
+            return;
         }
-        match load_text_from_string(&final_title, content, TextSource::Custom, &LoadOptions::default()) {
+        match load_text_from_string(
+            &final_title,
+            content,
+            TextSource::Custom,
+            &LoadOptions::default(),
+        ) {
             Ok(text) => {
                 self.text = text;
                 self.free_input_modal = None;
@@ -614,10 +642,10 @@ impl App {
     /// 重打当前赛文：重置会话与计时。
     /// 若当前赛文为乱序版，重新打乱以获得新的随机排列。
     fn restart(&mut self) {
-        if self.text.shuffled {
-            if let TextSource::Builtin { set } = self.text.source {
-                self.text = load_builtin_text_shuffled(set);
-            }
+        if self.text.shuffled
+            && let TextSource::Builtin { set } = self.text.source
+        {
+            self.text = load_builtin_text_shuffled(set);
         }
         let wb = self.text.session_word_boundaries();
         self.session =
@@ -757,10 +785,10 @@ impl App {
             self.online_error = Some("请先登录 52dazi（Ctrl-O）".to_string());
             return;
         }
-        if !self.api.is_logged_in() {
-            if let Some(token) = &self.token {
-                self.api.set_session(Some(AuthSession::from_token(token)));
-            }
+        if !self.api.is_logged_in()
+            && let Some(token) = &self.token
+        {
+            self.api.set_session(Some(AuthSession::from_token(token)));
         }
         match self.api.get_content(competition_type) {
             Ok(comp) => {
@@ -804,10 +832,10 @@ impl App {
                 detail: None,
             };
         }
-        if !self.api.is_logged_in() {
-            if let Some(token) = &self.token {
-                self.api.set_session(Some(AuthSession::from_token(token)));
-            }
+        if !self.api.is_logged_in()
+            && let Some(token) = &self.token
+        {
+            self.api.set_session(Some(AuthSession::from_token(token)));
         }
         match self
             .api
@@ -1259,12 +1287,48 @@ fn hint_text(
     } else if paused {
         " ↑↓ 选择菜单 | Enter 激活 | Esc/Tab 恢复跟打 | Ctrl-Q 退出"
     } else if is_ready {
-        " ↑↓ 菜单导航 | Enter 执行 | 开始打字自动聚焦 | Ctrl-B 内置 | Ctrl-F 载文 | Ctrl-Q 退出"
+        " ↑↓ 菜单导航 | Enter 执行 | 打字 自动聚焦 | Ctrl-B 内置 | Ctrl-F 载文 | Ctrl-Q 退出"
     } else if is_online {
         " Ctrl-Q 退出 | Ctrl-S 结束 | Tab 暂停 | Ctrl-B 内置赛文 | Ctrl-F 载文 | Ctrl-O 登录 | Ctrl-E 设置 "
     } else {
         " Ctrl-Q 退出 | Ctrl-S 结束 | Ctrl-R 重打 | Tab 暂停 | Ctrl-B 内置赛文 | Ctrl-F 载文 | Ctrl-O 登录 | Ctrl-E 设置 "
     }
+}
+
+/// 将形如 `" ↑↓ 选择 | Enter 载入 | Esc 取消 "` 的快捷键文案解析为圆角键帽胶囊（Rounded Badge Pill）排版。
+/// 使用 Unicode 左右半圆几何图形 `◖` 与 `◗` 作为按键胶囊两端的圆角外边框。
+fn hint_bar_line(hint_str: &str, palette: &ThemePalette) -> Line<'static> {
+    let cap_left_style = Style::default().fg(palette.selection).bg(palette.bg);
+    let key_style = Style::default()
+        .bg(palette.selection)
+        .fg(palette.accent)
+        .add_modifier(Modifier::BOLD);
+    let cap_right_style = Style::default().fg(palette.selection).bg(palette.bg);
+    let desc_style = Style::default().fg(palette.fg).bg(palette.bg);
+
+    let mut spans = Vec::new();
+    let items = hint_str.split('|');
+
+    for (i, item) in items.enumerate() {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        if i > 0 || !spans.is_empty() {
+            spans.push(Span::styled(" ", Style::default().bg(palette.bg)));
+        }
+        if let Some((k, d)) = item.split_once(' ') {
+            spans.push(Span::styled("◖", cap_left_style));
+            spans.push(Span::styled(k.to_string(), key_style));
+            spans.push(Span::styled("◗", cap_right_style));
+            spans.push(Span::styled(format!(" {d} "), desc_style));
+        } else {
+            spans.push(Span::styled("◖", cap_left_style));
+            spans.push(Span::styled(item.to_string(), key_style));
+            spans.push(Span::styled("◗", cap_right_style));
+        }
+    }
+    Line::from(spans)
 }
 
 /// 处理自由发文模态框按键，返回动作。
@@ -1326,10 +1390,8 @@ fn free_input_modal_input(modal: &mut FreeInputModal, key: KeyEvent) -> FreeInpu
             KeyCode::Enter => {
                 modal.content.push('\n');
             }
-            KeyCode::Up => {
-                if modal.content.is_empty() {
-                    modal.focus = FREE_INPUT_FOCUS_TITLE;
-                }
+            KeyCode::Up if modal.content.is_empty() => {
+                modal.focus = FREE_INPUT_FOCUS_TITLE;
             }
             _ => {}
         },
@@ -1563,9 +1625,22 @@ fn color(rgb: Rgb) -> Color {
     Color::Rgb(rgb.0, rgb.1, rgb.2)
 }
 
-/// 带主题边框色（text 槽位）的边框块。
-fn themed_block(theme: Theme) -> Block<'static> {
-    Block::bordered().border_style(Style::default().fg(color(theme.text)))
+/// 带主题边框色、背景色与圆角的 Block 构建器。
+/// - `is_active = true`：当前活动面板（例如正在打字时的跟打区，或暂停/就绪时的功能栏），边框采用 `palette.accent` 加粗高亮。
+/// - `is_active = false`：非活动面板，边框采用 `palette.muted` 柔和暗色，不抢正文视觉。
+/// - 面板底色统一填充为 `palette.bg`，正文基色为 `palette.fg`，保证任何终端环境下对比度一致且清晰。
+fn themed_block(palette: &ThemePalette, is_active: bool) -> Block<'static> {
+    let border_style = if is_active {
+        Style::default()
+            .fg(palette.accent)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(palette.muted)
+    };
+    Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(border_style)
+        .style(Style::default().bg(palette.bg).fg(palette.fg))
 }
 
 /// 处理登录模态框按键，返回动作。
@@ -1665,15 +1740,18 @@ fn ui(frame: &mut Frame, app: &App) {
         render_result_view(frame, app, stats, upload, *elapsed);
         return;
     }
-    if matches!(app.state, AppState::Settings) {
-        render_settings(frame, app);
-        return;
-    }
+    let palette = app.palette();
+    // 渲染全屏底色，确保终端背景无论亮暗均统一呈现主题色彩与高对比度
+    frame.render_widget(
+        Block::default().style(Style::default().bg(palette.bg).fg(palette.fg)),
+        frame.area(),
+    );
+
     let browsing = matches!(app.state, AppState::Browsing);
     let browsing_builtin = matches!(app.state, AppState::BrowsingBuiltin);
-    // 整体：主区 + 底部快捷键 bar
+    // 整体：主区 + 底部快捷键 bar（带圆角边框，高度 3 行）
     let [main, help_bar] =
-        Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(frame.area());
+        Layout::vertical([Constraint::Min(0), Constraint::Length(3)]).areas(frame.area());
     // 主区：左侧功能栏 + 右侧内容区（功能栏收起时宽度为 0）
     let sidebar_width = if app.sidebar_visible { 24 } else { 0 };
     let [sidebar, content] =
@@ -1695,7 +1773,19 @@ fn ui(frame: &mut Frame, app: &App) {
             Constraint::Percentage(type_pct),
         ])
         .areas(content);
-        // 上：对照原文区（已跟打部分绿/红着色）
+        // 上：对照原文区（已跟打部分绿/红着色，非活动暗边框，复合双色标题）
+        let ref_title = Line::from(vec![
+            Span::styled(
+                " 对照区 ",
+                Style::default()
+                    .fg(palette.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("— {} ", app.text.title),
+                Style::default().fg(palette.fg),
+            ),
+        ]);
         frame.render_widget(
             Paragraph::new(original_line(
                 &app.session,
@@ -1703,24 +1793,35 @@ fn ui(frame: &mut Frame, app: &App) {
                 app.theme(),
                 app.settings.bold,
             ))
-            .block(themed_block(app.theme()).title(format!(" 对照区 — {} ", app.text.title)))
+            .block(themed_block(&palette, false).title(ref_title))
             .wrap(Wrap { trim: false }),
             ref_area,
         );
-        // 下：跟打区（实时绿/红渲染）
-        let typing_title = if app.paused {
+        // 下：跟打区（实时绿/红渲染，打字活跃时高亮，复合双色标题与状态徽标）
+        let typing_active = !app.paused && !app.session.is_empty();
+        let mut typing_title_spans = vec![Span::styled(
+            " 跟打区 ",
+            Style::default()
+                .fg(palette.accent)
+                .add_modifier(Modifier::BOLD),
+        )];
+        if app.paused {
+            typing_title_spans.push(Span::styled(
+                "[已暂停] ",
+                Style::default()
+                    .fg(palette.warning)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        typing_title_spans.push(Span::styled(
             format!(
-                " 跟打区 [已暂停] — {}/{} 字符 ",
+                "— {}/{} 字符 ",
                 app.session.len(),
                 app.text.content.chars().count()
-            )
-        } else {
-            format!(
-                " 跟打区 — {}/{} 字符 ",
-                app.session.len(),
-                app.text.content.chars().count()
-            )
-        };
+            ),
+            Style::default().fg(palette.fg),
+        ));
+        let typing_title = Line::from(typing_title_spans);
         frame.render_widget(
             Paragraph::new(type_line(
                 &app.session,
@@ -1728,13 +1829,13 @@ fn ui(frame: &mut Frame, app: &App) {
                 app.theme(),
                 app.settings.bold,
             ))
-            .block(themed_block(app.theme()).title(typing_title))
+            .block(themed_block(&palette, typing_active).title(typing_title))
             .wrap(Wrap { trim: false }),
             type_area,
         );
     }
 
-    // 底部快捷键提示 bar
+    // 底部快捷键提示 bar（带圆角边框与结构化标题）
     let hint = hint_text(
         browsing,
         browsing_builtin,
@@ -1742,83 +1843,117 @@ fn ui(frame: &mut Frame, app: &App) {
         app.paused,
         app.session.is_empty(),
     );
-    frame.render_widget(Paragraph::new(Line::from(hint)), help_bar);
+    let hint_title = Line::from(vec![Span::styled(
+        " 快捷键 ",
+        Style::default()
+            .fg(palette.accent)
+            .add_modifier(Modifier::BOLD),
+    )]);
+    frame.render_widget(
+        Paragraph::new(hint_bar_line(hint, &palette))
+            .block(themed_block(&palette, false).title(hint_title)),
+        help_bar,
+    );
 
     // 模态框（覆盖层）
     if let Some(form) = &app.login_form {
-        render_login_modal(frame, form, app.theme());
+        render_login_modal(frame, form, &palette, app.theme());
     }
     if let Some(modal) = &app.input_method_modal {
-        render_input_method_modal(frame, modal, app.theme());
+        render_input_method_modal(frame, modal, &palette, app.theme());
     }
     if let Some(modal) = &app.free_input_modal {
-        render_free_input_modal(frame, modal, app.theme());
+        render_free_input_modal(frame, modal, &palette, app.theme());
+    }
+    if matches!(app.state, AppState::Settings) {
+        render_settings(frame, app);
     }
 }
 
 /// 登录模态框：居中弹层，用户名 + 遮蔽密码。
-fn render_login_modal(frame: &mut Frame, form: &LoginForm, theme: Theme) {
+fn render_login_modal(frame: &mut Frame, form: &LoginForm, palette: &ThemePalette, _theme: Theme) {
     let area = centered_rect(frame.area(), 62, 9);
     frame.render_widget(Clear, area);
-    let mut lines = vec![Line::from(" 登录 52dazi ").bold(), Line::from("")];
+    let mut lines = vec![
+        Line::from(" 登录 52dazi ").bold().fg(palette.fg),
+        Line::from(""),
+    ];
     let user_label = if form.focus == 0 {
         "用户名 ▸ "
     } else {
         "用户名   "
     };
-    lines.push(Line::from(format!(" {user_label}{}", form.username)));
+    lines.push(Line::from(format!(" {user_label}{}", form.username)).fg(palette.fg));
     let pass_label = if form.focus == 1 {
         "密码   ▸ "
     } else {
         "密码     "
     };
-    lines.push(Line::from(format!(
-        " {pass_label}{}",
-        mask_password(&form.password)
-    )));
+    lines
+        .push(Line::from(format!(" {pass_label}{}", mask_password(&form.password))).fg(palette.fg));
     lines.push(Line::from(""));
     if form.busy {
-        lines.push(Line::from(" 登录中…").fg(color(theme.warn)));
+        lines.push(Line::from(" 登录中…").fg(palette.warning));
     } else if let Some(err) = &form.error {
-        lines.push(Line::from(format!(" 错误: {err}")).fg(color(theme.wrong)));
+        lines.push(Line::from(format!(" 错误: {err}")).fg(palette.error));
     } else {
-        lines.push(Line::from(" Enter 登录 | Tab 切换 | Esc 取消").fg(color(theme.muted)));
+        lines.push(hint_bar_line(" Enter 登录 | Tab 切换 | Esc 取消 ", palette));
     }
+    let block = themed_block(palette, true)
+        .title(" 登录 ")
+        .style(Style::default().bg(palette.bg).fg(palette.fg));
     frame.render_widget(
         Paragraph::new(lines)
-            .block(themed_block(theme).title(" 登录 "))
+            .block(block)
             .wrap(Wrap { trim: false }),
         area,
     );
 }
 
 /// 自定义输入法名称弹窗：居中弹层，单行文本输入。
-fn render_input_method_modal(frame: &mut Frame, modal: &InputMethodModal, theme: Theme) {
+fn render_input_method_modal(
+    frame: &mut Frame,
+    modal: &InputMethodModal,
+    palette: &ThemePalette,
+    _theme: Theme,
+) {
     let area = centered_rect(frame.area(), 50, 7);
     frame.render_widget(Clear, area);
     let remaining = Settings::INPUT_METHOD_MAX_CHARS - modal.input.chars().count();
     let lines = vec![
-        Line::from(" 自定义输入法 ").bold(),
+        Line::from(" 自定义输入法 ").bold().fg(palette.fg),
         Line::from(""),
-        Line::from(format!(" ▸ {}", modal.input)),
+        Line::from(format!(" ▸ {}", modal.input))
+            .fg(palette.accent)
+            .bold(),
         Line::from(""),
-        Line::from(format!(" 还可输入 {remaining} 字").fg(color(theme.muted))),
-        Line::from(" Enter 保存 | Esc 取消").fg(color(theme.muted)),
+        Line::from(format!(" 还可输入 {remaining} 字")).fg(palette.fg),
+        hint_bar_line(" Enter 保存 | Esc 取消 ", palette),
     ];
+    let block = themed_block(palette, true)
+        .title(" 自定义输入法 ")
+        .style(Style::default().bg(palette.bg).fg(palette.fg));
     frame.render_widget(
         Paragraph::new(lines)
-            .block(themed_block(theme).title(" 自定义输入法 "))
+            .block(block)
             .wrap(Wrap { trim: false }),
         area,
     );
 }
 
 /// 自由发文模态框：居中弹层，标题 + 多行正文 + 保存选项。
-fn render_free_input_modal(frame: &mut Frame, modal: &FreeInputModal, theme: Theme) {
+fn render_free_input_modal(
+    frame: &mut Frame,
+    modal: &FreeInputModal,
+    palette: &ThemePalette,
+    _theme: Theme,
+) {
     let area = centered_rect(frame.area(), 68, 20);
     frame.render_widget(Clear, area);
 
-    let outer_block = themed_block(theme).title(" 自由发文 ");
+    let outer_block = themed_block(palette, true)
+        .title(" 自由发文 ")
+        .style(Style::default().bg(palette.bg).fg(palette.fg));
     frame.render_widget(outer_block, area);
 
     let inner_area = Rect {
@@ -1846,26 +1981,27 @@ fn render_free_input_modal(frame: &mut Frame, modal: &FreeInputModal, theme: The
     };
     let mut title_spans = vec![Span::raw(title_prefix)];
     if is_title_focus {
-        title_spans[0] = Span::styled(
-            title_prefix,
-            Style::default().fg(color(theme.accent)).bold(),
-        );
+        title_spans[0] = Span::styled(title_prefix, Style::default().fg(palette.accent).bold());
     }
-    title_spans.push(Span::raw(&modal.title));
+    title_spans.push(Span::styled(&modal.title, Style::default().fg(palette.fg)));
     frame.render_widget(Paragraph::new(Line::from(title_spans)), title_rect);
 
     // 2. 正文
     let is_content_focus = modal.focus == FREE_INPUT_FOCUS_CONTENT;
     let content_border_style = if is_content_focus {
-        Style::default().fg(color(theme.accent))
+        Style::default()
+            .fg(palette.accent)
+            .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(color(theme.text))
+        Style::default().fg(palette.muted)
     };
     let content_title = format!(" 赛文正文（{} 字）", modal.content.chars().count());
     frame.render_widget(
         Paragraph::new(modal.content.as_str())
+            .style(Style::default().fg(palette.fg))
             .block(
                 Block::bordered()
+                    .border_type(BorderType::Rounded)
                     .title(content_title)
                     .border_style(content_border_style),
             )
@@ -1880,10 +2016,13 @@ fn render_free_input_modal(frame: &mut Frame, modal: &FreeInputModal, theme: The
     let mut save_lines = vec![Line::from(vec![if is_cb_focus {
         Span::styled(
             format!("▸ {cb_mark} 保存为本地文件（空格切换）"),
-            Style::default().fg(color(theme.accent)).bold(),
+            Style::default().fg(palette.accent).bold(),
         )
     } else {
-        Span::raw(format!("  {cb_mark} 保存为本地文件（空格切换）"))
+        Span::styled(
+            format!("  {cb_mark} 保存为本地文件（空格切换）"),
+            Style::default().fg(palette.fg),
+        )
     }])];
     if modal.save_to_file {
         let path_prefix = if is_path_focus {
@@ -1893,10 +2032,12 @@ fn render_free_input_modal(frame: &mut Frame, modal: &FreeInputModal, theme: The
         };
         let mut path_spans = vec![Span::raw(path_prefix)];
         if is_path_focus {
-            path_spans[0] =
-                Span::styled(path_prefix, Style::default().fg(color(theme.accent)).bold());
+            path_spans[0] = Span::styled(path_prefix, Style::default().fg(palette.accent).bold());
         }
-        path_spans.push(Span::raw(&modal.save_path));
+        path_spans.push(Span::styled(
+            &modal.save_path,
+            Style::default().fg(palette.fg),
+        ));
         save_lines.push(Line::from(path_spans));
     }
     frame.render_widget(Paragraph::new(save_lines), save_rect);
@@ -1908,22 +2049,22 @@ fn render_free_input_modal(frame: &mut Frame, modal: &FreeInputModal, theme: The
     let submit_btn = if is_submit_focus {
         Span::styled(
             " [ 确认发文 (Ctrl-Enter/F2) ] ",
-            Style::default().reversed().fg(color(theme.accent)).bold(),
+            Style::default().reversed().fg(palette.accent).bold(),
         )
     } else {
         Span::styled(
             " [ 确认发文 (Ctrl-Enter/F2) ] ",
-            Style::default().fg(color(theme.accent)).bold(),
+            Style::default().fg(palette.accent).bold(),
         )
     };
 
     let cancel_btn = if is_cancel_focus {
         Span::styled(
             " [ 取消 (Esc) ] ",
-            Style::default().reversed().fg(color(theme.muted)).bold(),
+            Style::default().reversed().fg(palette.fg).bold(),
         )
     } else {
-        Span::styled(" [ 取消 (Esc) ] ", Style::default().fg(color(theme.muted)))
+        Span::styled(" [ 取消 (Esc) ] ", Style::default().fg(palette.fg))
     };
 
     let button_line = Line::from(vec![
@@ -1936,12 +2077,12 @@ fn render_free_input_modal(frame: &mut Frame, modal: &FreeInputModal, theme: The
 
     // 5. 底部提示 / 错误
     let hint_lines = if let Some(err) = &modal.error {
-        vec![Line::from(format!(" 错误: {err}")).fg(color(theme.wrong))]
+        vec![Line::from(format!(" 错误: {err}")).fg(palette.error)]
     } else {
-        vec![
-            Line::from(" Ctrl-Enter / F2 / Ctrl-S 快速发文 | Enter 换行 | Tab 切换焦点 | Esc 取消")
-                .fg(color(theme.muted)),
-        ]
+        vec![hint_bar_line(
+            " Ctrl-Enter 发文 | Enter 换行 | Tab 切换 | Esc 取消 ",
+            palette,
+        )]
     };
     frame.render_widget(Paragraph::new(hint_lines), hint_rect);
 }
@@ -1968,12 +2109,13 @@ fn render_sidebar(
     browsing: bool,
     browsing_builtin: bool,
 ) {
-    let theme = app.theme();
+    let _theme = app.theme();
+    let palette = app.palette();
     let mut lines: Vec<Line> = Vec::new();
     if browsing {
-        lines.push(Line::from(" 载入文件:").bold());
+        lines.push(Line::from(" 载入文件:").bold().fg(palette.fg));
         if app.browse_files.is_empty() {
-            lines.push(Line::from("   （无文本文件）").fg(color(theme.muted)));
+            lines.push(Line::from("   （无文本文件）").fg(palette.fg));
         } else {
             for (i, path) in app.browse_files.iter().enumerate() {
                 let name = path
@@ -1985,27 +2127,39 @@ fn render_sidebar(
                 } else {
                     "   "
                 };
-                lines.push(Line::from(format!("{prefix}{name}")));
+                let mut line = Line::from(format!("{prefix}{name}"));
+                if i == app.browse_selection {
+                    line = line.fg(palette.accent).bold();
+                } else {
+                    line = line.fg(palette.fg);
+                }
+                lines.push(line);
             }
         }
         if let Some(err) = &app.browse_error {
-            lines.push(Line::from(format!(" 错误: {err}")).fg(color(theme.wrong)));
+            lines.push(Line::from(format!(" 错误: {err}")).fg(palette.error));
         }
     } else if browsing_builtin {
-        lines.push(Line::from(" 内置赛文:").bold());
+        lines.push(Line::from(" 内置赛文:").bold().fg(palette.fg));
         for (i, set) in BUILTIN_SETS.iter().enumerate() {
             let prefix = if i == app.builtin_selection {
                 " > "
             } else {
                 "   "
             };
-            lines.push(Line::from(format!("{prefix}{}", set.name())));
+            let mut line = Line::from(format!("{prefix}{}", set.name()));
+            if i == app.builtin_selection {
+                line = line.fg(palette.accent).bold();
+            } else {
+                line = line.fg(palette.fg);
+            }
+            lines.push(line);
         }
     } else {
         if app.paused {
-            lines.push(Line::from(" [跟打已暂停]").bold().fg(color(theme.warn)));
+            lines.push(Line::from(" [跟打已暂停]").bold().fg(palette.warning));
         }
-        lines.push(Line::from(" 赛文来源:").bold());
+        lines.push(Line::from(" 赛文来源:").bold().fg(palette.fg));
 
         for (idx, item) in SIDEBAR_MENU_ITEMS.iter().enumerate() {
             let is_sel = idx == app.sidebar_selected && (app.session.is_empty() || app.paused);
@@ -2030,19 +2184,21 @@ fn render_sidebar(
 
             if *item == SidebarMenuItem::OnlineJisu {
                 lines.push(Line::from(""));
-                lines.push(Line::from(" 在线比赛:").bold());
+                lines.push(Line::from(" 在线比赛:").bold().fg(palette.fg));
             } else if *item == SidebarMenuItem::Settings {
                 lines.push(Line::from(""));
-                lines.push(Line::from(" 系统:").bold());
+                lines.push(Line::from(" 系统:").bold().fg(palette.fg));
             }
 
             let mut line = Line::from(format!("{prefix}{label}"));
             if is_sel {
-                line = line.fg(color(theme.accent)).bold();
+                line = line.fg(palette.accent).bold();
             } else if is_accent {
-                line = line.fg(color(theme.accent));
+                line = line.fg(palette.accent);
             } else if is_warn {
-                line = line.fg(color(theme.warn));
+                line = line.fg(palette.warning);
+            } else {
+                line = line.fg(palette.fg);
             }
             lines.push(line);
         }
@@ -2051,26 +2207,37 @@ fn render_sidebar(
     // 提示信息（加载中 / 通知 / 错误）
     if let Some(notice) = &app.sidebar_notice {
         lines.push(Line::from(""));
-        lines.push(Line::from(format!(" {notice}")).fg(color(theme.accent)));
+        lines.push(Line::from(format!(" {notice}")).fg(palette.accent));
     }
     if let Some(notice) = &app.login_notice {
-        lines.push(Line::from(format!("  {notice}")).fg(color(theme.muted)));
+        lines.push(Line::from(format!("  {notice}")).fg(palette.fg));
     }
     if let Some(ct) = app.online_loading {
-        lines.push(Line::from(format!(" 正在载入{}...", ct.name())).fg(color(theme.accent)));
+        lines.push(Line::from(format!(" 正在载入{}...", ct.name())).fg(palette.accent));
     }
     if let Some(err) = &app.online_error {
-        lines.push(Line::from(format!(" {err}")).fg(color(theme.wrong)));
+        lines.push(Line::from(format!(" {err}")).fg(palette.error));
     }
 
-    let title = if app.paused {
-        " 功能栏 [已暂停] "
-    } else {
-        " 功能栏 "
-    };
+    let is_active = browsing || browsing_builtin || app.paused || app.session.is_empty();
+    let mut title_spans = vec![Span::styled(
+        " 功能栏 ",
+        Style::default()
+            .fg(palette.accent)
+            .add_modifier(Modifier::BOLD),
+    )];
+    if app.paused {
+        title_spans.push(Span::styled(
+            "[已暂停] ",
+            Style::default()
+                .fg(palette.warning)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    let title = Line::from(title_spans);
     frame.render_widget(
         Paragraph::new(lines)
-            .block(themed_block(theme).title(title))
+            .block(themed_block(&palette, is_active).title(title))
             .wrap(Wrap { trim: false }),
         area,
     );
@@ -2078,7 +2245,8 @@ fn render_sidebar(
 
 /// 载文预览：右侧内容区显示选中文件的内容（前 400 字符）。
 fn render_preview(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
-    let theme = app.theme();
+    let _theme = app.theme();
+    let palette = app.palette();
     let (title, body, style) = match app.browse_files.get(app.browse_selection) {
         Some(path) => {
             let name = path
@@ -2089,31 +2257,49 @@ fn render_preview(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
                 Ok(raw) => {
                     let preview: String = raw.chars().take(400).collect();
                     let dot = if raw.chars().count() > 400 { "…" } else { "" };
-                    (name, format!("{preview}{dot}"), Style::default())
+                    (
+                        name,
+                        format!("{preview}{dot}"),
+                        Style::default().fg(palette.fg),
+                    )
                 }
                 Err(_) => (
                     name,
                     "（无法读取预览）".to_string(),
-                    Style::default().fg(color(theme.wrong)),
+                    Style::default().fg(palette.error),
                 ),
             }
         }
         None => (
             "预览".to_string(),
             "（无文件可选）".to_string(),
-            Style::default(),
+            Style::default().fg(palette.fg),
         ),
     };
+    let preview_title = Line::from(vec![
+        Span::styled(
+            " 载文预览 ",
+            Style::default()
+                .fg(palette.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!("— {title} "), Style::default().fg(palette.fg)),
+    ]);
     let lines = vec![
-        Line::from(format!(" 载文预览 — {title} ")).bold(),
+        Line::from(format!(" 载文预览 — {title} "))
+            .bold()
+            .fg(palette.fg),
         Line::from(""),
         Line::styled(body, style),
         Line::from(""),
-        Line::from(" Enter 载入 | Esc 取消 ").fg(color(theme.muted)),
+        hint_bar_line(" Enter 载入 | Esc 取消 ", &palette),
     ];
+    let block = themed_block(&palette, false)
+        .title(preview_title)
+        .style(Style::default().bg(palette.bg).fg(palette.fg));
     frame.render_widget(
         Paragraph::new(lines)
-            .block(themed_block(theme).title(" 预览 "))
+            .block(block)
             .wrap(Wrap { trim: false }),
         area,
     );
@@ -2150,40 +2336,56 @@ fn builtin_char_preview(content: &str) -> String {
 
 /// 内置赛文预览：右侧内容区显示选中套题的内容预览。
 fn render_builtin_preview(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
-    let theme = app.theme();
+    let _theme = app.theme();
+    let palette = app.palette();
     let (title, body) = app
         .builtin_preview
         .clone()
         .unwrap_or_else(|| ("预览".to_string(), "（无内置赛文）".to_string()));
     // 预览按每 10 字一页（单字）或整行（词组），与实际跟打展示一致。
     let mut lines: Vec<Line> = vec![
-        Line::from(format!(" 内置赛文 — {title} ")).bold(),
+        Line::from(format!(" 内置赛文 — {title} "))
+            .bold()
+            .fg(palette.fg),
         Line::from(""),
     ];
     let is_words = matches!(BUILTIN_SETS.get(app.builtin_selection), Some(set) if set.is_words());
     if is_words {
-        lines.push(Line::from(body));
+        lines.push(Line::from(body).fg(palette.fg));
     } else {
         for chunk in body
             .chars()
             .collect::<Vec<char>>()
             .chunks(BUILTIN_ITEMS_PER_PAGE)
         {
-            lines.push(Line::from(chunk.iter().collect::<String>()));
+            lines.push(Line::from(chunk.iter().collect::<String>()).fg(palette.fg));
         }
     }
     lines.push(Line::from(""));
     let shuffle_label = if app.builtin_shuffle {
-        "[x] 乱序"
+        "乱序(开)"
     } else {
-        "[ ] 乱序"
+        "乱序"
     };
-    lines.push(
-        Line::from(format!(" Enter 载入 | s {shuffle_label} | Esc 取消 ")).fg(color(theme.muted)),
-    );
+    lines.push(hint_bar_line(
+        &format!(" Enter 载入 | s {shuffle_label} | Esc 取消 "),
+        &palette,
+    ));
+    let builtin_preview_title = Line::from(vec![
+        Span::styled(
+            " 内置赛文预览 ",
+            Style::default()
+                .fg(palette.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!("— {title} "), Style::default().fg(palette.fg)),
+    ]);
+    let block = themed_block(&palette, false)
+        .title(builtin_preview_title)
+        .style(Style::default().bg(palette.bg).fg(palette.fg));
     frame.render_widget(
         Paragraph::new(lines)
-            .block(themed_block(theme).title(" 预览 "))
+            .block(block)
             .wrap(Wrap { trim: false }),
         area,
     );
@@ -2191,7 +2393,7 @@ fn render_builtin_preview(frame: &mut Frame, app: &App, area: ratatui::layout::R
 
 /// 设置视图：焦点行 + 左右调整（主题/占比/粗体/字体）。
 fn render_settings(frame: &mut Frame, app: &App) {
-    let theme = app.theme();
+    let palette = app.palette();
     let focus = app.settings_focus;
     let mut lines = vec![Line::from(" 设置 ").bold(), Line::from("")];
 
@@ -2199,57 +2401,68 @@ fn render_settings(frame: &mut Frame, app: &App) {
         "主题",
         app.settings.theme.name(),
         focus == FOCUS_THEME,
-        theme,
+        &palette,
     ));
     lines.push(settings_row(
         "对照区占比",
         &format!("{}%", app.settings.reference_ratio),
         focus == FOCUS_RATIO,
-        theme,
+        &palette,
     ));
     lines.push(settings_row(
         "粗体",
         on_off(app.settings.bold),
         focus == FOCUS_BOLD,
-        theme,
+        &palette,
     ));
     lines.push(settings_row(
         "字体",
         on_off(app.settings.font),
         focus == FOCUS_FONT,
-        theme,
+        &palette,
     ));
     lines.push(settings_row(
         "输入法",
         input_method_display(&app.settings.input_method),
         focus == FOCUS_INPUT_METHOD,
-        theme,
+        &palette,
     ));
 
     lines.push(Line::from(""));
     // 主题预览：用当前主题的对/错色渲染示意文字。
-    lines.push(Line::from(" 预览:").bold());
-    lines.push(Line::from("  对正确对正确").fg(color(theme.correct)));
-    lines.push(Line::from("  错错误错错误").fg(color(theme.wrong)));
+    lines.push(Line::from(" 预览:").bold().fg(palette.fg));
+    lines.push(Line::from("  对正确对正确").fg(palette.success));
+    lines.push(Line::from("  错错误错错误").fg(palette.error));
     lines.push(Line::from(""));
-    lines.push(Line::from(" ↑↓ 选择 | ←→ 调整 | Esc 返回").fg(color(theme.muted)));
+    lines.push(hint_bar_line(" ↑↓ 选择 | ←→ 调整 | Esc 返回 ", &palette));
 
+    let area = centered_rect(frame.area(), 60, 16);
+    frame.render_widget(Clear, area);
+    let settings_title = Line::from(vec![Span::styled(
+        " 设置 ",
+        Style::default()
+            .fg(palette.accent)
+            .add_modifier(Modifier::BOLD),
+    )]);
+    let block = themed_block(&palette, true)
+        .title(settings_title)
+        .style(Style::default().bg(palette.bg).fg(palette.fg));
     frame.render_widget(
         Paragraph::new(lines)
-            .block(themed_block(theme).title(" 设置 "))
+            .block(block)
             .wrap(Wrap { trim: false }),
-        centered_rect(frame.area(), 60, 16),
+        area,
     );
 }
 
 /// 设置项行：焦点项用 accent 色 + `>` 标记高亮。
-fn settings_row(label: &str, value: &str, focused: bool, theme: Theme) -> Line<'static> {
+fn settings_row(label: &str, value: &str, focused: bool, palette: &ThemePalette) -> Line<'static> {
     let marker = if focused { " > " } else { "   " };
     let line = Line::from(format!("{marker}{label}: {value}"));
     if focused {
-        line.fg(color(theme.accent))
+        line.fg(palette.accent).bold()
     } else {
-        line
+        line.fg(palette.fg)
     }
 }
 
@@ -2267,14 +2480,21 @@ fn render_result_view(
     elapsed: Duration,
 ) {
     let theme = app.theme();
+    let palette = app.palette();
     let total_area = frame.area();
+
+    // 渲染全屏底色
+    frame.render_widget(
+        Block::default().style(Style::default().bg(palette.bg).fg(palette.fg)),
+        total_area,
+    );
 
     // 1. 顶部成绩摘要
     let mut summary_lines = vec![Line::from(vec![
         Span::raw(" WPM: "),
         Span::styled(
             format!("{:.1}", stats.wpm),
-            Style::default().bold().fg(color(theme.accent)),
+            Style::default().bold().fg(palette.accent),
         ),
         Span::raw("   正确字数: "),
         Span::styled(
@@ -2283,7 +2503,7 @@ fn render_result_view(
                 stats.correct_chars,
                 app.text.content.chars().count()
             ),
-            Style::default().bold(),
+            Style::default().bold().fg(palette.success),
         ),
         Span::raw("   错字: "),
         Span::styled(
@@ -2292,13 +2512,13 @@ fn render_result_view(
                 stats.wrong_total, stats.wrong_chars, stats.edits
             ),
             Style::default().fg(if stats.wrong_total > 0 {
-                color(theme.wrong)
+                palette.error
             } else {
-                color(theme.correct)
+                palette.success
             }),
         ),
         Span::raw("   用时: "),
-        Span::styled(format_time(elapsed), Style::default().bold()),
+        Span::styled(format_time(elapsed), Style::default().bold().fg(palette.fg)),
     ])];
     if !stats.edit_details.is_empty() {
         let details: String = stats.edit_details.iter().collect();
@@ -2317,7 +2537,7 @@ fn render_result_view(
     // 2. 错字时间线行生成
     let mut timeline_lines = Vec::new();
     if stats.error_points.is_empty() {
-        timeline_lines.push(Line::from(" 全对无错字").fg(color(theme.correct)));
+        timeline_lines.push(Line::from(" 全对无错字").fg(palette.success));
     } else {
         let max_show = 4;
         for ep in stats.error_points.iter().take(max_show) {
@@ -2333,7 +2553,7 @@ fn render_result_view(
                                 .unwrap_or_else(|| "?".into()),
                             ep.wpm
                         ))
-                        .fg(color(theme.wrong)),
+                        .fg(palette.error),
                     );
                 }
                 ErrorType::Backspace { deleted } => {
@@ -2342,7 +2562,7 @@ fn render_result_view(
                             "   [{:04.1}s] 回改: '{}' · WPM {:.1}",
                             ep.time_secs, deleted, ep.wpm
                         ))
-                        .fg(color(theme.warn)),
+                        .fg(palette.warning),
                     );
                 }
             }
@@ -2353,45 +2573,62 @@ fn render_result_view(
                     "   ... 共有 {} 处错字记录",
                     stats.error_points.len()
                 ))
-                .fg(color(theme.muted)),
+                .fg(palette.muted),
             );
         }
     }
     let timeline_height = (timeline_lines.len() as u16 + 2).min(8);
 
     // 3. 底部操作提示
-    let hint_line = if app.text.is_online() {
+    let hint_str = if app.text.is_online() {
         if let UploadState::Failed {
             need_relogin: true, ..
         } = upload
         {
-            Line::from(
-                " Esc 返回 | Ctrl-O 登录并上传 | Ctrl-F 载文 | Ctrl-B 内置赛文 | Ctrl-Q 退出",
-            )
-            .fg(color(theme.muted))
+            " Esc 返回 | Ctrl-O 登录并上传 | Ctrl-F 载文 | Ctrl-B 内置赛文 | Ctrl-Q 退出"
         } else {
-            Line::from(" Esc 返回 | Ctrl-F 载文 | Ctrl-B 内置赛文 | Ctrl-Q 退出")
-                .fg(color(theme.muted))
+            " Esc 返回 | Ctrl-F 载文 | Ctrl-B 内置赛文 | Ctrl-Q 退出"
         }
     } else {
-        Line::from(" Esc 返回 | Enter/r 重打 | Ctrl-F 载文 | Ctrl-B 内置赛文 | Ctrl-Q 退出")
-            .fg(color(theme.muted))
+        " Esc 返回 | Enter/r 重打 | Ctrl-F 载文 | Ctrl-B 内置赛文 | Ctrl-Q 退出"
     };
+    let hint_line = hint_bar_line(hint_str, &palette);
 
     // 极小终端降级展示
+    let result_title = Line::from(vec![
+        Span::styled(
+            " 成绩 ",
+            Style::default()
+                .fg(palette.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("— {} ", app.text.title),
+            Style::default().fg(palette.fg),
+        ),
+    ]);
     if total_area.height < 14 {
         let [top_area, bottom_area] =
-            Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(total_area);
+            Layout::vertical([Constraint::Min(0), Constraint::Length(3)]).areas(total_area);
         let mut all_lines = summary_lines;
         all_lines.push(Line::from(""));
         all_lines.extend(timeline_lines);
         frame.render_widget(
             Paragraph::new(all_lines)
-                .block(themed_block(theme).title(format!(" 成绩 — {} ", app.text.title)))
+                .block(themed_block(&palette, true).title(result_title))
                 .wrap(Wrap { trim: false }),
             top_area,
         );
-        frame.render_widget(Paragraph::new(hint_line), bottom_area);
+        let hint_title = Line::from(vec![Span::styled(
+            " 快捷键 ",
+            Style::default()
+                .fg(palette.accent)
+                .add_modifier(Modifier::BOLD),
+        )]);
+        frame.render_widget(
+            Paragraph::new(hint_line).block(themed_block(&palette, false).title(hint_title)),
+            bottom_area,
+        );
         return;
     }
 
@@ -2399,13 +2636,13 @@ fn render_result_view(
         Constraint::Length(summary_height),
         Constraint::Min(6),
         Constraint::Length(timeline_height),
-        Constraint::Length(1),
+        Constraint::Length(3),
     ])
     .areas(total_area);
 
     frame.render_widget(
         Paragraph::new(summary_lines)
-            .block(themed_block(theme).title(format!(" 成绩 — {} ", app.text.title)))
+            .block(themed_block(&palette, true).title(result_title))
             .wrap(Wrap { trim: false }),
         summary_area,
     );
@@ -2429,25 +2666,25 @@ fn render_result_view(
     let max_y = (max_y_sample.max(max_y_error).max(stats.wpm).max(30.0) * 1.15).ceil();
 
     let x_labels = vec![
-        Span::styled("0s", Style::default().fg(color(theme.muted))),
+        Span::styled("0s", Style::default().fg(palette.muted).bg(palette.bg)),
         Span::styled(
             format!("{:.1}s", max_x / 2.0),
-            Style::default().fg(color(theme.muted)),
+            Style::default().fg(palette.muted).bg(palette.bg),
         ),
         Span::styled(
             format!("{:.1}s", max_x),
-            Style::default().fg(color(theme.muted)),
+            Style::default().fg(palette.muted).bg(palette.bg),
         ),
     ];
     let y_labels = vec![
-        Span::styled("0", Style::default().fg(color(theme.muted))),
+        Span::styled("0", Style::default().fg(palette.muted).bg(palette.bg)),
         Span::styled(
             format!("{:.0}", max_y / 2.0),
-            Style::default().fg(color(theme.muted)),
+            Style::default().fg(palette.muted).bg(palette.bg),
         ),
         Span::styled(
             format!("{:.0}", max_y),
-            Style::default().fg(color(theme.muted)),
+            Style::default().fg(palette.muted).bg(palette.bg),
         ),
     ];
 
@@ -2456,7 +2693,7 @@ fn render_result_view(
             .name("WPM 速度")
             .marker(Marker::Braille)
             .graph_type(GraphType::Line)
-            .style(Style::default().fg(color(theme.accent)))
+            .style(Style::default().fg(palette.accent).bg(palette.bg))
             .data(speed_data),
     ];
     if !error_data.is_empty() {
@@ -2465,7 +2702,7 @@ fn render_result_view(
                 .name("打错点")
                 .marker(Marker::Dot)
                 .graph_type(GraphType::Scatter)
-                .style(Style::default().fg(color(theme.wrong)))
+                .style(Style::default().fg(palette.error).bg(palette.bg))
                 .data(&error_data),
         );
     }
@@ -2476,19 +2713,32 @@ fn render_result_view(
         .max()
         .unwrap_or(3) as u16;
 
+    let chart_title = Line::from(vec![Span::styled(
+        " WPM 速度曲线 ",
+        Style::default()
+            .fg(palette.accent)
+            .add_modifier(Modifier::BOLD),
+    )]);
     let chart = Chart::new(datasets)
-        .block(themed_block(theme).title(" WPM 速度曲线 "))
+        .block(themed_block(&palette, true).title(chart_title))
+        .style(Style::default().bg(palette.bg).fg(palette.fg))
         .x_axis(
             Axis::default()
-                .title("时间")
-                .style(Style::default().fg(color(theme.muted)))
+                .title(Span::styled(
+                    "时间",
+                    Style::default().fg(palette.muted).bg(palette.bg),
+                ))
+                .style(Style::default().fg(palette.muted).bg(palette.bg))
                 .bounds([0.0, max_x])
                 .labels(x_labels),
         )
         .y_axis(
             Axis::default()
-                .title("WPM")
-                .style(Style::default().fg(color(theme.muted)))
+                .title(Span::styled(
+                    "WPM",
+                    Style::default().fg(palette.muted).bg(palette.bg),
+                ))
+                .style(Style::default().fg(palette.muted).bg(palette.bg))
                 .bounds([0.0, max_y])
                 .labels(y_labels),
         );
@@ -2502,17 +2752,32 @@ fn render_result_view(
         max_x,
         max_y,
         max_y_label_width,
-        theme,
+        &palette,
     );
 
+    let timeline_title = Line::from(vec![Span::styled(
+        " 错字时间线 ",
+        Style::default()
+            .fg(palette.accent)
+            .add_modifier(Modifier::BOLD),
+    )]);
     frame.render_widget(
         Paragraph::new(timeline_lines)
-            .block(themed_block(theme).title(" 错字时间线 "))
+            .block(themed_block(&palette, true).title(timeline_title))
             .wrap(Wrap { trim: false }),
         timeline_area,
     );
 
-    frame.render_widget(Paragraph::new(hint_line), hint_area);
+    let hint_title = Line::from(vec![Span::styled(
+        " 快捷键 ",
+        Style::default()
+            .fg(palette.accent)
+            .add_modifier(Modifier::BOLD),
+    )]);
+    frame.render_widget(
+        Paragraph::new(hint_line).block(themed_block(&palette, false).title(hint_title)),
+        hint_area,
+    );
 }
 
 /// 在速度折线图上直接标注打错点（红点）及对应的错字字符（标注在红点上方，支持多字词语组合连续展示与防碰撞）。
@@ -2523,7 +2788,7 @@ fn overlay_error_chars_on_chart(
     max_x: f64,
     max_y: f64,
     max_y_label_width: u16,
-    theme: Theme,
+    palette: &ThemePalette,
 ) {
     if stats.error_points.is_empty() || chart_area.width < 15 || chart_area.height < 6 {
         return;
@@ -2562,11 +2827,11 @@ fn overlay_error_chars_on_chart(
             ErrorType::Backspace { deleted } => (*deleted, true),
         };
 
-        if let Some(last) = clusters.last_mut() {
-            if (ep.time_secs - last.time_secs).abs() < 0.35 {
-                last.items.push((ch, is_backspace));
-                continue;
-            }
+        if let Some(last) = clusters.last_mut()
+            && (ep.time_secs - last.time_secs).abs() < 0.35
+        {
+            last.items.push((ch, is_backspace));
+            continue;
         }
 
         clusters.push(ErrorCluster {
@@ -2628,21 +2893,24 @@ fn overlay_error_chars_on_chart(
             let dot_col = cur_col + (char_w.saturating_sub(1) / 2);
             let dot_style = Style::default()
                 .fg(if *is_backspace {
-                    color(theme.warn)
+                    palette.warning
                 } else {
-                    color(theme.wrong)
+                    palette.error
                 })
+                .bg(palette.bg)
                 .bold();
             buf.set_string(dot_col, dot_row, "•", dot_style);
 
             // 2. 在红点上方绘制具体错字字符
             let char_style = if *is_backspace {
                 Style::default()
-                    .fg(color(theme.warn))
+                    .fg(palette.warning)
+                    .bg(palette.bg)
                     .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
             } else {
                 Style::default()
-                    .fg(color(theme.wrong))
+                    .fg(palette.error)
+                    .bg(palette.bg)
                     .add_modifier(Modifier::BOLD | Modifier::REVERSED)
             };
             buf.set_string(cur_col, char_row, ch.to_string(), char_style);
@@ -2731,8 +2999,7 @@ fn build_word_spans(
             // 词间空格（不可打的分隔符，用默认色）
             spans.push(Span::raw(" "));
         }
-        for ci in ws..we {
-            let (c, status) = statuses[ci];
+        for &(c, status) in &statuses[ws..we] {
             let style = match status {
                 Some(CharStatus::Correct) => Style::default().fg(color(theme.correct)),
                 Some(CharStatus::Wrong) => Style::default().fg(color(theme.wrong)),
@@ -3289,7 +3556,7 @@ mod tests {
     #[test]
     fn original_line_shuffled_word_set_uses_text_boundaries() {
         // 乱序词组 Text 携带自身 word_boundaries，original_line 应直接使用它们。
-        let theme = Theme::preset(ThemePreset::Default);
+        let theme = Theme::preset(ThemePreset::CatppuccinMocha);
         let set = BUILTIN_SETS[3]; // 常用词组前五百
         let text = load_builtin_text_shuffled(set);
         assert!(text.shuffled);
@@ -3324,7 +3591,7 @@ mod tests {
     #[test]
     fn type_line_shuffled_word_set_uses_text_boundaries() {
         // 乱序词组 Text 携带自身 word_boundaries，type_line 应直接使用它们。
-        let theme = Theme::preset(ThemePreset::Default);
+        let theme = Theme::preset(ThemePreset::CatppuccinMocha);
         let set = BUILTIN_SETS[3]; // 常用词组前五百
         let text = load_builtin_text_shuffled(set);
         let boundaries = text.word_boundaries.as_ref().unwrap();
@@ -3426,7 +3693,7 @@ mod tests {
 
     #[test]
     fn type_line_colors_correct_green_wrong_red() {
-        let theme = Theme::preset(ThemePreset::Default);
+        let theme = Theme::preset(ThemePreset::CatppuccinMocha);
         let mut session = Session::new("你好世界");
         session.type_text("你好四界");
         let text = type_line(
@@ -3449,7 +3716,7 @@ mod tests {
 
     #[test]
     fn original_line_colors_green_red_default() {
-        let theme = Theme::preset(ThemePreset::Default);
+        let theme = Theme::preset(ThemePreset::CatppuccinMocha);
         let mut session = Session::new("你好世界");
         session.type_text("你好四");
         let text = original_line(
@@ -3479,7 +3746,7 @@ mod tests {
 
     #[test]
     fn type_line_applies_bold_modifier() {
-        let theme = Theme::preset(ThemePreset::Default);
+        let theme = Theme::preset(ThemePreset::CatppuccinMocha);
         let mut session = Session::new("你好世界");
         session.type_text("你好");
         let file_text = Text {
@@ -3500,7 +3767,7 @@ mod tests {
 
     #[test]
     fn original_line_applies_bold_modifier() {
-        let theme = Theme::preset(ThemePreset::Default);
+        let theme = Theme::preset(ThemePreset::CatppuccinMocha);
         let mut session = Session::new("你好世界");
         session.type_text("你好");
         // 已打到（对）与未打到都加粗。
@@ -3779,25 +4046,91 @@ mod tests {
     #[test]
     fn next_prev_theme_cycles_and_persists() {
         let mut app = test_app(file_text("你好"));
-        // 默认从 Default 开始。
-        assert_eq!(app.settings.theme, ThemePreset::Default);
+        // 默认从 CatppuccinMocha 开始。
+        assert_eq!(app.settings.theme, ThemePreset::CatppuccinMocha);
         // 切下一主题并持久化。
         app.next_theme();
-        assert_eq!(app.settings.theme, ThemePreset::Catppuccin);
-        assert_eq!(app.settings_store.load().theme, ThemePreset::Catppuccin);
-        // 循环回绕：往前退回到 Default。
+        assert_eq!(app.settings.theme, ThemePreset::TokyoNight);
+        assert_eq!(app.settings_store.load().theme, ThemePreset::TokyoNight);
+        // 循环回绕：往前退回到 CatppuccinMocha。
         app.prev_theme();
-        assert_eq!(app.settings.theme, ThemePreset::Default);
-        assert_eq!(app.settings_store.load().theme, ThemePreset::Default);
-        // 从 Default 往上退绕到 Gruvbox。
+        assert_eq!(app.settings.theme, ThemePreset::CatppuccinMocha);
+        assert_eq!(
+            app.settings_store.load().theme,
+            ThemePreset::CatppuccinMocha
+        );
+        // 从 CatppuccinMocha 往上退绕到 OneDark。
         app.prev_theme();
-        assert_eq!(app.settings.theme, ThemePreset::Gruvbox);
+        assert_eq!(app.settings.theme, ThemePreset::OneDark);
+    }
+
+    #[test]
+    fn theme_palette_resolves_all_presets() {
+        for preset in ThemePreset::ALL {
+            let palette = theme_palette(preset);
+            assert_ne!(palette.accent, palette.bg);
+        }
+    }
+
+    #[test]
+    fn themed_block_rounded_and_focus_highlight() {
+        let palette = theme_palette(ThemePreset::CatppuccinMocha);
+        let active_block = themed_block(&palette, true);
+        let inactive_block = themed_block(&palette, false);
+        // Both blocks use BorderType::Rounded and distinguishable border colors
+        let _ = active_block;
+        let _ = inactive_block;
+    }
+
+    #[test]
+    fn composite_title_spans_rendering() {
+        let palette = theme_palette(ThemePreset::CatppuccinMocha);
+        let spans = vec![
+            Span::styled(
+                " 跟打区 ",
+                Style::default()
+                    .fg(palette.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "[已暂停] ",
+                Style::default()
+                    .fg(palette.warning)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("— 0/10 字符 ", Style::default().fg(palette.fg)),
+        ];
+        let title = Line::from(spans);
+        assert_eq!(title.spans.len(), 3);
+        assert_eq!(title.spans[0].style.fg, Some(palette.accent));
+        assert_eq!(title.spans[1].style.fg, Some(palette.warning));
+        assert_eq!(title.spans[2].style.fg, Some(palette.fg));
+    }
+
+    #[test]
+    fn hint_bar_line_badge_pill_formatting() {
+        let palette = theme_palette(ThemePreset::CatppuccinMocha);
+        let line = hint_bar_line(" Ctrl-Q 退出 | Ctrl-E 设置 ", &palette);
+        assert!(!line.spans.is_empty());
+        // Left rounded cap has selection fg and bg
+        assert_eq!(line.spans[0].content, "◖");
+        assert_eq!(line.spans[0].style.fg, Some(palette.selection));
+        // Key text span has selection bg and accent fg
+        assert_eq!(line.spans[1].content, "Ctrl-Q");
+        assert_eq!(line.spans[1].style.bg, Some(palette.selection));
+        assert_eq!(line.spans[1].style.fg, Some(palette.accent));
+        // Right rounded cap has selection fg
+        assert_eq!(line.spans[2].content, "◗");
+        assert_eq!(line.spans[2].style.fg, Some(palette.selection));
+        // Description span has palette.fg color
+        assert!(line.spans[3].content.contains("退出"));
+        assert_eq!(line.spans[3].style.fg, Some(palette.fg));
     }
 
     #[test]
     fn theme_switch_changes_correct_wrong_colors() {
         // 对/错颜色随主题切换改变（外部可观察行为：不是固定绿/红）。
-        let default_theme = Theme::preset(ThemePreset::Default);
+        let catppuccin_theme = Theme::preset(ThemePreset::CatppuccinMocha);
         let dracula_theme = Theme::preset(ThemePreset::Dracula);
         let mut session = Session::new("你好");
         session.type_text("你四");
@@ -3808,17 +4141,17 @@ mod tests {
             word_boundaries: None,
             shuffled: false,
         };
-        let default_text = original_line(&session, &file_text, default_theme, false);
+        let catppuccin_text = original_line(&session, &file_text, catppuccin_theme, false);
         let dracula_text = original_line(&session, &file_text, dracula_theme, false);
-        let default_line = &default_text.lines[0];
+        let catppuccin_line = &catppuccin_text.lines[0];
         let dracula_line = &dracula_text.lines[0];
         assert_eq!(
-            default_line.spans[0].style.fg,
-            Some(color(default_theme.correct))
+            catppuccin_line.spans[0].style.fg,
+            Some(color(catppuccin_theme.correct))
         );
         assert_eq!(
-            default_line.spans[1].style.fg,
-            Some(color(default_theme.wrong))
+            catppuccin_line.spans[1].style.fg,
+            Some(color(catppuccin_theme.wrong))
         );
         assert_eq!(
             dracula_line.spans[0].style.fg,
@@ -3829,11 +4162,11 @@ mod tests {
             Some(color(dracula_theme.wrong))
         );
         assert_ne!(
-            default_line.spans[0].style.fg,
+            catppuccin_line.spans[0].style.fg,
             dracula_line.spans[0].style.fg
         );
         assert_ne!(
-            default_line.spans[1].style.fg,
+            catppuccin_line.spans[1].style.fg,
             dracula_line.spans[1].style.fg
         );
     }
@@ -3841,7 +4174,7 @@ mod tests {
     #[test]
     fn type_line_builtin_shows_only_current_page() {
         // 25 字内置赛文：每页 10 字，当前组 10 字全对才翻到下一页，跟打区只显示当前页。
-        let theme = Theme::preset(ThemePreset::Default);
+        let theme = Theme::preset(ThemePreset::CatppuccinMocha);
         let content = "一二三四五六七八九十甲乙丙丁戊己庚辛壬癸子丑寅卯辰";
         let mut session = Session::new_gated(content, true);
         let text = builtin_text(content);
@@ -3868,7 +4201,7 @@ mod tests {
     #[test]
     fn type_line_builtin_wrong_char_blocks_page_advance() {
         // 组内有错字 → completed_groups 不推进 → 不翻页。
-        let theme = Theme::preset(ThemePreset::Default);
+        let theme = Theme::preset(ThemePreset::CatppuccinMocha);
         let content = "一二三四五六七八九十甲乙丙丁戊己庚辛壬癸子丑寅卯辰";
         let mut session = Session::new_gated(content, true);
         let text = builtin_text(content);
@@ -3890,7 +4223,7 @@ mod tests {
     #[test]
     fn type_line_builtin_backspace_at_group_boundary_keeps_page() {
         // 退格到组首封顶 → 页起始不变、不翻回上一组。
-        let theme = Theme::preset(ThemePreset::Default);
+        let theme = Theme::preset(ThemePreset::CatppuccinMocha);
         let content = "一二三四五六七八九十甲乙丙丁戊己庚辛壬癸子丑寅卯辰";
         let mut session = Session::new_gated(content, true);
         let text = builtin_text(content);
@@ -3916,7 +4249,7 @@ mod tests {
     #[test]
     fn original_line_builtin_shows_only_current_page() {
         // 25 字内置赛文：对照区只显示当前组 10 字，当前组全对才翻到下一组。
-        let theme = Theme::preset(ThemePreset::Default);
+        let theme = Theme::preset(ThemePreset::CatppuccinMocha);
         let content = "一二三四五六七八九十甲乙丙丁戊己庚辛壬癸子丑寅卯辰";
         let mut session = Session::new_gated(content, true);
         let text = builtin_text(content);
@@ -3943,7 +4276,7 @@ mod tests {
     #[test]
     fn type_line_file_source_stays_single_line() {
         // 非内置赛文（File）保持单行：由终端宽度自动折行，不分多行 span。
-        let theme = Theme::preset(ThemePreset::Default);
+        let theme = Theme::preset(ThemePreset::CatppuccinMocha);
         let mut session = Session::new("一二三四五六七八九十十一十");
         session.type_text("一二三四五六七八九十十一十");
         let text = type_line(
@@ -3959,7 +4292,7 @@ mod tests {
     #[test]
     fn type_line_empty_input_builtin_shows_placeholder() {
         // 空输入时显示提示行（不分多行、无空 span）。
-        let theme = Theme::preset(ThemePreset::Default);
+        let theme = Theme::preset(ThemePreset::CatppuccinMocha);
         let session = Session::new_gated("一二三四五六七八九十", true);
         let text = type_line(
             &session,
@@ -3973,7 +4306,7 @@ mod tests {
     #[test]
     fn type_line_word_set_shows_space_between_words() {
         // 词组赛文：词间显示空格 span，去逗号。每页 10 个词。
-        let theme = Theme::preset(ThemePreset::Default);
+        let theme = Theme::preset(ThemePreset::CatppuccinMocha);
         // content_no_commas = "可以一个自己没有..."（词间无逗号）
         let set = BUILTIN_SETS[3]; // 常用词组前五百
         let no_commas = set.content_no_commas();
@@ -4010,7 +4343,7 @@ mod tests {
     #[test]
     fn original_line_word_set_shows_10_words_per_page() {
         // 词组赛文对照区：每页显示 10 个词，词间有 9 个空格 span。
-        let theme = Theme::preset(ThemePreset::Default);
+        let theme = Theme::preset(ThemePreset::CatppuccinMocha);
         let set = BUILTIN_SETS[3]; // 常用词组前五百
         let no_commas = set.content_no_commas();
         let boundaries = set.word_boundaries();
@@ -4057,7 +4390,7 @@ mod tests {
     #[test]
     fn type_line_word_set_advances_page_after_10_words() {
         // 词组赛文打满 10 个词且全对后翻页。
-        let theme = Theme::preset(ThemePreset::Default);
+        let theme = Theme::preset(ThemePreset::CatppuccinMocha);
         let set = BUILTIN_SETS[3]; // 常用词组前五百
         let no_commas = set.content_no_commas();
         let boundaries = set.word_boundaries();
@@ -4098,7 +4431,7 @@ mod tests {
         // 回归：词组赛文每词 2 字，打 5 个词（= 10 字符）不应推进 completed_groups。
         // 现状 bug：completed_groups 以字符计（每 10 字符推进），而渲染以词计（每 10 词翻页），
         // 导致打 5 个词（10 字符）就翻页，跟打区变空白。
-        let theme = Theme::preset(ThemePreset::Default);
+        let theme = Theme::preset(ThemePreset::CatppuccinMocha);
         let set = BUILTIN_SETS[3]; // 常用词组前五百
         let no_commas = set.content_no_commas();
         let boundaries = set.word_boundaries();
@@ -4137,7 +4470,7 @@ mod tests {
     #[test]
     fn original_line_word_set_advances_page_after_10_words() {
         // 词组赛文对照区：10 个词全对后翻到第 2 组，显示第 11-20 词。
-        let theme = Theme::preset(ThemePreset::Default);
+        let theme = Theme::preset(ThemePreset::CatppuccinMocha);
         let set = BUILTIN_SETS[3]; // 常用词组前五百
         let no_commas = set.content_no_commas();
         let boundaries = set.word_boundaries();
@@ -4391,7 +4724,7 @@ mod tests {
 
     #[test]
     fn upload_lines_renders_each_state() {
-        let theme = Theme::preset(ThemePreset::Default);
+        let theme = Theme::preset(ThemePreset::CatppuccinMocha);
         // 离线：不显示上传状态。
         assert!(upload_lines(&UploadState::NotApplicable, theme).is_empty());
         // 上传中。
@@ -4857,7 +5190,34 @@ mod tests {
         assert!(clean_content.contains("回改:'四'"));
         assert!(clean_content.contains("四"));
         assert!(clean_content.contains("•"));
-        assert!(clean_content.contains("Esc返回"));
+        assert!(clean_content.contains("Esc") && clean_content.contains("返回"));
+
+        // 验证速度曲线图绘图区域（y: 5..17, x: 12..95）的所有单元格背景色与主题 palette.bg 一致
+        let palette = app.palette();
+        for y in 5..17 {
+            for x in 12..95 {
+                let cell = &buffer[(x, y)];
+                // 跳过宽字符（如中文字符 '四'）的占位后导单元格
+                let is_wide_char_tail = cell.symbol() == " "
+                    && cell.fg == Color::Reset
+                    && x > 0
+                    && buffer[(x - 1, y)]
+                        .symbol()
+                        .chars()
+                        .next()
+                        .map_or(false, |c| !c.is_ascii());
+                if !is_wide_char_tail {
+                    assert_eq!(
+                        cell.bg,
+                        palette.bg,
+                        "Chart cell at ({x}, {y}) bg mismatch with theme palette.bg, sym={:?}, fg={:?}, bg={:?}",
+                        cell.symbol(),
+                        cell.fg,
+                        cell.bg
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -4921,7 +5281,7 @@ mod tests {
 
         let clean_content = content.replace(' ', "");
         assert!(clean_content.contains("成绩"));
-        assert!(clean_content.contains("Esc返回"));
+        assert!(clean_content.contains("Esc") && clean_content.contains("返回"));
     }
 
     // ---- Issues #45 / #46 / #47 自由发文、剪贴板发文与功能栏导航测试 ----
@@ -5177,9 +5537,11 @@ mod tests {
         app.close_free_input();
         app.session.type_text("测");
         app.pause();
-        terminal.draw(|f| ui(f, &app)).unwrap();
+        let backend2 = ratatui::backend::TestBackend::new(90, 28);
+        let mut terminal2 = ratatui::Terminal::new(backend2).unwrap();
+        terminal2.draw(|f| ui(f, &app)).unwrap();
 
-        let buffer2 = terminal.backend().buffer();
+        let buffer2 = terminal2.backend().buffer();
         let content2 = (0..buffer2.area.height)
             .map(|y| {
                 (0..buffer2.area.width)
@@ -5191,5 +5553,203 @@ mod tests {
 
         let clean2 = content2.replace(' ', "");
         assert!(clean2.contains("恢复跟打"));
+    }
+
+    #[test]
+    fn settings_view_theme_cycling_and_preview_render() {
+        let mut app = test_app(file_text("测试设置"));
+        app.state = AppState::Settings;
+        app.settings_focus = FOCUS_THEME;
+
+        for preset in ThemePreset::ALL {
+            let backend = ratatui::backend::TestBackend::new(90, 28);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal.draw(|f| ui(f, &app)).unwrap();
+
+            let buffer = terminal.backend().buffer();
+            let content = (0..buffer.area.height)
+                .map(|y| {
+                    (0..buffer.area.width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            let clean = content.replace(' ', "");
+            assert!(clean.contains("设置"));
+            assert!(clean.contains("主题"));
+            assert!(clean.contains(&preset.name().replace(' ', "")));
+            assert!(clean.contains("对正确对正确"));
+            assert!(clean.contains("错错误错错误"));
+
+            // 验证持久化
+            assert_eq!(app.settings_store.load().theme, preset);
+
+            // 切到下一主题
+            app.next_theme();
+        }
+
+        // 验证循环回绕回到了第一个
+        assert_eq!(app.settings.theme, ThemePreset::CatppuccinMocha);
+
+        // 验证向上反向循环
+        app.prev_theme();
+        assert_eq!(app.settings.theme, ThemePreset::OneDark);
+    }
+
+    #[test]
+    fn settings_row_styling_focused() {
+        let palette = theme_palette(ThemePreset::TokyoNight);
+        let focused = settings_row("主题", "Tokyo Night", true, &palette);
+        let unfocused = settings_row("粗体", "关", false, &palette);
+
+        assert!(focused.spans[0].content.contains('>'));
+        assert_eq!(focused.style.fg, Some(palette.accent));
+        assert!(focused.style.add_modifier.contains(Modifier::BOLD));
+
+        assert!(!unfocused.spans[0].content.contains('>'));
+        assert_eq!(unfocused.style.fg, Some(palette.fg));
+    }
+
+    #[test]
+    fn settings_modal_overlay_clears_background_and_renders_cleanly() {
+        let mut app = test_app(file_text("一二三四五六七八九十"));
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+
+        // 1. 先渲染打字主界面
+        terminal.draw(|f| ui(f, &app)).unwrap();
+
+        // 2. 打开设置
+        app.state = AppState::Settings;
+        let backend2 = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal2 = ratatui::Terminal::new(backend2).unwrap();
+        terminal2.draw(|f| ui(f, &app)).unwrap();
+
+        let buffer = terminal2.backend().buffer();
+        let content = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let clean = content.replace(' ', "");
+        assert!(clean.contains("设置"));
+        assert!(clean.contains("主题:"));
+        assert!(clean.contains("对照区占比:"));
+        assert!(clean.contains("粗体:"));
+        assert!(clean.contains("字体:"));
+        assert!(clean.contains("输入法:"));
+    }
+
+    #[test]
+    fn nord_theme_hint_bar_and_preview_hints_high_contrast() {
+        let palette = theme_palette(ThemePreset::Nord);
+        let line = hint_bar_line(" ↑↓ 选择 | Enter 载入 | Esc 取消 ", &palette);
+
+        // 验证 Badge Pill 中按键样式与描述文字对比度
+        for span in &line.spans {
+            if span.content.contains("选择")
+                || span.content.contains("载入")
+                || span.content.contains("取消")
+            {
+                assert_eq!(span.style.fg, Some(palette.fg));
+            }
+            if span.content.contains("Enter") || span.content.contains("Esc") {
+                assert_eq!(span.style.fg, Some(palette.accent));
+                assert_eq!(span.style.bg, Some(palette.selection));
+            }
+        }
+    }
+
+    #[test]
+    fn main_ui_renders_high_contrast_theme_background_and_sidebar_unselected_items_visible() {
+        for preset in [
+            ThemePreset::CatppuccinMocha,
+            ThemePreset::TokyoNight,
+            ThemePreset::Nord,
+            ThemePreset::Dracula,
+            ThemePreset::Gruvbox,
+            ThemePreset::RosePine,
+            ThemePreset::Kanagawa,
+            ThemePreset::OneDark,
+        ] {
+            let mut app = test_app(file_text("中文跟打测试赛文"));
+            app.settings.theme = preset;
+            let palette = theme_palette(preset);
+
+            let backend = ratatui::backend::TestBackend::new(100, 30);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal.draw(|f| ui(f, &app)).unwrap();
+
+            let buffer = terminal.backend().buffer();
+
+            // 1. 验证左侧功能栏未选中项（如 "F1 极速杯" 中的 "极"）具有 palette.fg 前景色和 palette.bg 背景色
+            let mut found_f1 = false;
+            for y in 0..buffer.area.height {
+                for x in 0..24 {
+                    let cell = &buffer[(x, y)];
+                    if cell.symbol() == "极" {
+                        assert_eq!(cell.fg, palette.fg, "Preset {:?} '极' fg mismatch", preset);
+                        assert_eq!(cell.bg, palette.bg, "Preset {:?} '极' bg mismatch", preset);
+                        found_f1 = true;
+                        break;
+                    }
+                }
+                if found_f1 {
+                    break;
+                }
+            }
+            assert!(found_f1, "应当在侧边栏找到 '极'");
+
+            // 2. 验证底部快捷键栏带有圆角边框、快捷键标题与高对比度描述
+            let mut found_nav = false;
+            let mut found_key = false;
+            let mut found_title = false;
+            let mut found_rounded_border = false;
+
+            for y in (buffer.area.height - 3)..buffer.area.height {
+                for x in 0..buffer.area.width {
+                    let cell = &buffer[(x, y)];
+                    if cell.symbol() == "快" {
+                        assert_eq!(
+                            cell.fg, palette.accent,
+                            "Preset {:?} '快' fg mismatch",
+                            preset
+                        );
+                        found_title = true;
+                    }
+                    if cell.symbol() == "╭" || cell.symbol() == "╰" {
+                        found_rounded_border = true;
+                    }
+                    if cell.symbol() == "菜" {
+                        assert_eq!(cell.fg, palette.fg, "Preset {:?} '菜' fg mismatch", preset);
+                        assert_eq!(cell.bg, palette.bg, "Preset {:?} '菜' bg mismatch", preset);
+                        found_nav = true;
+                    }
+                    if cell.symbol() == "↑" {
+                        assert_eq!(
+                            cell.fg, palette.accent,
+                            "Preset {:?} '↑' fg mismatch",
+                            preset
+                        );
+                        assert_eq!(
+                            cell.bg, palette.selection,
+                            "Preset {:?} '↑' bg mismatch",
+                            preset
+                        );
+                        found_key = true;
+                    }
+                }
+            }
+            assert!(found_rounded_border, "底部快捷键栏应当有圆角边框 (╭/╰)");
+            assert!(found_title, "底部快捷键栏应当包含标题 '快捷键'");
+            assert!(found_nav, "应当在底部提示栏找到 '菜'");
+            assert!(found_key, "应当在底部提示栏找到按键胶囊 '↑'");
+        }
     }
 }

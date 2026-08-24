@@ -76,10 +76,10 @@ impl TokenStore {
             return None;
         }
         // 尝试解析 JSON 会话格式
-        if let Ok(sess) = serde_json::from_str::<AuthSession>(trimmed) {
-            if !sess.token.is_empty() {
-                return Some(sess);
-            }
+        if let Ok(sess) = serde_json::from_str::<AuthSession>(trimmed)
+            && !sess.token.is_empty()
+        {
+            return Some(sess);
         }
         // 兼容旧格式：纯文本 token
         Some(AuthSession::from_token(trimmed))

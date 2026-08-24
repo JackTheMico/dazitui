@@ -454,16 +454,16 @@ impl ApiClient {
             .get("set-cookie")
             .and_then(|v| v.to_str().ok())
             .map(|s| s.split(';').next().unwrap_or(s).trim().to_string());
-        if let Some(cookie_val) = new_cookie {
-            if let Ok(mut lock) = self.session.lock() {
-                if let Some(sess) = lock.as_mut() {
-                    sess.cookie = Some(cookie_val);
-                    if let Some(ref store) = self.token_store {
-                        let _ = store.save_session(sess);
-                    }
-                } else {
-                    *lock = Some(AuthSession::new("", Some(cookie_val)));
+        if let Some(cookie_val) = new_cookie
+            && let Ok(mut lock) = self.session.lock()
+        {
+            if let Some(sess) = lock.as_mut() {
+                sess.cookie = Some(cookie_val);
+                if let Some(ref store) = self.token_store {
+                    let _ = store.save_session(sess);
                 }
+            } else {
+                *lock = Some(AuthSession::new("", Some(cookie_val)));
             }
         }
         resp.body_mut()

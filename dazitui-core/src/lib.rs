@@ -50,15 +50,15 @@ impl Text {
     /// 乱序词组赛文使用 `Text.word_boundaries`；顺序词组赛文回退到 `BuiltinSet::word_boundaries()`。
     /// 非词组赛文返回空 Vec（Session 回退到单字逻辑：每组 GROUP_SIZE 字）。
     pub fn session_word_boundaries(&self) -> Vec<(usize, usize)> {
-        if let Some(b) = &self.word_boundaries {
-            if !b.is_empty() {
-                return b.clone();
-            }
+        if let Some(b) = &self.word_boundaries
+            && !b.is_empty()
+        {
+            return b.clone();
         }
-        if let TextSource::Builtin { set } = self.source {
-            if set.is_words() {
-                return set.word_boundaries();
-            }
+        if let TextSource::Builtin { set } = self.source
+            && set.is_words()
+        {
+            return set.word_boundaries();
         }
         Vec::new()
     }
@@ -390,10 +390,10 @@ pub fn load_text_from_clipboard(options: &LoadOptions) -> Result<Text, LoadError
 
 /// 将赛文保存到本地文件。
 pub fn save_text_to_file(path: &Path, content: &str) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
     }
     std::fs::write(path, content)
 }
