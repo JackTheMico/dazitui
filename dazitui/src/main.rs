@@ -2539,7 +2539,7 @@ fn render_result_view(
     frame.render_widget(Paragraph::new(hint_line), hint_area);
 }
 
-/// 在速度折线图上直接标注打错点（红点）及对应的错字字符（标注在红点上方）。
+/// 在速度折线图上直接标注打错点（红点）及对应的错字字符（标注在红点上方，支持多字词语组合连续展示与防碰撞）。
 fn overlay_error_chars_on_chart(
     buf: &mut ratatui::buffer::Buffer,
     chart_area: Rect,
@@ -2572,52 +2572,110 @@ fn overlay_error_chars_on_chart(
     }
     let plot_height = (plot_y_end - plot_y_start) as f64;
 
+    // 1. 将时间极其接近（如输入法同一词语一次性上屏）的打错点聚类为组
+    struct ErrorCluster {
+        time_secs: f64,
+        wpm: f64,
+        items: Vec<(char, bool)>, // (字符, 是否回改)
+    }
+
+    let mut clusters: Vec<ErrorCluster> = Vec::new();
     for ep in &stats.error_points {
         let (ch, is_backspace) = match &ep.error_type {
             ErrorType::Mismatch { typed, .. } => (*typed, false),
             ErrorType::Backspace { deleted } => (*deleted, true),
         };
 
-        let norm_x = (ep.time_secs / max_x).clamp(0.0, 1.0);
-        let norm_y = (ep.wpm / max_y).clamp(0.0, 1.0);
+        if let Some(last) = clusters.last_mut() {
+            if (ep.time_secs - last.time_secs).abs() < 0.35 {
+                last.items.push((ch, is_backspace));
+                continue;
+            }
+        }
 
-        let dot_col = (plot_x_start + (norm_x * (plot_width - 1.0)).round() as u16)
+        clusters.push(ErrorCluster {
+            time_secs: ep.time_secs,
+            wpm: ep.wpm,
+            items: vec![(ch, is_backspace)],
+        });
+    }
+
+    // 2. 依次渲染各个聚类，避免列覆盖
+    let mut prev_cluster_end_col: u16 = 0;
+    let mut prev_char_row: u16 = 0;
+
+    for cluster in &clusters {
+        let norm_x = (cluster.time_secs / max_x).clamp(0.0, 1.0);
+        let norm_y = (cluster.wpm / max_y).clamp(0.0, 1.0);
+
+        let base_col = (plot_x_start + (norm_x * (plot_width - 1.0)).round() as u16)
             .clamp(plot_x_start, plot_x_end.saturating_sub(1));
         let dot_row = plot_y_end
             .saturating_sub(1)
             .saturating_sub((norm_y * (plot_height - 1.0)).round() as u16)
             .clamp(plot_y_start, plot_y_end.saturating_sub(1));
 
-        // 1. 在曲线上绘制打错点标记（红点/黄点）
-        let dot_style = Style::default()
-            .fg(if is_backspace {
-                color(theme.warn)
-            } else {
-                color(theme.wrong)
-            })
-            .bold();
-        buf.set_string(dot_col, dot_row, "•", dot_style);
-
-        // 2. 在红点上方标注打错的具体字符
-        let char_width = if ch.is_ascii() { 1 } else { 2 };
-        let char_col = dot_col.min(plot_x_end.saturating_sub(char_width));
         let char_row = if dot_row > plot_y_start {
             dot_row - 1
         } else {
             (dot_row + 1).min(plot_y_end.saturating_sub(1))
         };
 
-        let char_style = if is_backspace {
-            Style::default()
-                .fg(color(theme.warn))
-                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-        } else {
-            Style::default()
-                .fg(color(theme.wrong))
-                .add_modifier(Modifier::BOLD | Modifier::REVERSED)
-        };
+        let total_char_width: u16 = cluster
+            .items
+            .iter()
+            .map(|(c, _)| if c.is_ascii() { 1 } else { 2 })
+            .sum();
 
-        buf.set_string(char_col, char_row, ch.to_string(), char_style);
+        // 居中或锚定起始列，并防越界
+        let mut start_col = base_col.saturating_sub(total_char_width / 2);
+        if start_col < plot_x_start {
+            start_col = plot_x_start;
+        }
+        if start_col + total_char_width > plot_x_end {
+            start_col = plot_x_end.saturating_sub(total_char_width);
+        }
+
+        // 若与上一组在同一行发生列重叠，向后微调避免互相覆盖
+        if char_row == prev_char_row && start_col < prev_cluster_end_col {
+            start_col = prev_cluster_end_col.min(plot_x_end.saturating_sub(total_char_width));
+        }
+
+        let mut cur_col = start_col;
+        for (ch, is_backspace) in &cluster.items {
+            let char_w = if ch.is_ascii() { 1 } else { 2 };
+            if cur_col + char_w > plot_x_end {
+                break;
+            }
+
+            // 1. 在曲线上绘制打错点标记（红点/黄点），位于字符正下方
+            let dot_col = cur_col + (char_w.saturating_sub(1) / 2);
+            let dot_style = Style::default()
+                .fg(if *is_backspace {
+                    color(theme.warn)
+                } else {
+                    color(theme.wrong)
+                })
+                .bold();
+            buf.set_string(dot_col, dot_row, "•", dot_style);
+
+            // 2. 在红点上方绘制具体错字字符
+            let char_style = if *is_backspace {
+                Style::default()
+                    .fg(color(theme.warn))
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+            } else {
+                Style::default()
+                    .fg(color(theme.wrong))
+                    .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+            };
+            buf.set_string(cur_col, char_row, ch.to_string(), char_style);
+
+            cur_col += char_w;
+        }
+
+        prev_cluster_end_col = cur_col;
+        prev_char_row = char_row;
     }
 }
 
@@ -4826,6 +4884,46 @@ mod tests {
         assert!(clean_content.contains("四"));
         assert!(clean_content.contains("•"));
         assert!(clean_content.contains("Esc返回"));
+    }
+
+    #[test]
+    fn render_result_view_shows_all_wrong_chars_when_multi_char_word_errors_occur() {
+        let mut app = test_app(file_text("你好世界测试代码编程"));
+        app.session.type_text_at("你好", Duration::from_secs(1));
+        app.session.type_text_at("中华", Duration::from_secs(2));
+        app.session.type_text_at("人民", Duration::from_secs(3));
+        app.session.type_text_at("代码", Duration::from_secs(4));
+        app.session.type_text_at("编程", Duration::from_secs(5));
+        app.finish_typing();
+
+        let stats = if let AppState::Finished { stats, .. } = &app.state {
+            stats.clone()
+        } else {
+            panic!("expected finished state");
+        };
+        assert_eq!(stats.wrong_total, 4);
+        assert_eq!(stats.wrong_chars, 4);
+        assert_eq!(stats.edits, 0);
+
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| ui(f, &app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let chart_content = (4..23)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let clean_chart = chart_content.replace(' ', "");
+        assert!(clean_chart.contains("中"), "图表区应包含错字'中'");
+        assert!(clean_chart.contains("华"), "图表区应包含错字'华'");
+        assert!(clean_chart.contains("人"), "图表区应包含错字'人'");
+        assert!(clean_chart.contains("民"), "图表区应包含错字'民'");
+        assert!(clean_chart.contains("•"), "图表区应包含打错点标记");
     }
 
     #[test]
