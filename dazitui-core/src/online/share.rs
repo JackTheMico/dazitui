@@ -151,6 +151,8 @@ mod tests {
             typed_chars: 40,
             key_frequency: vec![("a".to_string(), 100), ("b".to_string(), 40)],
             edit_details: vec![],
+            speed_samples: vec![],
+            error_points: vec![],
         }
     }
 

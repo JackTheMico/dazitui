@@ -1164,6 +1164,8 @@ mod tests {
             wrong_total: 0,
             key_frequency: vec![("a".into(), 10)],
             edit_details: Vec::new(),
+            speed_samples: Vec::new(),
+            error_points: Vec::new(),
         };
 
         let outcome = client
@@ -1219,6 +1221,8 @@ mod tests {
             wrong_total: 0,
             key_frequency: vec![("a".into(), 100)],
             edit_details: Vec::new(),
+            speed_samples: Vec::new(),
+            error_points: Vec::new(),
         };
         let upload_stats = crate::online::share::to_upload_stats(&stats, Duration::from_secs(60));
         let payload = crate::online::share::build_upload_payload(

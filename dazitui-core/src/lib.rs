@@ -6,7 +6,7 @@ mod settings;
 #[cfg(feature = "online")]
 mod online;
 
-pub use session::{CharStatus, GROUP_SIZE, Session, Stats, TypeResult};
+pub use session::{CharStatus, ErrorPoint, ErrorType, GROUP_SIZE, Session, Stats, TypeResult};
 pub use settings::{
     FONT_SIZE_PT, Rgb, Settings, SettingsStore, Theme, ThemePreset, osc_font_size_sequence,
 };

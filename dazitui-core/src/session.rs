@@ -21,6 +21,39 @@ pub struct TypeResult {
     pub edit_count: u32,
 }
 
+/// 错字类型。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ErrorType {
+    /// 与原文不一致的错字（typed: 输入的字符, expected: 期望的原文对应位置字符）。
+    Mismatch {
+        typed: char,
+        expected: Option<char>,
+    },
+    /// 回改（退格删除的字符）。
+    Backspace {
+        deleted: char,
+    },
+}
+
+/// 打错点信息（发生时间 + 当时即时 WPM + 错误类型）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ErrorPoint {
+    /// 发生时间（相对会话开始的秒数）。
+    pub time_secs: f64,
+    /// 发生时刻的即时/平滑 WPM。
+    pub wpm: f64,
+    /// 错误类型。
+    pub error_type: ErrorType,
+}
+
+/// 内部记录的打字事件。
+#[derive(Debug, Clone, PartialEq)]
+struct TypingEvent {
+    elapsed: Duration,
+    is_correct: bool,
+    error: Option<ErrorType>,
+}
+
 /// 跟打统计结果（完成或提前结束时计算）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Stats {
@@ -40,6 +73,10 @@ pub struct Stats {
     pub key_frequency: Vec<(String, u32)>,
     /// 回改明细：被删除的字符（按删除顺序）。
     pub edit_details: Vec<char>,
+    /// 速度折线采样点：[(时间秒, 即时/平滑WPM)]。
+    pub speed_samples: Vec<(f64, f64)>,
+    /// 打错点集合（按时间排序）。
+    pub error_points: Vec<ErrorPoint>,
 }
 
 /// 内置赛文组大小：每组 10 个单位（单字赛文=10 字，词组赛文=10 词）。
@@ -65,6 +102,7 @@ pub struct Session {
     completed_groups: usize,
     group_gated: bool,
     group_bounds: Vec<(usize, usize)>,
+    events: Vec<TypingEvent>,
 }
 
 impl Session {
@@ -109,24 +147,49 @@ impl Session {
             completed_groups: 0,
             group_gated,
             group_bounds,
+            events: Vec::new(),
         }
     }
 
     /// 上屏一段文本：追加到输入末尾，重新与原文比对，返回本次字符的对/错。
+    pub fn type_text(&mut self, committed: &str) -> TypeResult {
+        self.type_text_at(committed, Duration::ZERO)
+    }
+
+    /// 上屏一段文本并携带相对时间戳。
     ///
     /// 组边界门槛（内置赛文）：当前组（`GROUP_SIZE` 字）全对才放行。
     /// 多字符输入跨组边界时只接受到当前组末尾，超出部分丢弃。
-    pub fn type_text(&mut self, committed: &str) -> TypeResult {
+    pub fn type_text_at(&mut self, committed: &str, elapsed: Duration) -> TypeResult {
         let chars: Vec<char> = committed.chars().collect();
         let start = self.input.len();
-        if self.group_gated {
+        let accept_len = if self.group_gated {
             let (_, group_end) = self.current_group_bounds();
-            // 截断到组边界：只接受到当前组末尾的字符数
-            let accept = group_end.saturating_sub(self.input.len()).min(chars.len());
-            self.input.extend(chars[..accept].iter().copied());
+            group_end.saturating_sub(self.input.len()).min(chars.len())
         } else {
-            self.input.extend(chars.iter().copied());
+            chars.len()
+        };
+
+        for (offset, &c) in chars[..accept_len].iter().enumerate() {
+            let pos = start + offset;
+            self.input.push(c);
+            let expected = self.original.get(pos).copied();
+            let is_match = expected == Some(c);
+            let error = if is_match {
+                None
+            } else {
+                Some(ErrorType::Mismatch {
+                    typed: c,
+                    expected,
+                })
+            };
+            self.events.push(TypingEvent {
+                elapsed,
+                is_correct: is_match,
+                error,
+            });
         }
+
         let statuses = self.align();
         let statuses = statuses[start..].to_vec();
         // 检查当前组是否全对（仅组门槛模式）
@@ -147,9 +210,14 @@ impl Session {
     }
 
     /// 回改一次：删除最后一个已上屏字符，返回是否成功。
+    pub fn backspace(&mut self) -> bool {
+        self.backspace_at(Duration::ZERO)
+    }
+
+    /// 回改一次并携带相对时间戳。
     ///
     /// 组边界门槛（内置赛文）：已完成组的起始位置不可回改（锁住已完成组）。
-    pub fn backspace(&mut self) -> bool {
+    pub fn backspace_at(&mut self, elapsed: Duration) -> bool {
         if self.group_gated {
             let (group_start, _) = self.current_group_bounds();
             if self.input.len() <= group_start {
@@ -159,6 +227,11 @@ impl Session {
         if let Some(c) = self.input.pop() {
             self.edits += 1;
             self.edit_details.push(c);
+            self.events.push(TypingEvent {
+                elapsed,
+                is_correct: false,
+                error: Some(ErrorType::Backspace { deleted: c }),
+            });
             true
         } else {
             false
@@ -170,6 +243,75 @@ impl Session {
     /// `key` 为按键的字符串表示，如 "a"、"Backspace"、"Enter"。
     pub fn record_key(&mut self, key: &str) {
         *self.key_counts.entry(key.to_string()).or_insert(0) += 1;
+    }
+
+    /// 计算给定时间点 `t` 处的即时/平滑 WPM（基于 2 秒滑动窗口）。
+    fn calc_rolling_wpm(&self, t: f64) -> f64 {
+        if t <= 0.0 {
+            return 0.0;
+        }
+        let window = 2.0;
+        let t_start = (t - window).max(0.0);
+        let dt = t - t_start;
+        if dt <= 0.0 {
+            return 0.0;
+        }
+        let correct_count = self
+            .events
+            .iter()
+            .filter(|e| {
+                let s = e.elapsed.as_secs_f64();
+                let in_window = if t_start == 0.0 {
+                    s >= 0.0 && s <= t
+                } else {
+                    s > t_start && s <= t
+                };
+                in_window && e.is_correct
+            })
+            .count();
+        (correct_count as f64 / dt) * 60.0
+    }
+
+    /// 计算时间序列速度采样点。
+    fn compute_speed_samples(&self, total_secs: f64) -> Vec<(f64, f64)> {
+        if total_secs <= 0.0 {
+            return vec![(0.0, 0.0)];
+        }
+        let mut samples = Vec::new();
+        samples.push((0.0, 0.0));
+
+        let mut t = 1.0;
+        while t < total_secs {
+            let wpm = self.calc_rolling_wpm(t);
+            samples.push((t, wpm));
+            t += 1.0;
+        }
+        if total_secs > 0.0 {
+            let last_t = samples.last().map(|s| s.0).unwrap_or(0.0);
+            if (total_secs - last_t).abs() > 0.01 {
+                let wpm = self.calc_rolling_wpm(total_secs);
+                samples.push((total_secs, wpm));
+            }
+        }
+        samples
+    }
+
+    /// 计算打错点信息列表。
+    fn compute_error_points(&self) -> Vec<ErrorPoint> {
+        self.events
+            .iter()
+            .filter_map(|e| {
+                e.error.as_ref().map(|err| {
+                    let t = e.elapsed.as_secs_f64();
+                    let wpm = self.calc_rolling_wpm(t);
+                    ErrorPoint {
+                        time_secs: t,
+                        wpm,
+                        error_type: err.clone(),
+                    }
+                })
+            })
+            .collect()
     }
 
     /// 计算跟打统计（完成或提前结束时调用，不消耗会话）。
@@ -191,6 +333,9 @@ impl Session {
             .map(|(k, v)| (k.clone(), *v))
             .collect();
         key_frequency.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let total_secs = elapsed.as_secs_f64();
+        let speed_samples = self.compute_speed_samples(total_secs);
+        let error_points = self.compute_error_points();
         Stats {
             wpm,
             correct_chars: correct,
@@ -200,6 +345,8 @@ impl Session {
             typed_chars: self.input.len(),
             key_frequency,
             edit_details: self.edit_details.clone(),
+            speed_samples,
+            error_points,
         }
     }
 
@@ -605,5 +752,77 @@ mod tests {
         session.type_text("甲乙X"); // 尾组有错字
         assert!(!session.is_complete(), "尾组有错字不应完成");
         assert_eq!(session.completed_groups(), 1);
+    }
+
+    // ---- Issue #39 时序速度采样与打错事件记录测试 ----
+
+    #[test]
+    fn time_series_speed_samples_reflects_burst_and_pause() {
+        let mut session = Session::new("一二三四五六七八九十");
+        // 第 1 秒打了 2 个字（正确）
+        session.type_text_at("一二", Duration::from_secs(1));
+        // 第 2 秒打了 2 个字（正确）
+        session.type_text_at("三四", Duration::from_secs(2));
+        // 第 3-4 秒暂停（无输入）
+        // 第 5 秒打了 2 个字（正确）
+        session.type_text_at("五六", Duration::from_secs(5));
+
+        let stats = session.finish(Duration::from_secs(5));
+        assert!(!stats.speed_samples.is_empty());
+        assert_eq!(stats.speed_samples[0], (0.0, 0.0));
+
+        // 第 1 秒样本
+        let s1 = stats.speed_samples.iter().find(|(t, _)| (*t - 1.0).abs() < 1e-3).unwrap();
+        // 2 字 / 1s * 60 = 120 WPM
+        assert!((s1.1 - 120.0).abs() < 1.0);
+
+        // 第 4 秒样本（暂停阶段：在 [2.0, 4.0] 窗口内只有 2.0s 时的输入，窗口内无新字增量）
+        let s4 = stats.speed_samples.iter().find(|(t, _)| (*t - 4.0).abs() < 1e-3).unwrap();
+        assert_eq!(s4.1, 0.0);
+    }
+
+    #[test]
+    fn error_points_records_mismatches_and_backspaces() {
+        let mut session = Session::new("你好世界");
+        // 1.0s: 打对「你」
+        session.type_text_at("你", Duration::from_secs_f64(1.0));
+        // 2.0s: 打错「四」（期望「好」）
+        session.type_text_at("四", Duration::from_secs_f64(2.0));
+        // 2.5s: 回改删掉「四」
+        session.backspace_at(Duration::from_secs_f64(2.5));
+        // 3.0s: 改对「好」
+        session.type_text_at("好", Duration::from_secs_f64(3.0));
+
+        let stats = session.finish(Duration::from_secs_f64(3.0));
+        assert_eq!(stats.error_points.len(), 2);
+
+        // 错误点 1：Mismatch
+        let ep1 = &stats.error_points[0];
+        assert!((ep1.time_secs - 2.0).abs() < 1e-3);
+        assert_eq!(
+            ep1.error_type,
+            ErrorType::Mismatch {
+                typed: '四',
+                expected: Some('好'),
+            }
+        );
+
+        // 错误点 2：Backspace
+        let ep2 = &stats.error_points[1];
+        assert!((ep2.time_secs - 2.5).abs() < 1e-3);
+        assert_eq!(
+            ep2.error_type,
+            ErrorType::Backspace {
+                deleted: '四',
+            }
+        );
+    }
+
+    #[test]
+    fn finish_empty_session_has_default_speed_samples_and_error_points() {
+        let session = Session::new("你好");
+        let stats = session.finish(Duration::ZERO);
+        assert_eq!(stats.speed_samples, vec![(0.0, 0.0)]);
+        assert!(stats.error_points.is_empty());
     }
 }
