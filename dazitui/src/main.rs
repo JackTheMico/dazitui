@@ -9,7 +9,7 @@ use dazitui_core::{
     FONT_SIZE_PT, LoadError, LoadOptions, Rgb, Session, Settings, SettingsStore, Stats, Text,
     TextSource, Theme, TokenStore, env_credentials, format_time, is_auth_failure,
     load_builtin_text, load_builtin_text_shuffled, load_text_from_clipboard, load_text_from_file,
-    load_text_from_file_with_options, load_text_from_string, osc_font_size_sequence,
+    load_text_from_string, osc_font_size_sequence,
     osc52_clipboard, save_text_to_file,
 };
 use ratatui::Frame;
@@ -266,8 +266,6 @@ struct App {
     browse_selection: usize,
     /// 内置赛文浏览当前选中下标。
     builtin_selection: usize,
-    /// 载文选项。
-    options: LoadOptions,
     /// 载文失败时的错误提示。
     browse_error: Option<String>,
     /// token 持久化存储。
@@ -422,7 +420,6 @@ impl App {
             browse_files: Vec::new(),
             browse_selection: 0,
             builtin_selection: 0,
-            options: LoadOptions::default(),
             browse_error: None,
             token_store,
             token,
@@ -547,7 +544,7 @@ impl App {
                 }
             }
         }
-        match load_text_from_string(&final_title, content, TextSource::Custom, &self.options) {
+        match load_text_from_string(&final_title, content, TextSource::Custom, &LoadOptions::default()) {
             Ok(text) => {
                 self.text = text;
                 self.free_input_modal = None;
@@ -567,7 +564,7 @@ impl App {
 
     /// 从剪贴板载入赛文并开始跟打。
     fn load_from_clipboard(&mut self) {
-        match load_text_from_clipboard(&self.options) {
+        match load_text_from_clipboard(&LoadOptions::default()) {
             Ok(text) => {
                 self.text = text;
                 self.restart();
@@ -673,12 +670,12 @@ impl App {
         self.state = AppState::Browsing;
     }
 
-    /// 载入当前选中的文件（应用载文选项），成功后开始新跟打。
+    /// 载入当前选中的文件，成功后开始新跟打。
     fn load_selected(&mut self) {
         let Some(path) = self.browse_files.get(self.browse_selection).cloned() else {
             return;
         };
-        match load_text_from_file_with_options(&path, &self.options) {
+        match load_text_from_file(&path) {
             Ok(text) => {
                 self.text = text;
                 self.restart();
@@ -1058,12 +1055,6 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                         }
                         KeyCode::Enter => app.load_selected(),
                         KeyCode::Esc => app.state = AppState::Typing,
-                        KeyCode::Char('1') => {
-                            app.options.strip_whitespace = !app.options.strip_whitespace
-                        }
-                        KeyCode::Char('2') => {
-                            app.options.strip_punctuation = !app.options.strip_punctuation
-                        }
                         _ => {}
                     },
                     AppState::BrowsingBuiltin => match key.code {
@@ -1262,7 +1253,7 @@ fn hint_text(
     is_ready: bool,
 ) -> &'static str {
     if browsing {
-        " ↑↓ 选择 | Enter 载入 | Esc 取消 | 1 去空格 | 2 去符号 | Ctrl-E 设置 | Ctrl-Q 退出"
+        " ↑↓ 选择 | Enter 载入 | Esc 取消 | Ctrl-E 设置 | Ctrl-Q 退出"
     } else if browsing_builtin {
         " ↑↓ 选择 | Enter 载入 | s 乱序 | Esc 取消 | Ctrl-Q 退出"
     } else if paused {
@@ -1969,7 +1960,7 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
     }
 }
 
-/// 左侧功能栏：菜单列表 + 载文选项开关。
+/// 左侧功能栏：菜单列表。
 fn render_sidebar(
     frame: &mut Frame,
     app: &App,
@@ -2056,21 +2047,6 @@ fn render_sidebar(
             lines.push(line);
         }
     }
-
-    lines.push(Line::from(""));
-    lines.push(Line::from(" 载文选项:").bold());
-    let ws = if app.options.strip_whitespace {
-        "[x]"
-    } else {
-        "[ ]"
-    };
-    let punct = if app.options.strip_punctuation {
-        "[x]"
-    } else {
-        "[ ]"
-    };
-    lines.push(Line::from(format!(" {ws} 1 去空格")));
-    lines.push(Line::from(format!(" {punct} 2 去符号")));
 
     // 提示信息（加载中 / 通知 / 错误）
     if let Some(notice) = &app.sidebar_notice {
@@ -3721,7 +3697,7 @@ mod tests {
     }
 
     #[test]
-    fn load_selected_applies_options_and_restarts() {
+    fn load_selected_loads_file_and_restarts() {
         let dir = temp_dir("load");
         let path = dir.join("a.txt");
         fs::write(&path, "你好， 世界。\n第二行").unwrap();
@@ -3736,12 +3712,10 @@ mod tests {
         // 打开浏览时扫描的是当前工作目录，手动指向临时目录
         app.browse_files = list_text_files(&dir);
         app.browse_selection = 0;
-        app.options.strip_whitespace = true;
-        app.options.strip_punctuation = true;
 
         app.load_selected();
         assert_eq!(app.text.title, "a.txt");
-        assert_eq!(app.text.content, "你好世界第二行");
+        assert_eq!(app.text.content, "你好， 世界。\n第二行");
         assert!(matches!(app.state, AppState::Typing));
         assert_eq!(app.session.len(), 0);
 

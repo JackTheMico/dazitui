@@ -15,18 +15,6 @@
             ]
         },
         {
-            "symbol": "dazitui-core/src/lib.rs:strip_punctuation",
-            "guarantees": [
-                "strip_punctuation.removes_punct"
-            ]
-        },
-        {
-            "symbol": "dazitui-core/src/lib.rs:strip_whitespace",
-            "guarantees": [
-                "strip_whitespace.removes_all"
-            ]
-        },
-        {
             "symbol": "dazitui-core/src/lib.rs:shuffle",
             "guarantees": [
                 "shuffle.preserves_multiset"
