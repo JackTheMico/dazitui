@@ -26,8 +26,10 @@ pub struct TypeResult {
 pub enum ErrorType {
     /// 与原文不一致的错字（typed: 输入的字符, expected: 期望的原文对应位置字符）。
     Mismatch { typed: char, expected: Option<char> },
-    /// 回改（退格删除的字符）。
-    Backspace { deleted: char },
+    /// 回改（删除的字符）。
+    Backspace {
+        deleted: char,
+    },
 }
 
 /// 打错点信息（发生时间 + 当时即时 WPM + 错误类型）。
@@ -165,25 +167,27 @@ impl Session {
             chars.len()
         };
 
+        self.input.extend(chars[..accept_len].iter().copied());
+
+        let all_statuses = self.align();
+        let statuses = all_statuses[start..].to_vec();
+
         for (offset, &c) in chars[..accept_len].iter().enumerate() {
             let pos = start + offset;
-            self.input.push(c);
+            let is_correct = statuses.get(offset) == Some(&CharStatus::Correct);
             let expected = self.original.get(pos).copied();
-            let is_match = expected == Some(c);
-            let error = if is_match {
+            let error = if is_correct {
                 None
             } else {
                 Some(ErrorType::Mismatch { typed: c, expected })
             };
             self.events.push(TypingEvent {
                 elapsed,
-                is_correct: is_match,
+                is_correct,
                 error,
             });
         }
 
-        let statuses = self.align();
-        let statuses = statuses[start..].to_vec();
         // 检查当前组是否全对（仅组门槛模式）
         if self.group_gated {
             let (group_start, group_end) = self.current_group_bounds();

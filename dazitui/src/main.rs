@@ -913,11 +913,11 @@ fn handle_key(session: &mut Session, key: KeyEvent, elapsed: Duration) {
     }
 }
 
-/// 处理成绩视图（结果界面）下的按键事件：
+/// 处理成绩视图下的按键事件：
 /// - Ctrl-F: 打开载文浏览
 /// - Ctrl-B: 打开内置赛文浏览
 /// - Ctrl-E: 打开设置视图
-/// - Esc: 返回主界面（重置会话为就绪状态，保持当前赛文）
+/// - Esc: 返回主界面（重置会话为就绪状态；在线赛文重置回内置赛文）
 /// - Enter / r / R: 重新开始跟打当前赛文（仅限离线/内置赛文）
 fn handle_finished_key(app: &mut App, key: KeyEvent) -> bool {
     if is_open_browser(key) {
@@ -934,6 +934,9 @@ fn handle_finished_key(app: &mut App, key: KeyEvent) -> bool {
     }
     match key.code {
         KeyCode::Esc => {
+            if app.text.is_online() {
+                app.text = load_builtin_text(BUILTIN_SETS[0]);
+            }
             app.restart();
             true
         }
@@ -1639,7 +1642,7 @@ fn render_result_view(
         if stats.error_points.len() > max_show {
             timeline_lines.push(
                 Line::from(format!(
-                    "   ... 共有 {} 处错字与回改",
+                    "   ... 共有 {} 处错字记录",
                     stats.error_points.len()
                 ))
                 .fg(color(theme.muted)),
@@ -3857,6 +3860,8 @@ mod tests {
         let handled = handle_finished_key(&mut app, esc);
         assert!(handled);
         assert!(matches!(app.state, AppState::Typing));
+        assert!(!app.text.is_online());
+        assert_eq!(app.text.title, "常用单字前五百");
     }
 
     #[test]
