@@ -2539,7 +2539,7 @@ fn render_result_view(
     frame.render_widget(Paragraph::new(hint_line), hint_area);
 }
 
-/// 在速度折线图上直接标注打错的字符（高亮渲染在对应时刻与 WPM 坐标处）。
+/// 在速度折线图上直接标注打错点（红点）及对应的错字字符（标注在红点上方）。
 fn overlay_error_chars_on_chart(
     buf: &mut ratatui::buffer::Buffer,
     chart_area: Rect,
@@ -2581,16 +2581,33 @@ fn overlay_error_chars_on_chart(
         let norm_x = (ep.time_secs / max_x).clamp(0.0, 1.0);
         let norm_y = (ep.wpm / max_y).clamp(0.0, 1.0);
 
-        let col = plot_x_start + (norm_x * (plot_width - 1.0)).round() as u16;
-        let row = plot_y_end
+        let dot_col = (plot_x_start + (norm_x * (plot_width - 1.0)).round() as u16)
+            .clamp(plot_x_start, plot_x_end.saturating_sub(1));
+        let dot_row = plot_y_end
             .saturating_sub(1)
-            .saturating_sub((norm_y * (plot_height - 1.0)).round() as u16);
+            .saturating_sub((norm_y * (plot_height - 1.0)).round() as u16)
+            .clamp(plot_y_start, plot_y_end.saturating_sub(1));
 
+        // 1. 在曲线上绘制打错点标记（红点/黄点）
+        let dot_style = Style::default()
+            .fg(if is_backspace {
+                color(theme.warn)
+            } else {
+                color(theme.wrong)
+            })
+            .bold();
+        buf.set_string(dot_col, dot_row, "•", dot_style);
+
+        // 2. 在红点上方标注打错的具体字符
         let char_width = if ch.is_ascii() { 1 } else { 2 };
-        let col = col.min(plot_x_end.saturating_sub(char_width));
-        let row = row.clamp(plot_y_start, plot_y_end.saturating_sub(1));
+        let char_col = dot_col.min(plot_x_end.saturating_sub(char_width));
+        let char_row = if dot_row > plot_y_start {
+            dot_row - 1
+        } else {
+            (dot_row + 1).min(plot_y_end.saturating_sub(1))
+        };
 
-        let style = if is_backspace {
+        let char_style = if is_backspace {
             Style::default()
                 .fg(color(theme.warn))
                 .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
@@ -2600,7 +2617,7 @@ fn overlay_error_chars_on_chart(
                 .add_modifier(Modifier::BOLD | Modifier::REVERSED)
         };
 
-        buf.set_string(col, row, ch.to_string(), style);
+        buf.set_string(char_col, char_row, ch.to_string(), char_style);
     }
 }
 
@@ -4807,6 +4824,7 @@ mod tests {
         assert!(clean_content.contains("错字时间线"));
         assert!(clean_content.contains("回改:'四'"));
         assert!(clean_content.contains("四"));
+        assert!(clean_content.contains("•"));
         assert!(clean_content.contains("Esc返回"));
     }
 
