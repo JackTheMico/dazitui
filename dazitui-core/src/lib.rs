@@ -64,12 +64,16 @@ impl Text {
     }
 }
 
-/// 赛文来源：本地文件、内置赛文或 52dazi.cn 在线比赛。
+/// 赛文来源：本地文件、自由输入、剪贴板、内置赛文或 52dazi.cn 在线比赛。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TextSource {
     /// 本地文件。
     #[default]
     File,
+    /// 自由输入赛文。
+    Custom,
+    /// 剪贴板赛文。
+    Clipboard,
     /// 内置赛文（随二进制分发的练习材料，如常用单字）。
     Builtin { set: BuiltinSet },
     /// 52dazi.cn 在线赛文。
@@ -344,18 +348,54 @@ pub fn load_text_from_file_with_options(
             LoadError::ReadFailed
         }
     })?;
-    let content = process_content(content, options)?;
     let title = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
+    load_text_from_string(&title, content, TextSource::File, options)
+}
+
+/// 从字符串内容载入赛文，按选项处理内容。
+pub fn load_text_from_string(
+    title: &str,
+    raw: String,
+    source: TextSource,
+    options: &LoadOptions,
+) -> Result<Text, LoadError> {
+    let content = process_content(raw, options)?;
     Ok(Text {
-        title,
+        title: title.to_string(),
         content,
-        source: TextSource::File,
+        source,
         word_boundaries: None,
         shuffled: false,
     })
+}
+
+/// 读取系统剪贴板的纯文本内容。
+pub fn read_clipboard_text() -> Result<String, LoadError> {
+    let mut clipboard = arboard::Clipboard::new().map_err(|_| LoadError::ReadFailed)?;
+    let text = clipboard.get_text().map_err(|_| LoadError::ReadFailed)?;
+    if text.is_empty() {
+        return Err(LoadError::Empty);
+    }
+    Ok(text)
+}
+
+/// 从系统剪贴板载入赛文，按选项处理内容。
+pub fn load_text_from_clipboard(options: &LoadOptions) -> Result<Text, LoadError> {
+    let raw = read_clipboard_text()?;
+    load_text_from_string("剪贴板赛文", raw, TextSource::Clipboard, options)
+}
+
+/// 将赛文保存到本地文件。
+pub fn save_text_to_file(path: &Path, content: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    std::fs::write(path, content)
 }
 
 /// 按选项处理原文：去空格、去标点、去首尾空白；处理为空则报 Empty。
@@ -801,6 +841,75 @@ mod tests {
                 "{} 乱序后内容与顺序版完全相同（极低概率，可能乱序未生效）",
                 set.name()
             );
+        }
+    }
+
+    #[test]
+    fn load_text_from_string_with_custom_and_clipboard_sources() {
+        let opts = LoadOptions::default();
+        let custom_text = load_text_from_string(
+            "自由发文",
+            "这是自定义赛文。\n换行测试。".to_string(),
+            TextSource::Custom,
+            &opts,
+        )
+        .expect("自定义文本载入应成功");
+        assert_eq!(custom_text.title, "自由发文");
+        assert_eq!(custom_text.content, "这是自定义赛文。\n换行测试。");
+        assert_eq!(custom_text.source, TextSource::Custom);
+        assert!(!custom_text.is_online());
+        assert!(!custom_text.source.is_builtin());
+
+        let clipboard_text = load_text_from_string(
+            "剪贴板赛文",
+            "剪贴板内容".to_string(),
+            TextSource::Clipboard,
+            &opts,
+        )
+        .expect("剪贴板文本载入应成功");
+        assert_eq!(clipboard_text.title, "剪贴板赛文");
+        assert_eq!(clipboard_text.content, "剪贴板内容");
+        assert_eq!(clipboard_text.source, TextSource::Clipboard);
+        assert!(!clipboard_text.is_online());
+        assert!(!clipboard_text.source.is_builtin());
+    }
+
+    #[test]
+    fn load_text_from_string_options_filter() {
+        let opts = LoadOptions {
+            strip_whitespace: true,
+            strip_punctuation: true,
+        };
+        let text = load_text_from_string(
+            "测试",
+            " 你好， 世界！ \n 标点。 ".to_string(),
+            TextSource::Custom,
+            &opts,
+        )
+        .expect("清洗应成功");
+        assert_eq!(text.content, "你好世界标点");
+
+        let empty_err =
+            load_text_from_string("空测试", "   \n\t  ".to_string(), TextSource::Custom, &opts)
+                .expect_err("空白文本应返回 Empty 错误");
+        assert_eq!(empty_err, LoadError::Empty);
+    }
+
+    #[test]
+    fn save_text_to_file_creates_file_and_parent_dirs() {
+        let path = temp_path("custom_sub/nested/test.txt");
+        let content = "自定义内容\n第二行";
+        save_text_to_file(&path, content).expect("保存应成功");
+
+        let read_back = fs::read_to_string(&path).expect("读取应成功");
+        assert_eq!(read_back, content);
+
+        let _ = fs::remove_file(&path);
+        if let Some(parent) = path.parent() {
+            let _ = fs::remove_dir(parent);
+            if let Some(grand) = parent.parent() {
+                let _ = fs::remove_dir(grand);
+            }
         }
     }
 }

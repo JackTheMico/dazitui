@@ -27,9 +27,7 @@ pub enum ErrorType {
     /// 与原文不一致的错字（typed: 输入的字符, expected: 期望的原文对应位置字符）。
     Mismatch { typed: char, expected: Option<char> },
     /// 回改（删除的字符）。
-    Backspace {
-        deleted: char,
-    },
+    Backspace { deleted: char },
 }
 
 /// 打错点信息（发生时间 + 当时即时 WPM + 错误类型）。

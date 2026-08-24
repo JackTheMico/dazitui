@@ -8,8 +8,9 @@ use dazitui_core::{
     ApiClient, ApiError, AuthSession, BUILTIN_SETS, CharStatus, CompetitionType, ErrorType,
     FONT_SIZE_PT, LoadError, LoadOptions, Rgb, Session, Settings, SettingsStore, Stats, Text,
     TextSource, Theme, TokenStore, env_credentials, format_time, is_auth_failure,
-    load_builtin_text, load_builtin_text_shuffled, load_text_from_file,
-    load_text_from_file_with_options, osc_font_size_sequence, osc52_clipboard,
+    load_builtin_text, load_builtin_text_shuffled, load_text_from_clipboard, load_text_from_file,
+    load_text_from_file_with_options, load_text_from_string, osc_font_size_sequence,
+    osc52_clipboard, save_text_to_file,
 };
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -100,6 +101,32 @@ fn cycle_input_method_next(current: &str) -> String {
     INPUT_METHOD_PRESETS[next].to_string()
 }
 
+/// 功能栏可导航菜单项。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SidebarMenuItem {
+    LoadFile,
+    BuiltinText,
+    FreeInput,
+    Clipboard,
+    OnlineJisu,
+    OnlineJinbiao,
+    OnlineJianshen,
+    Settings,
+    Login,
+}
+
+const SIDEBAR_MENU_ITEMS: &[SidebarMenuItem] = &[
+    SidebarMenuItem::LoadFile,
+    SidebarMenuItem::BuiltinText,
+    SidebarMenuItem::FreeInput,
+    SidebarMenuItem::Clipboard,
+    SidebarMenuItem::OnlineJisu,
+    SidebarMenuItem::OnlineJinbiao,
+    SidebarMenuItem::OnlineJianshen,
+    SidebarMenuItem::Settings,
+    SidebarMenuItem::Login,
+];
+
 /// 成绩视图里的成绩上传状态（在线赛文完成跟打后自动上传）。
 #[derive(Debug, Clone, PartialEq)]
 enum UploadState {
@@ -120,15 +147,119 @@ enum UploadState {
     },
 }
 
+/// 自由发文模态框焦点字段。
+const FREE_INPUT_FOCUS_TITLE: usize = 0;
+const FREE_INPUT_FOCUS_CONTENT: usize = 1;
+const FREE_INPUT_FOCUS_SAVE_CHECKBOX: usize = 2;
+const FREE_INPUT_FOCUS_SAVE_PATH: usize = 3;
+const FREE_INPUT_FOCUS_SUBMIT_BTN: usize = 4;
+const FREE_INPUT_FOCUS_CANCEL_BTN: usize = 5;
+
+/// 自由发文模态框状态。
+#[derive(Debug, Clone)]
+struct FreeInputModal {
+    title: String,
+    content: String,
+    save_to_file: bool,
+    save_path: String,
+    focus: usize,
+    error: Option<String>,
+}
+
+impl FreeInputModal {
+    fn new() -> Self {
+        Self {
+            title: "自由发文".to_string(),
+            content: String::new(),
+            save_to_file: false,
+            save_path: "./自由发文.txt".to_string(),
+            focus: FREE_INPUT_FOCUS_CONTENT,
+            error: None,
+        }
+    }
+
+    fn update_default_save_path(&mut self) {
+        if !self.save_to_file
+            && (self.save_path.starts_with("./") && self.save_path.ends_with(".txt"))
+        {
+            let sanitized = if self.title.trim().is_empty() {
+                "自由发文"
+            } else {
+                self.title.trim()
+            };
+            self.save_path = format!("./{sanitized}.txt");
+        }
+    }
+
+    fn next_focus(&mut self) {
+        self.focus = match self.focus {
+            FREE_INPUT_FOCUS_TITLE => FREE_INPUT_FOCUS_CONTENT,
+            FREE_INPUT_FOCUS_CONTENT => FREE_INPUT_FOCUS_SAVE_CHECKBOX,
+            FREE_INPUT_FOCUS_SAVE_CHECKBOX => {
+                if self.save_to_file {
+                    FREE_INPUT_FOCUS_SAVE_PATH
+                } else {
+                    FREE_INPUT_FOCUS_SUBMIT_BTN
+                }
+            }
+            FREE_INPUT_FOCUS_SAVE_PATH => FREE_INPUT_FOCUS_SUBMIT_BTN,
+            FREE_INPUT_FOCUS_SUBMIT_BTN => FREE_INPUT_FOCUS_CANCEL_BTN,
+            _ => FREE_INPUT_FOCUS_TITLE,
+        };
+        self.error = None;
+    }
+
+    fn prev_focus(&mut self) {
+        self.focus = match self.focus {
+            FREE_INPUT_FOCUS_TITLE => FREE_INPUT_FOCUS_CANCEL_BTN,
+            FREE_INPUT_FOCUS_CONTENT => FREE_INPUT_FOCUS_TITLE,
+            FREE_INPUT_FOCUS_SAVE_CHECKBOX => FREE_INPUT_FOCUS_CONTENT,
+            FREE_INPUT_FOCUS_SAVE_PATH => FREE_INPUT_FOCUS_SAVE_CHECKBOX,
+            FREE_INPUT_FOCUS_SUBMIT_BTN => {
+                if self.save_to_file {
+                    FREE_INPUT_FOCUS_SAVE_PATH
+                } else {
+                    FREE_INPUT_FOCUS_SAVE_CHECKBOX
+                }
+            }
+            FREE_INPUT_FOCUS_CANCEL_BTN => FREE_INPUT_FOCUS_SUBMIT_BTN,
+            _ => FREE_INPUT_FOCUS_TITLE,
+        };
+        self.error = None;
+    }
+}
+
+/// 自由发文模态框按键动作。
+#[derive(Debug, PartialEq, Eq)]
+enum FreeInputAction {
+    None,
+    Submit {
+        title: String,
+        content: String,
+        save: Option<PathBuf>,
+    },
+    Cancel,
+}
+
 /// 应用全部状态（TUI 层）。
 struct App {
     /// 当前赛文（载文后替换）。
     text: Text,
     session: Session,
     start: Instant,
+    /// 累计活跃打字用时（暂停前积累的时间）。
+    accumulated_elapsed: Duration,
+    /// 当前活跃打字段的起始时刻（暂停时置为 None）。
+    active_start: Option<Instant>,
+    /// 是否处于暂停状态（打字中途按 Tab 触发）。
+    paused: bool,
     state: AppState,
     /// 功能栏是否展开。
     sidebar_visible: bool,
+    /// 功能栏当前选中的菜单项下标。
+    sidebar_selected: usize,
+    /// 功能栏通用临时通知/提示。
+    sidebar_notice: Option<String>,
     /// 载文浏览的文件列表。
     browse_files: Vec<PathBuf>,
     /// 文件列表当前选中下标。
@@ -170,6 +301,8 @@ struct App {
     builtin_preview: Option<(String, String)>,
     /// 自定义输入法名称弹窗（`None` = 未打开）。
     input_method_modal: Option<InputMethodModal>,
+    /// 自由发文编辑弹窗（`None` = 未打开）。
+    free_input_modal: Option<FreeInputModal>,
 }
 
 /// 登录模态框输入状态。
@@ -279,8 +412,13 @@ impl App {
             text,
             session,
             start: Instant::now(),
+            accumulated_elapsed: Duration::ZERO,
+            active_start: None,
+            paused: false,
             state: AppState::Typing,
             sidebar_visible: true,
+            sidebar_selected: 0,
+            sidebar_notice: None,
             browse_files: Vec::new(),
             browse_selection: 0,
             builtin_selection: 0,
@@ -300,6 +438,40 @@ impl App {
             builtin_shuffle: false,
             builtin_preview: None,
             input_method_modal: None,
+            free_input_modal: None,
+        }
+    }
+
+    /// 计算当前总活跃用时（已累计用时 + 当前活跃段）。
+    fn current_elapsed(&self) -> Duration {
+        if let Some(active) = self.active_start {
+            self.accumulated_elapsed + active.elapsed()
+        } else {
+            self.accumulated_elapsed
+        }
+    }
+
+    /// 暂停跟打计时。
+    fn pause(&mut self) {
+        if let Some(active) = self.active_start.take() {
+            self.accumulated_elapsed += active.elapsed();
+        }
+        self.paused = true;
+    }
+
+    /// 恢复跟打计时。
+    fn resume(&mut self) {
+        if self.paused {
+            self.active_start = Some(Instant::now());
+            self.paused = false;
+        }
+    }
+
+    /// 确保跟打计时处于启动活跃态。
+    fn touch_typing(&mut self) {
+        if self.paused || self.active_start.is_none() {
+            self.active_start = Some(Instant::now());
+            self.paused = false;
         }
     }
 
@@ -349,6 +521,68 @@ impl App {
         self.login_form = None;
     }
 
+    /// 打开自由发文模态框。
+    fn open_free_input(&mut self) {
+        self.free_input_modal = Some(FreeInputModal::new());
+        self.sidebar_notice = None;
+    }
+
+    /// 关闭自由发文模态框。
+    fn close_free_input(&mut self) {
+        self.free_input_modal = None;
+    }
+
+    /// 提交自由发文：处理内容、可选保存文件、载入赛文并开启新跟打。
+    fn submit_free_input(&mut self, title: String, content: String, save: Option<PathBuf>) {
+        let final_title = if title.trim().is_empty() {
+            "自由发文".to_string()
+        } else {
+            title.trim().to_string()
+        };
+        if let Some(path) = save {
+            if let Err(e) = save_text_to_file(&path, &content) {
+                if let Some(modal) = self.free_input_modal.as_mut() {
+                    modal.error = Some(format!("保存文件失败: {e}"));
+                    return;
+                }
+            }
+        }
+        match load_text_from_string(&final_title, content, TextSource::Custom, &self.options) {
+            Ok(text) => {
+                self.text = text;
+                self.free_input_modal = None;
+                self.restart();
+                self.sidebar_notice = Some(format!("已载入: {final_title}"));
+            }
+            Err(err) => {
+                if let Some(modal) = self.free_input_modal.as_mut() {
+                    modal.error = Some(match err {
+                        LoadError::Empty => "赛文正文为空或处理后为空".to_string(),
+                        _ => "载入赛文失败".to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    /// 从剪贴板载入赛文并开始跟打。
+    fn load_from_clipboard(&mut self) {
+        match load_text_from_clipboard(&self.options) {
+            Ok(text) => {
+                self.text = text;
+                self.restart();
+                self.sidebar_notice = Some("已载入剪贴板赛文".to_string());
+            }
+            Err(err) => {
+                self.sidebar_notice = Some(match err {
+                    LoadError::Empty => "剪贴板为空或处理后为空".to_string(),
+                    LoadError::ReadFailed => "无法读取系统剪贴板".to_string(),
+                    LoadError::NotFound => "剪贴板未找到文本".to_string(),
+                });
+            }
+        }
+    }
+
     /// 提交登录：调用网关，成功后持久化 token。
     fn submit_login(&mut self) {
         let Some(form) = self.login_form.as_mut() else {
@@ -392,6 +626,9 @@ impl App {
         self.session =
             Session::new_gated_with_words(&self.text.content, self.text.source.is_builtin(), &wb);
         self.start = Instant::now();
+        self.accumulated_elapsed = Duration::ZERO;
+        self.active_start = None;
+        self.paused = false;
         self.state = AppState::Typing;
         self.browse_error = None;
     }
@@ -401,7 +638,14 @@ impl App {
     /// 在线赛文置为「上传中」并返回 `Some((成绩, 用时))` 供调用方继续上传；
     /// 离线赛文直接进入成绩视图，返回 `None`。
     fn finish_typing(&mut self) -> Option<(Stats, Duration)> {
-        let elapsed = self.start.elapsed();
+        if let Some(active) = self.active_start.take() {
+            self.accumulated_elapsed += active.elapsed();
+        }
+        let elapsed = if self.accumulated_elapsed.is_zero() {
+            self.start.elapsed()
+        } else {
+            self.accumulated_elapsed
+        };
         let stats = self.session.finish(elapsed);
         let is_online = self.text.is_online();
         if is_online {
@@ -642,9 +886,20 @@ fn run_tui(app: App) -> io::Result<()> {
         emit_font_osc();
     }
     // bracketed paste：中文输入法（fcitx/ibus）上屏以 paste 事件到达，必须启用
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste);
+    // 键盘增强协议（Kitty keyboard protocol）：支持终端准确发送 Ctrl+Enter 修饰键
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        crossterm::event::EnableBracketedPaste,
+        crossterm::event::PushKeyboardEnhancementFlags(
+            crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        )
+    );
     let result = event_loop(&mut terminal, app);
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        crossterm::event::PopKeyboardEnhancementFlags,
+        crossterm::event::DisableBracketedPaste
+    );
     ratatui::restore();
     result
 }
@@ -687,8 +942,20 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                     }
                     continue;
                 }
-                if is_toggle_sidebar(key) {
-                    app.sidebar_visible = !app.sidebar_visible;
+                // 自由发文模态框打开时优先处理其按键。
+                if let Some(modal) = app.free_input_modal.as_mut() {
+                    let action = free_input_modal_input(modal, key);
+                    match action {
+                        FreeInputAction::Cancel => app.close_free_input(),
+                        FreeInputAction::Submit {
+                            title,
+                            content,
+                            save,
+                        } => {
+                            app.submit_free_input(title, content, save);
+                        }
+                        FreeInputAction::None => {}
+                    }
                     continue;
                 }
                 if is_open_login(key) {
@@ -718,22 +985,60 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                             continue;
                         }
                         if let Some(competition_type) = online_shortcut(key) {
-                            if !app.logged_in {
-                                // 未登录：引导先登录。
-                                app.online_error =
-                                    Some("请先登录 52dazi 后再载入在线赛文".to_string());
-                                app.open_login();
+                            trigger_online_competition(&mut app, competition_type, terminal)?;
+                            continue;
+                        }
+
+                        // Tab 键：打字中途暂停/恢复；就绪态收起/展开功能栏
+                        if key.code == KeyCode::Tab {
+                            if !app.session.is_empty() {
+                                if app.paused {
+                                    app.resume();
+                                } else {
+                                    app.pause();
+                                }
                             } else {
-                                app.online_loading = Some(competition_type);
-                                // 先渲染「加载中...」，再同步下载。
-                                terminal.draw(|frame| ui(frame, &app))?;
-                                app.download_online(competition_type);
+                                app.sidebar_visible = !app.sidebar_visible;
                             }
                             continue;
                         }
-                        handle_key(&mut app.session, key, app.start.elapsed());
-                        if app.session.is_complete() {
-                            finish_and_maybe_upload(&mut app, terminal)?;
+
+                        // 就绪态或暂停态下，上下键在功能栏导航，Enter 激活菜单项
+                        let is_menu_navigating = app.session.is_empty() || app.paused;
+                        if is_menu_navigating {
+                            match key.code {
+                                KeyCode::Up => {
+                                    app.sidebar_selected = if app.sidebar_selected == 0 {
+                                        SIDEBAR_MENU_ITEMS.len() - 1
+                                    } else {
+                                        app.sidebar_selected - 1
+                                    };
+                                    continue;
+                                }
+                                KeyCode::Down => {
+                                    app.sidebar_selected =
+                                        (app.sidebar_selected + 1) % SIDEBAR_MENU_ITEMS.len();
+                                    continue;
+                                }
+                                KeyCode::Enter => {
+                                    activate_sidebar_menu_item(&mut app, terminal)?;
+                                    continue;
+                                }
+                                KeyCode::Esc if app.paused => {
+                                    app.resume();
+                                    continue;
+                                }
+                                _ => {}
+                            }
+                        }
+
+                        if matches!(key.code, KeyCode::Backspace | KeyCode::Char(_)) {
+                            app.touch_typing();
+                            let elapsed = app.current_elapsed();
+                            handle_key(&mut app.session, key, elapsed);
+                            if app.session.is_complete() {
+                                finish_and_maybe_upload(&mut app, terminal)?;
+                            }
                         }
                     }
                     AppState::Finished { .. } => {
@@ -806,7 +1111,6 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                                     } else {
                                         cycle_input_method_prev(&app.settings.input_method)
                                     };
-                                    // 「自定义」预设的弹窗由 Enter 键触发，此处只轮转选中
                                     app.settings.input_method = next;
                                     let _ = app.settings_store.save(&app.settings);
                                 }
@@ -814,7 +1118,6 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                             }
                         }
                         KeyCode::Enter => {
-                            // 输入法行且当前为「自定义」或已有自定义名称时打开弹窗
                             if app.settings_focus == FOCUS_INPUT_METHOD
                                 && input_method_preset_index(&app.settings.input_method)
                                     == INPUT_METHOD_PRESETS.len() - 1
@@ -829,8 +1132,32 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                 }
             }
             Event::Paste(committed) => {
+                if let Some(modal) = app.free_input_modal.as_mut() {
+                    match modal.focus {
+                        FREE_INPUT_FOCUS_TITLE => {
+                            modal.title.push_str(&committed);
+                            modal.update_default_save_path();
+                        }
+                        FREE_INPUT_FOCUS_CONTENT => {
+                            modal.content.push_str(&committed);
+                        }
+                        FREE_INPUT_FOCUS_SAVE_PATH => {
+                            modal.save_path.push_str(&committed);
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+                if let Some(modal) = app.input_method_modal.as_mut() {
+                    for c in committed.chars() {
+                        modal.push_char(c);
+                    }
+                    continue;
+                }
                 if matches!(app.state, AppState::Typing) {
-                    app.session.type_text_at(&committed, app.start.elapsed());
+                    app.touch_typing();
+                    let elapsed = app.current_elapsed();
+                    app.session.type_text_at(&committed, elapsed);
                     if app.session.is_complete() {
                         finish_and_maybe_upload(&mut app, terminal)?;
                     }
@@ -841,18 +1168,74 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
     }
 }
 
-/// 完成跟打：进入成绩视图；在线赛文先渲染「上传中」再同步上传成绩。
-fn finish_and_maybe_upload(
+/// 触发在线比赛赛文下载（未登录时引导登录）。
+fn trigger_online_competition<B: ratatui::backend::Backend>(
     app: &mut App,
-    terminal: &mut ratatui::DefaultTerminal,
+    competition_type: CompetitionType,
+    terminal: &mut ratatui::Terminal<B>,
+) -> io::Result<()> {
+    if !app.logged_in {
+        app.online_error = Some("请先登录 52dazi 后再载入在线赛文".to_string());
+        app.open_login();
+    } else {
+        app.online_loading = Some(competition_type);
+        terminal
+            .draw(|frame| ui(frame, app))
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        app.download_online(competition_type);
+    }
+    Ok(())
+}
+
+/// 激活功能栏选中的菜单项。
+fn activate_sidebar_menu_item<B: ratatui::backend::Backend>(
+    app: &mut App,
+    terminal: &mut ratatui::Terminal<B>,
+) -> io::Result<()> {
+    let item = SIDEBAR_MENU_ITEMS
+        .get(app.sidebar_selected)
+        .copied()
+        .unwrap_or(SidebarMenuItem::LoadFile);
+    match item {
+        SidebarMenuItem::LoadFile => app.open_browser(),
+        SidebarMenuItem::BuiltinText => app.open_builtin_browser(),
+        SidebarMenuItem::FreeInput => app.open_free_input(),
+        SidebarMenuItem::Clipboard => app.load_from_clipboard(),
+        SidebarMenuItem::OnlineJisu => {
+            trigger_online_competition(app, CompetitionType::Jisu, terminal)?;
+        }
+        SidebarMenuItem::OnlineJinbiao => {
+            trigger_online_competition(app, CompetitionType::Jinbiao, terminal)?;
+        }
+        SidebarMenuItem::OnlineJianshen => {
+            trigger_online_competition(app, CompetitionType::Jianshen, terminal)?;
+        }
+        SidebarMenuItem::Settings => app.state = AppState::Settings,
+        SidebarMenuItem::Login => app.open_login(),
+    }
+    Ok(())
+}
+
+/// 完成跟打：进入成绩视图；在线赛文先渲染「上传中」再同步上传成绩。
+fn finish_and_maybe_upload<B: ratatui::backend::Backend>(
+    app: &mut App,
+    terminal: &mut ratatui::Terminal<B>,
 ) -> io::Result<()> {
     let result = app.finish_typing();
     if let Some((stats, elapsed)) = result {
         // 先渲染「上传中」，再同步上传（阻塞）。
-        terminal.draw(|frame| ui(frame, app))?;
+        terminal
+            .draw(|frame| ui(frame, app))
+            .map_err(|e| io::Error::other(e.to_string()))?;
         app.do_upload(&stats, elapsed);
     }
     Ok(())
+}
+
+/// 收起/展开功能栏：Tab。
+#[allow(dead_code)]
+fn is_toggle_sidebar(key: KeyEvent) -> bool {
+    key.code == KeyCode::Tab
 }
 
 /// 提前结束快捷键：Ctrl-S（Stop）。
@@ -870,16 +1253,175 @@ fn restart_allowed(key: KeyEvent, is_online: bool) -> bool {
     is_restart(key) && !is_online
 }
 
-/// 底部快捷键提示栏文案：按浏览状态与赛文来源动态切换（在线赛文不显示重打）。
-fn hint_text(browsing: bool, browsing_builtin: bool, is_online: bool) -> &'static str {
+/// 底部快捷键提示栏文案：按浏览状态与赛文来源动态切换。
+fn hint_text(
+    browsing: bool,
+    browsing_builtin: bool,
+    is_online: bool,
+    paused: bool,
+    is_ready: bool,
+) -> &'static str {
     if browsing {
         " ↑↓ 选择 | Enter 载入 | Esc 取消 | 1 去空格 | 2 去符号 | Ctrl-E 设置 | q 退出"
     } else if browsing_builtin {
         " ↑↓ 选择 | Enter 载入 | s 乱序 | Esc 取消 | q 退出"
+    } else if paused {
+        " ↑↓ 选择菜单 | Enter 激活 | Esc/Tab 恢复跟打 | q 退出"
+    } else if is_ready {
+        " ↑↓ 菜单导航 | Enter 执行 | 开始打字自动聚焦 | Ctrl-B 内置 | Ctrl-F 载文 | q 退出"
     } else if is_online {
-        " q 退出 | Ctrl-S 结束 | Ctrl-B 内置赛文 | Ctrl-F 载文 | Ctrl-O 登录 | Ctrl-E 设置 | Tab 收起栏 "
+        " q 退出 | Ctrl-S 结束 | Tab 暂停 | Ctrl-B 内置赛文 | Ctrl-F 载文 | Ctrl-O 登录 | Ctrl-E 设置 "
     } else {
-        " q 退出 | Ctrl-S 结束 | Ctrl-R 重打 | Ctrl-B 内置赛文 | Ctrl-F 载文 | Ctrl-O 登录 | Ctrl-E 设置 | Tab 收起栏 "
+        " q 退出 | Ctrl-S 结束 | Ctrl-R 重打 | Tab 暂停 | Ctrl-B 内置赛文 | Ctrl-F 载文 | Ctrl-O 登录 | Ctrl-E 设置 "
+    }
+}
+
+/// 处理自由发文模态框按键，返回动作。
+fn free_input_modal_input(modal: &mut FreeInputModal, key: KeyEvent) -> FreeInputAction {
+    if key.code == KeyCode::Esc {
+        return FreeInputAction::Cancel;
+    }
+
+    let is_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let is_alt = key.modifiers.contains(KeyModifiers::ALT);
+
+    let is_submit_shortcut = match key.code {
+        KeyCode::Enter if is_ctrl || is_alt => true,
+        KeyCode::Char('\n') | KeyCode::Char('\r') if is_ctrl || is_alt => true,
+        KeyCode::Char('s') | KeyCode::Char('S') if is_ctrl => true,
+        KeyCode::Char('d') | KeyCode::Char('D') if is_ctrl => true,
+        KeyCode::Char('j') | KeyCode::Char('J') if is_ctrl => true,
+        KeyCode::Char('m') | KeyCode::Char('M') if is_ctrl => true,
+        KeyCode::F(2) | KeyCode::F(10) => true,
+        _ => false,
+    };
+
+    if is_submit_shortcut {
+        return try_submit_free_input(modal);
+    }
+
+    if key.code == KeyCode::Tab {
+        modal.next_focus();
+        return FreeInputAction::None;
+    }
+    if key.code == KeyCode::BackTab {
+        modal.prev_focus();
+        return FreeInputAction::None;
+    }
+
+    match modal.focus {
+        FREE_INPUT_FOCUS_TITLE => match key.code {
+            KeyCode::Char(c) if !is_ctrl && !is_alt => {
+                modal.title.push(c);
+                modal.update_default_save_path();
+            }
+            KeyCode::Backspace => {
+                modal.title.pop();
+                modal.update_default_save_path();
+            }
+            KeyCode::Down | KeyCode::Enter => {
+                modal.focus = FREE_INPUT_FOCUS_CONTENT;
+            }
+            _ => {}
+        },
+        FREE_INPUT_FOCUS_CONTENT => match key.code {
+            KeyCode::Char(c) if !is_ctrl && !is_alt => {
+                modal.content.push(c);
+                modal.error = None;
+            }
+            KeyCode::Backspace => {
+                modal.content.pop();
+            }
+            KeyCode::Enter => {
+                modal.content.push('\n');
+            }
+            KeyCode::Up => {
+                if modal.content.is_empty() {
+                    modal.focus = FREE_INPUT_FOCUS_TITLE;
+                }
+            }
+            _ => {}
+        },
+        FREE_INPUT_FOCUS_SAVE_CHECKBOX => match key.code {
+            KeyCode::Char(' ') | KeyCode::Enter => {
+                modal.save_to_file = !modal.save_to_file;
+                modal.update_default_save_path();
+            }
+            KeyCode::Up => modal.focus = FREE_INPUT_FOCUS_CONTENT,
+            KeyCode::Down => {
+                if modal.save_to_file {
+                    modal.focus = FREE_INPUT_FOCUS_SAVE_PATH;
+                } else {
+                    modal.focus = FREE_INPUT_FOCUS_SUBMIT_BTN;
+                }
+            }
+            _ => {}
+        },
+        FREE_INPUT_FOCUS_SAVE_PATH => match key.code {
+            KeyCode::Char(c) if !is_ctrl && !is_alt => {
+                modal.save_path.push(c);
+                modal.error = None;
+            }
+            KeyCode::Backspace => {
+                modal.save_path.pop();
+            }
+            KeyCode::Up => modal.focus = FREE_INPUT_FOCUS_SAVE_CHECKBOX,
+            KeyCode::Down | KeyCode::Enter => modal.focus = FREE_INPUT_FOCUS_SUBMIT_BTN,
+            _ => {}
+        },
+        FREE_INPUT_FOCUS_SUBMIT_BTN => match key.code {
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                return try_submit_free_input(modal);
+            }
+            KeyCode::Left | KeyCode::Up => {
+                if modal.save_to_file {
+                    modal.focus = FREE_INPUT_FOCUS_SAVE_PATH;
+                } else {
+                    modal.focus = FREE_INPUT_FOCUS_SAVE_CHECKBOX;
+                }
+            }
+            KeyCode::Right | KeyCode::Down => {
+                modal.focus = FREE_INPUT_FOCUS_CANCEL_BTN;
+            }
+            _ => {}
+        },
+        FREE_INPUT_FOCUS_CANCEL_BTN => match key.code {
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                return FreeInputAction::Cancel;
+            }
+            KeyCode::Left | KeyCode::Up => {
+                modal.focus = FREE_INPUT_FOCUS_SUBMIT_BTN;
+            }
+            KeyCode::Right | KeyCode::Down => {
+                modal.focus = FREE_INPUT_FOCUS_TITLE;
+            }
+            _ => {}
+        },
+        _ => {}
+    }
+
+    FreeInputAction::None
+}
+
+/// 尝试提交自由发文。
+fn try_submit_free_input(modal: &mut FreeInputModal) -> FreeInputAction {
+    if modal.content.trim().is_empty() {
+        modal.error = Some("赛文正文不能为空".to_string());
+        return FreeInputAction::None;
+    }
+    let save_path = if modal.save_to_file {
+        if modal.save_path.trim().is_empty() {
+            modal.error = Some("保存路径不能为空".to_string());
+            return FreeInputAction::None;
+        }
+        Some(PathBuf::from(modal.save_path.trim()))
+    } else {
+        None
+    };
+    FreeInputAction::Submit {
+        title: modal.title.clone(),
+        content: modal.content.clone(),
+        save: save_path,
     }
 }
 
@@ -891,11 +1433,6 @@ fn is_open_browser(key: KeyEvent) -> bool {
 /// 进入内置赛文浏览快捷键：Ctrl-B（Builtin）。
 fn is_open_builtin_browser(key: KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('b')
-}
-
-/// 收起/展开功能栏：Tab。
-fn is_toggle_sidebar(key: KeyEvent) -> bool {
-    key.code == KeyCode::Tab
 }
 
 /// 处理跟打键：退格回改，可打印字符上屏；同时记录按键频率与时序事件。
@@ -1178,6 +1715,19 @@ fn ui(frame: &mut Frame, app: &App) {
             ref_area,
         );
         // 下：跟打区（实时绿/红渲染）
+        let typing_title = if app.paused {
+            format!(
+                " 跟打区 [已暂停] — {}/{} 字符 ",
+                app.session.len(),
+                app.text.content.chars().count()
+            )
+        } else {
+            format!(
+                " 跟打区 — {}/{} 字符 ",
+                app.session.len(),
+                app.text.content.chars().count()
+            )
+        };
         frame.render_widget(
             Paragraph::new(type_line(
                 &app.session,
@@ -1185,26 +1735,31 @@ fn ui(frame: &mut Frame, app: &App) {
                 app.theme(),
                 app.settings.bold,
             ))
-            .block(themed_block(app.theme()).title(format!(
-                " 跟打区 — {}/{} 字符 ",
-                app.session.len(),
-                app.text.content.chars().count()
-            )))
+            .block(themed_block(app.theme()).title(typing_title))
             .wrap(Wrap { trim: false }),
             type_area,
         );
     }
 
     // 底部快捷键提示 bar
-    let hint = hint_text(browsing, browsing_builtin, app.text.is_online());
+    let hint = hint_text(
+        browsing,
+        browsing_builtin,
+        app.text.is_online(),
+        app.paused,
+        app.session.is_empty(),
+    );
     frame.render_widget(Paragraph::new(Line::from(hint)), help_bar);
 
-    // 登录模态框（覆盖层）
+    // 模态框（覆盖层）
     if let Some(form) = &app.login_form {
         render_login_modal(frame, form, app.theme());
     }
     if let Some(modal) = &app.input_method_modal {
         render_input_method_modal(frame, modal, app.theme());
+    }
+    if let Some(modal) = &app.free_input_modal {
+        render_free_input_modal(frame, modal, app.theme());
     }
 }
 
@@ -1265,6 +1820,139 @@ fn render_input_method_modal(frame: &mut Frame, modal: &InputMethodModal, theme:
     );
 }
 
+/// 自由发文模态框：居中弹层，标题 + 多行正文 + 保存选项。
+fn render_free_input_modal(frame: &mut Frame, modal: &FreeInputModal, theme: Theme) {
+    let area = centered_rect(frame.area(), 68, 20);
+    frame.render_widget(Clear, area);
+
+    let outer_block = themed_block(theme).title(" 自由发文 ");
+    frame.render_widget(outer_block, area);
+
+    let inner_area = Rect {
+        x: area.x + 2,
+        y: area.y + 1,
+        width: area.width.saturating_sub(4),
+        height: area.height.saturating_sub(2),
+    };
+
+    let [title_rect, content_rect, save_rect, button_rect, hint_rect] = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Min(6),
+        Constraint::Length(3),
+        Constraint::Length(1),
+        Constraint::Length(2),
+    ])
+    .areas(inner_area);
+
+    // 1. 标题
+    let is_title_focus = modal.focus == FREE_INPUT_FOCUS_TITLE;
+    let title_prefix = if is_title_focus {
+        "▸ 标题: "
+    } else {
+        "  标题: "
+    };
+    let mut title_spans = vec![Span::raw(title_prefix)];
+    if is_title_focus {
+        title_spans[0] = Span::styled(
+            title_prefix,
+            Style::default().fg(color(theme.accent)).bold(),
+        );
+    }
+    title_spans.push(Span::raw(&modal.title));
+    frame.render_widget(Paragraph::new(Line::from(title_spans)), title_rect);
+
+    // 2. 正文
+    let is_content_focus = modal.focus == FREE_INPUT_FOCUS_CONTENT;
+    let content_border_style = if is_content_focus {
+        Style::default().fg(color(theme.accent))
+    } else {
+        Style::default().fg(color(theme.text))
+    };
+    let content_title = format!(" 赛文正文（{} 字）", modal.content.chars().count());
+    frame.render_widget(
+        Paragraph::new(modal.content.as_str())
+            .block(
+                Block::bordered()
+                    .title(content_title)
+                    .border_style(content_border_style),
+            )
+            .wrap(Wrap { trim: false }),
+        content_rect,
+    );
+
+    // 3. 保存复选框与路径
+    let is_cb_focus = modal.focus == FREE_INPUT_FOCUS_SAVE_CHECKBOX;
+    let is_path_focus = modal.focus == FREE_INPUT_FOCUS_SAVE_PATH;
+    let cb_mark = if modal.save_to_file { "[x]" } else { "[ ]" };
+    let mut save_lines = vec![Line::from(vec![if is_cb_focus {
+        Span::styled(
+            format!("▸ {cb_mark} 保存为本地文件（空格切换）"),
+            Style::default().fg(color(theme.accent)).bold(),
+        )
+    } else {
+        Span::raw(format!("  {cb_mark} 保存为本地文件（空格切换）"))
+    }])];
+    if modal.save_to_file {
+        let path_prefix = if is_path_focus {
+            "    ▸ 路径: "
+        } else {
+            "      路径: "
+        };
+        let mut path_spans = vec![Span::raw(path_prefix)];
+        if is_path_focus {
+            path_spans[0] =
+                Span::styled(path_prefix, Style::default().fg(color(theme.accent)).bold());
+        }
+        path_spans.push(Span::raw(&modal.save_path));
+        save_lines.push(Line::from(path_spans));
+    }
+    frame.render_widget(Paragraph::new(save_lines), save_rect);
+
+    // 4. 按钮行
+    let is_submit_focus = modal.focus == FREE_INPUT_FOCUS_SUBMIT_BTN;
+    let is_cancel_focus = modal.focus == FREE_INPUT_FOCUS_CANCEL_BTN;
+
+    let submit_btn = if is_submit_focus {
+        Span::styled(
+            " [ 确认发文 (Ctrl-Enter/F2) ] ",
+            Style::default().reversed().fg(color(theme.accent)).bold(),
+        )
+    } else {
+        Span::styled(
+            " [ 确认发文 (Ctrl-Enter/F2) ] ",
+            Style::default().fg(color(theme.accent)).bold(),
+        )
+    };
+
+    let cancel_btn = if is_cancel_focus {
+        Span::styled(
+            " [ 取消 (Esc) ] ",
+            Style::default().reversed().fg(color(theme.muted)).bold(),
+        )
+    } else {
+        Span::styled(" [ 取消 (Esc) ] ", Style::default().fg(color(theme.muted)))
+    };
+
+    let button_line = Line::from(vec![
+        Span::raw("  "),
+        submit_btn,
+        Span::raw("   "),
+        cancel_btn,
+    ]);
+    frame.render_widget(Paragraph::new(button_line), button_rect);
+
+    // 5. 底部提示 / 错误
+    let hint_lines = if let Some(err) = &modal.error {
+        vec![Line::from(format!(" 错误: {err}")).fg(color(theme.wrong))]
+    } else {
+        vec![
+            Line::from(" Ctrl-Enter / F2 / Ctrl-S 快速发文 | Enter 换行 | Tab 切换焦点 | Esc 取消")
+                .fg(color(theme.muted)),
+        ]
+    };
+    frame.render_widget(Paragraph::new(hint_lines), hint_rect);
+}
+
 /// 计算居中矩形。
 fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
     let w = width.min(area.width);
@@ -1279,7 +1967,7 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
     }
 }
 
-/// 左侧功能栏：文件列表 + 载文选项开关。
+/// 左侧功能栏：菜单列表 + 载文选项开关。
 fn render_sidebar(
     frame: &mut Frame,
     app: &App,
@@ -1321,9 +2009,52 @@ fn render_sidebar(
             lines.push(Line::from(format!("{prefix}{}", set.name())));
         }
     } else {
-        lines.push(Line::from(" 载入文件（Ctrl-F）").fg(color(theme.muted)));
-        lines.push(Line::from(" 内置赛文（Ctrl-B）").fg(color(theme.muted)));
+        if app.paused {
+            lines.push(Line::from(" [跟打已暂停]").bold().fg(color(theme.warn)));
+        }
+        lines.push(Line::from(" 赛文来源:").bold());
+
+        for (idx, item) in SIDEBAR_MENU_ITEMS.iter().enumerate() {
+            let is_sel = idx == app.sidebar_selected && (app.session.is_empty() || app.paused);
+            let prefix = if is_sel { " > " } else { "   " };
+            let (label, is_accent, is_warn) = match item {
+                SidebarMenuItem::LoadFile => ("载入文件（Ctrl-F）", false, false),
+                SidebarMenuItem::BuiltinText => ("内置赛文（Ctrl-B）", false, false),
+                SidebarMenuItem::FreeInput => ("自由发文", false, false),
+                SidebarMenuItem::Clipboard => ("剪贴板发文", false, false),
+                SidebarMenuItem::OnlineJisu => ("F1 极速杯", false, false),
+                SidebarMenuItem::OnlineJinbiao => ("F2 锦标赛", false, false),
+                SidebarMenuItem::OnlineJianshen => ("F3 键神杯", false, false),
+                SidebarMenuItem::Settings => ("设置（Ctrl-E）", false, false),
+                SidebarMenuItem::Login => {
+                    if app.logged_in {
+                        ("已登录 52dazi", true, false)
+                    } else {
+                        ("登录 52dazi（Ctrl-O）", false, true)
+                    }
+                }
+            };
+
+            if *item == SidebarMenuItem::OnlineJisu {
+                lines.push(Line::from(""));
+                lines.push(Line::from(" 在线比赛:").bold());
+            } else if *item == SidebarMenuItem::Settings {
+                lines.push(Line::from(""));
+                lines.push(Line::from(" 系统:").bold());
+            }
+
+            let mut line = Line::from(format!("{prefix}{label}"));
+            if is_sel {
+                line = line.fg(color(theme.accent)).bold();
+            } else if is_accent {
+                line = line.fg(color(theme.accent));
+            } else if is_warn {
+                line = line.fg(color(theme.warn));
+            }
+            lines.push(line);
+        }
     }
+
     lines.push(Line::from(""));
     lines.push(Line::from(" 载文选项:").bold());
     let ws = if app.options.strip_whitespace {
@@ -1338,31 +2069,30 @@ fn render_sidebar(
     };
     lines.push(Line::from(format!(" {ws} 1 去空格")));
     lines.push(Line::from(format!(" {punct} 2 去符号")));
-    lines.push(Line::from(""));
-    lines.push(Line::from(" 在线:").bold());
-    let login_entry = if app.logged_in {
-        Line::from(" 已登录 52dazi").fg(color(theme.accent))
-    } else {
-        Line::from(" 登录 52dazi（Ctrl-O）").fg(color(theme.warn))
-    };
-    lines.push(login_entry);
+
+    // 提示信息（加载中 / 通知 / 错误）
+    if let Some(notice) = &app.sidebar_notice {
+        lines.push(Line::from(""));
+        lines.push(Line::from(format!(" {notice}")).fg(color(theme.accent)));
+    }
     if let Some(notice) = &app.login_notice {
         lines.push(Line::from(format!("  {notice}")).fg(color(theme.muted)));
     }
-    // 三个比赛入口。
-    lines.push(Line::from(" F1 极速杯"));
-    lines.push(Line::from(" F2 锦标赛"));
-    lines.push(Line::from(" F3 键神杯"));
-    // 加载中 / 错误提示。
     if let Some(ct) = app.online_loading {
         lines.push(Line::from(format!(" 正在载入{}...", ct.name())).fg(color(theme.accent)));
     }
     if let Some(err) = &app.online_error {
         lines.push(Line::from(format!(" {err}")).fg(color(theme.wrong)));
     }
+
+    let title = if app.paused {
+        " 功能栏 [已暂停] "
+    } else {
+        " 功能栏 "
+    };
     frame.render_widget(
         Paragraph::new(lines)
-            .block(themed_block(theme).title(" 功能栏 "))
+            .block(themed_block(theme).title(title))
             .wrap(Wrap { trim: false }),
         area,
     );
@@ -1759,6 +2489,12 @@ fn render_result_view(
         );
     }
 
+    let max_y_label_width = y_labels
+        .iter()
+        .map(|s| s.content.chars().count())
+        .max()
+        .unwrap_or(3) as u16;
+
     let chart = Chart::new(datasets)
         .block(themed_block(theme).title(" WPM 速度曲线 "))
         .x_axis(
@@ -1778,6 +2514,16 @@ fn render_result_view(
 
     frame.render_widget(chart, chart_area);
 
+    overlay_error_chars_on_chart(
+        frame.buffer_mut(),
+        chart_area,
+        stats,
+        max_x,
+        max_y,
+        max_y_label_width,
+        theme,
+    );
+
     frame.render_widget(
         Paragraph::new(timeline_lines)
             .block(themed_block(theme).title(" 错字时间线 "))
@@ -1786,6 +2532,71 @@ fn render_result_view(
     );
 
     frame.render_widget(Paragraph::new(hint_line), hint_area);
+}
+
+/// 在速度折线图上直接标注打错的字符（高亮渲染在对应时刻与 WPM 坐标处）。
+fn overlay_error_chars_on_chart(
+    buf: &mut ratatui::buffer::Buffer,
+    chart_area: Rect,
+    stats: &Stats,
+    max_x: f64,
+    max_y: f64,
+    max_y_label_width: u16,
+    theme: Theme,
+) {
+    if stats.error_points.is_empty() || chart_area.width < 15 || chart_area.height < 6 {
+        return;
+    }
+
+    let inner_x = chart_area.x + 1;
+    let inner_y = chart_area.y + 1;
+    let inner_w = chart_area.width.saturating_sub(2);
+    let inner_h = chart_area.height.saturating_sub(2);
+
+    let plot_x_start = inner_x + max_y_label_width + 1;
+    let plot_x_end = inner_x + inner_w.saturating_sub(1);
+    if plot_x_end <= plot_x_start {
+        return;
+    }
+    let plot_width = (plot_x_end - plot_x_start) as f64;
+
+    let plot_y_start = inner_y;
+    let plot_y_end = inner_y + inner_h.saturating_sub(2);
+    if plot_y_end <= plot_y_start {
+        return;
+    }
+    let plot_height = (plot_y_end - plot_y_start) as f64;
+
+    for ep in &stats.error_points {
+        let (ch, is_backspace) = match &ep.error_type {
+            ErrorType::Mismatch { typed, .. } => (*typed, false),
+            ErrorType::Backspace { deleted } => (*deleted, true),
+        };
+
+        let norm_x = (ep.time_secs / max_x).clamp(0.0, 1.0);
+        let norm_y = (ep.wpm / max_y).clamp(0.0, 1.0);
+
+        let col = plot_x_start + (norm_x * (plot_width - 1.0)).round() as u16;
+        let row = plot_y_end
+            .saturating_sub(1)
+            .saturating_sub((norm_y * (plot_height - 1.0)).round() as u16);
+
+        let char_width = if ch.is_ascii() { 1 } else { 2 };
+        let col = col.min(plot_x_end.saturating_sub(char_width));
+        let row = row.clamp(plot_y_start, plot_y_end.saturating_sub(1));
+
+        let style = if is_backspace {
+            Style::default()
+                .fg(color(theme.warn))
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        } else {
+            Style::default()
+                .fg(color(theme.wrong))
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+        };
+
+        buf.set_string(col, row, ch.to_string(), style);
+    }
 }
 
 /// 成绩视图里的上传状态行（纯函数，供渲染与测试）。
@@ -2247,14 +3058,18 @@ mod tests {
     #[test]
     fn hint_text_hides_restart_when_online() {
         // 离线跟打：显示重打提示。
-        assert!(hint_text(false, false, false).contains("重打"));
+        assert!(hint_text(false, false, false, false, false).contains("重打"));
         // 在线跟打：不显示重打提示。
-        assert!(!hint_text(false, false, true).contains("重打"));
+        assert!(!hint_text(false, false, true, false, false).contains("重打"));
         // 浏览态（载文选择）与来源无关，也不显示重打。
-        assert!(!hint_text(true, false, false).contains("重打"));
-        assert!(!hint_text(true, false, true).contains("重打"));
+        assert!(!hint_text(true, false, false, false, false).contains("重打"));
+        assert!(!hint_text(true, false, true, false, false).contains("重打"));
         // 内置赛文浏览态：不显示重打。
-        assert!(!hint_text(false, true, false).contains("重打"));
+        assert!(!hint_text(false, true, false, false, false).contains("重打"));
+        // 暂停态
+        assert!(hint_text(false, false, false, true, false).contains("恢复跟打"));
+        // 就绪态
+        assert!(hint_text(false, false, false, false, true).contains("菜单导航"));
     }
 
     #[test]
@@ -3974,6 +4789,7 @@ mod tests {
         assert!(clean_content.contains("WPM速度曲线"));
         assert!(clean_content.contains("错字时间线"));
         assert!(clean_content.contains("回改:'四'"));
+        assert!(clean_content.contains("四"));
         assert!(clean_content.contains("Esc返回"));
     }
 
@@ -3999,5 +4815,274 @@ mod tests {
         let clean_content = content.replace(' ', "");
         assert!(clean_content.contains("成绩"));
         assert!(clean_content.contains("Esc返回"));
+    }
+
+    // ---- Issues #45 / #46 / #47 自由发文、剪贴板发文与功能栏导航测试 ----
+
+    #[test]
+    fn free_input_modal_input_flow_and_submission() {
+        let mut modal = FreeInputModal::new();
+        assert_eq!(modal.focus, FREE_INPUT_FOCUS_CONTENT);
+
+        // 默认按 Ctrl-Enter 提交空内容 -> 报错
+        let ctrl_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL);
+        let action = free_input_modal_input(&mut modal, ctrl_enter);
+        assert_eq!(action, FreeInputAction::None);
+        assert!(modal.error.is_some());
+
+        // 输入正文
+        let char_a = KeyEvent::new(KeyCode::Char('我'), KeyModifiers::NONE);
+        free_input_modal_input(&mut modal, char_a);
+        let char_b = KeyEvent::new(KeyCode::Char('打'), KeyModifiers::NONE);
+        free_input_modal_input(&mut modal, char_b);
+        assert_eq!(modal.content, "我打");
+
+        // Tab 切换到保存勾选
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        free_input_modal_input(&mut modal, tab);
+        assert_eq!(modal.focus, FREE_INPUT_FOCUS_SAVE_CHECKBOX);
+
+        // 空格切换勾选
+        let space = KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE);
+        free_input_modal_input(&mut modal, space);
+        assert!(modal.save_to_file);
+
+        // Tab 切换到保存路径
+        free_input_modal_input(&mut modal, tab);
+        assert_eq!(modal.focus, FREE_INPUT_FOCUS_SAVE_PATH);
+        assert_eq!(modal.save_path, "./自由发文.txt");
+
+        // Tab 切换到确认发文按钮
+        free_input_modal_input(&mut modal, tab);
+        assert_eq!(modal.focus, FREE_INPUT_FOCUS_SUBMIT_BTN);
+
+        // Tab 切换到取消按钮
+        free_input_modal_input(&mut modal, tab);
+        assert_eq!(modal.focus, FREE_INPUT_FOCUS_CANCEL_BTN);
+
+        // 再次 Tab 循环回标题
+        free_input_modal_input(&mut modal, tab);
+        assert_eq!(modal.focus, FREE_INPUT_FOCUS_TITLE);
+
+        // 修改标题
+        let backspace = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
+        free_input_modal_input(&mut modal, backspace);
+        let char_c = KeyEvent::new(KeyCode::Char('章'), KeyModifiers::NONE);
+        free_input_modal_input(&mut modal, char_c);
+        assert_eq!(modal.title, "自由发章");
+
+        // 测试多种发文快捷键：
+        // 1. Ctrl-S (大写/小写)
+        let ctrl_s = KeyEvent::new(KeyCode::Char('S'), KeyModifiers::CONTROL);
+        let submit_action = free_input_modal_input(&mut modal, ctrl_s);
+        assert_eq!(
+            submit_action,
+            FreeInputAction::Submit {
+                title: "自由发章".to_string(),
+                content: "我打".to_string(),
+                save: Some(PathBuf::from("./自由发文.txt")),
+            }
+        );
+
+        // 2. F2 快捷键
+        let f2 = KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE);
+        assert_eq!(
+            free_input_modal_input(&mut modal, f2),
+            FreeInputAction::Submit {
+                title: "自由发章".to_string(),
+                content: "我打".to_string(),
+                save: Some(PathBuf::from("./自由发文.txt")),
+            }
+        );
+
+        // 3. Alt-Enter 快捷键
+        let alt_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT);
+        assert_eq!(
+            free_input_modal_input(&mut modal, alt_enter),
+            FreeInputAction::Submit {
+                title: "自由发章".to_string(),
+                content: "我打".to_string(),
+                save: Some(PathBuf::from("./自由发文.txt")),
+            }
+        );
+
+        // 4. Ctrl-Enter 快捷键
+        assert_eq!(
+            free_input_modal_input(&mut modal, ctrl_enter),
+            FreeInputAction::Submit {
+                title: "自由发章".to_string(),
+                content: "我打".to_string(),
+                save: Some(PathBuf::from("./自由发文.txt")),
+            }
+        );
+
+        // 5. 焦点移动到提交按钮并按 Enter 提交
+        modal.focus = FREE_INPUT_FOCUS_SUBMIT_BTN;
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(
+            free_input_modal_input(&mut modal, enter),
+            FreeInputAction::Submit {
+                title: "自由发章".to_string(),
+                content: "我打".to_string(),
+                save: Some(PathBuf::from("./自由发文.txt")),
+            }
+        );
+
+        // 6. 焦点移动到取消按钮并按 Enter 取消
+        modal.focus = FREE_INPUT_FOCUS_CANCEL_BTN;
+        assert_eq!(
+            free_input_modal_input(&mut modal, enter),
+            FreeInputAction::Cancel
+        );
+
+        // 7. Esc 取消
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(
+            free_input_modal_input(&mut modal, esc),
+            FreeInputAction::Cancel
+        );
+    }
+
+    #[test]
+    fn app_submit_free_input_creates_custom_session() {
+        let mut app = test_app(file_text("初始文本"));
+        let dir = temp_dir("custom_save");
+        let temp_file = dir.join("saved_custom.txt");
+
+        app.open_free_input();
+        assert!(app.free_input_modal.is_some());
+
+        app.submit_free_input(
+            "测试自定标题".to_string(),
+            "自定义打字内容第一行\n第二行".to_string(),
+            Some(temp_file.clone()),
+        );
+
+        assert!(app.free_input_modal.is_none());
+        assert_eq!(app.text.title, "测试自定标题");
+        assert_eq!(app.text.content, "自定义打字内容第一行\n第二行");
+        assert_eq!(app.text.source, TextSource::Custom);
+        assert_eq!(app.session.len(), 0);
+        assert_eq!(app.sidebar_notice.as_deref(), Some("已载入: 测试自定标题"));
+
+        // 验证文件是否已保存到本地
+        let file_content = fs::read_to_string(&temp_file).expect("文件应存在");
+        assert_eq!(file_content, "自定义打字内容第一行\n第二行");
+        let _ = fs::remove_file(&temp_file);
+
+        // 验证重打
+        app.session.type_text("自定义打字内容");
+        assert_eq!(app.session.len(), 7);
+        app.restart();
+        assert_eq!(app.session.len(), 0);
+        assert_eq!(app.text.title, "测试自定标题");
+    }
+
+    #[test]
+    fn app_pause_and_resume_freezes_timer() {
+        let mut app = test_app(file_text("测试计时文本"));
+        assert!(!app.paused);
+        assert_eq!(app.current_elapsed(), Duration::ZERO);
+
+        // 开始打字
+        app.touch_typing();
+        assert!(!app.paused);
+        assert!(app.active_start.is_some());
+
+        // 暂停
+        app.pause();
+        assert!(app.paused);
+        assert!(app.active_start.is_none());
+        let paused_elapsed = app.current_elapsed();
+
+        // 恢复
+        app.resume();
+        assert!(!app.paused);
+        assert!(app.active_start.is_some());
+        assert!(app.current_elapsed() >= paused_elapsed);
+    }
+
+    #[test]
+    fn sidebar_menu_navigation_and_activation() {
+        let mut app = test_app(file_text("测试导航"));
+        assert_eq!(app.sidebar_selected, 0);
+
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+
+        // 激活 自由发文 (index 2)
+        app.sidebar_selected = 2;
+        assert_eq!(
+            SIDEBAR_MENU_ITEMS[app.sidebar_selected],
+            SidebarMenuItem::FreeInput
+        );
+        activate_sidebar_menu_item(&mut app, &mut terminal).unwrap();
+        assert!(app.free_input_modal.is_some());
+        app.close_free_input();
+
+        // 激活 载入文件 (index 0)
+        app.sidebar_selected = 0;
+        activate_sidebar_menu_item(&mut app, &mut terminal).unwrap();
+        assert!(matches!(app.state, AppState::Browsing));
+        app.state = AppState::Typing;
+
+        // 激活 内置赛文 (index 1)
+        app.sidebar_selected = 1;
+        activate_sidebar_menu_item(&mut app, &mut terminal).unwrap();
+        assert!(matches!(app.state, AppState::BrowsingBuiltin));
+        app.state = AppState::Typing;
+
+        // 激活 设置 (index 7)
+        app.sidebar_selected = 7;
+        activate_sidebar_menu_item(&mut app, &mut terminal).unwrap();
+        assert!(matches!(app.state, AppState::Settings));
+        app.state = AppState::Typing;
+    }
+
+    #[test]
+    fn render_ui_with_free_input_modal_and_paused_sidebar() {
+        let mut app = test_app(file_text("测试弹窗渲染"));
+        app.open_free_input();
+
+        let backend = ratatui::backend::TestBackend::new(90, 28);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| ui(f, &app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let content = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let clean = content.replace(' ', "");
+        assert!(clean.contains("自由发文"));
+        assert!(clean.contains("标题"));
+        assert!(clean.contains("赛文正文"));
+        assert!(clean.contains("保存为本地文件"));
+        assert!(clean.contains("确认发文"));
+        assert!(clean.contains("Ctrl-Enter"));
+
+        // 测试暂停态功能栏渲染
+        app.close_free_input();
+        app.session.type_text("测");
+        app.pause();
+        terminal.draw(|f| ui(f, &app)).unwrap();
+
+        let buffer2 = terminal.backend().buffer();
+        let content2 = (0..buffer2.area.height)
+            .map(|y| {
+                (0..buffer2.area.width)
+                    .map(|x| buffer2[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let clean2 = content2.replace(' ', "");
+        assert!(clean2.contains("恢复跟打"));
     }
 }

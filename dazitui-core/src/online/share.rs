@@ -50,6 +50,8 @@ pub fn format_share_text(
 ) -> String {
     let name = match source {
         TextSource::File => "本地",
+        TextSource::Custom => "自由发文",
+        TextSource::Clipboard => "剪贴板",
         TextSource::Builtin { set } => set.name(),
         TextSource::Online { competition_type } => competition_type.name(),
     };
