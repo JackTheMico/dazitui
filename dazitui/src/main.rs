@@ -1262,17 +1262,17 @@ fn hint_text(
     is_ready: bool,
 ) -> &'static str {
     if browsing {
-        " ↑↓ 选择 | Enter 载入 | Esc 取消 | 1 去空格 | 2 去符号 | Ctrl-E 设置 | q 退出"
+        " ↑↓ 选择 | Enter 载入 | Esc 取消 | 1 去空格 | 2 去符号 | Ctrl-E 设置 | Ctrl-Q 退出"
     } else if browsing_builtin {
-        " ↑↓ 选择 | Enter 载入 | s 乱序 | Esc 取消 | q 退出"
+        " ↑↓ 选择 | Enter 载入 | s 乱序 | Esc 取消 | Ctrl-Q 退出"
     } else if paused {
-        " ↑↓ 选择菜单 | Enter 激活 | Esc/Tab 恢复跟打 | q 退出"
+        " ↑↓ 选择菜单 | Enter 激活 | Esc/Tab 恢复跟打 | Ctrl-Q 退出"
     } else if is_ready {
-        " ↑↓ 菜单导航 | Enter 执行 | 开始打字自动聚焦 | Ctrl-B 内置 | Ctrl-F 载文 | q 退出"
+        " ↑↓ 菜单导航 | Enter 执行 | 开始打字自动聚焦 | Ctrl-B 内置 | Ctrl-F 载文 | Ctrl-Q 退出"
     } else if is_online {
-        " q 退出 | Ctrl-S 结束 | Tab 暂停 | Ctrl-B 内置赛文 | Ctrl-F 载文 | Ctrl-O 登录 | Ctrl-E 设置 "
+        " Ctrl-Q 退出 | Ctrl-S 结束 | Tab 暂停 | Ctrl-B 内置赛文 | Ctrl-F 载文 | Ctrl-O 登录 | Ctrl-E 设置 "
     } else {
-        " q 退出 | Ctrl-S 结束 | Ctrl-R 重打 | Tab 暂停 | Ctrl-B 内置赛文 | Ctrl-F 载文 | Ctrl-O 登录 | Ctrl-E 设置 "
+        " Ctrl-Q 退出 | Ctrl-S 结束 | Ctrl-R 重打 | Tab 暂停 | Ctrl-B 内置赛文 | Ctrl-F 载文 | Ctrl-O 登录 | Ctrl-E 设置 "
     }
 }
 
@@ -1487,10 +1487,12 @@ fn handle_finished_key(app: &mut App, key: KeyEvent) -> bool {
     }
 }
 
-/// 退出快捷键：q / Q / Ctrl-C。
+/// 退出快捷键：Ctrl-Q / Ctrl-C（防止单按 q 误触退出）。
 fn is_quit(key: KeyEvent) -> bool {
     let is_ctrl_c = key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c');
-    key.code == KeyCode::Char('q') || key.code == KeyCode::Char('Q') || is_ctrl_c
+    let is_ctrl_q = key.modifiers.contains(KeyModifiers::CONTROL)
+        && (key.code == KeyCode::Char('q') || key.code == KeyCode::Char('Q'));
+    is_ctrl_q || is_ctrl_c
 }
 
 /// 打开登录模态框快捷键：Ctrl-O。
@@ -2387,13 +2389,16 @@ fn render_result_view(
             need_relogin: true, ..
         } = upload
         {
-            Line::from(" Esc 返回 | Ctrl-O 登录并上传 | Ctrl-F 载文 | Ctrl-B 内置赛文 | q 退出")
-                .fg(color(theme.muted))
+            Line::from(
+                " Esc 返回 | Ctrl-O 登录并上传 | Ctrl-F 载文 | Ctrl-B 内置赛文 | Ctrl-Q 退出",
+            )
+            .fg(color(theme.muted))
         } else {
-            Line::from(" Esc 返回 | Ctrl-F 载文 | Ctrl-B 内置赛文 | q 退出").fg(color(theme.muted))
+            Line::from(" Esc 返回 | Ctrl-F 载文 | Ctrl-B 内置赛文 | Ctrl-Q 退出")
+                .fg(color(theme.muted))
         }
     } else {
-        Line::from(" Esc 返回 | Enter/r 重打 | Ctrl-F 载文 | Ctrl-B 内置赛文 | q 退出")
+        Line::from(" Esc 返回 | Enter/r 重打 | Ctrl-F 载文 | Ctrl-B 内置赛文 | Ctrl-Q 退出")
             .fg(color(theme.muted))
     };
 
@@ -2986,12 +2991,24 @@ mod tests {
     }
 
     #[test]
-    fn q_quits() {
+    fn ctrl_q_quits() {
         assert!(is_quit(KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(is_quit(KeyEvent::new(
+            KeyCode::Char('Q'),
+            KeyModifiers::CONTROL
+        )));
+    }
+
+    #[test]
+    fn plain_q_does_not_quit() {
+        assert!(!is_quit(KeyEvent::new(
             KeyCode::Char('q'),
             KeyModifiers::NONE
         )));
-        assert!(is_quit(KeyEvent::new(
+        assert!(!is_quit(KeyEvent::new(
             KeyCode::Char('Q'),
             KeyModifiers::NONE
         )));
