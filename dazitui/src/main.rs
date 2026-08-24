@@ -11,7 +11,8 @@ use dazitui_core::{
     Session, SessionRecord, Settings, SettingsStore, Stats, StatsDb, Text, TextSource, Theme,
     TokenStore, env_credentials, format_time, is_auth_failure, load_builtin_text,
     load_builtin_text_shuffled, load_text_from_clipboard, load_text_from_file,
-    load_text_from_string, osc_font_size_sequence, osc52_clipboard, save_text_to_file,
+    load_text_from_string, lttb_downsample, osc_font_size_sequence, osc52_clipboard,
+    save_text_to_file,
 };
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -23,6 +24,57 @@ use ratatui::widgets::{
     Axis, Block, BorderType, Chart, Clear, Dataset, GraphType, Paragraph, Wrap,
 };
 use ratatui_themes::{ThemeName, ThemePalette};
+
+/// 统计视图子页面 / Tab。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum StatsTab {
+    #[default]
+    WpmTrend,
+    Heatmap,
+    ErrorRanking,
+}
+
+/// 速度趋势图的时间跨度范围。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum WpmChartRange {
+    #[default]
+    Recent30,
+    Recent100,
+    All,
+}
+
+impl WpmChartRange {
+    fn next(self) -> Self {
+        match self {
+            Self::Recent30 => Self::Recent100,
+            Self::Recent100 => Self::All,
+            Self::All => Self::Recent30,
+        }
+    }
+
+    fn limit(self) -> Option<usize> {
+        match self {
+            Self::Recent30 => Some(30),
+            Self::Recent100 => Some(100),
+            Self::All => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Recent30 => "近 30 场",
+            Self::Recent100 => "近 100 场",
+            Self::All => "全部历史",
+        }
+    }
+}
+
+/// 统计视图状态。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct StatsViewState {
+    tab: StatsTab,
+    wpm_range: WpmChartRange,
+}
 
 /// 将 core 的 ThemePreset 映射为 ratatui_themes 的 ThemePalette。
 pub fn theme_palette(preset: ThemePreset) -> ThemePalette {
@@ -56,6 +108,8 @@ enum AppState {
     BrowsingBuiltin,
     /// 设置视图：切换主题等外观设置。
     Settings,
+    /// 统计视图：速度趋势图、键位热力图与错字排行榜。
+    Stats(StatsViewState),
 }
 
 /// 设置视图焦点项下标。
@@ -131,6 +185,7 @@ enum SidebarMenuItem {
     OnlineJisu,
     OnlineJinbiao,
     OnlineJianshen,
+    Stats,
     Settings,
     Login,
 }
@@ -143,6 +198,7 @@ const SIDEBAR_MENU_ITEMS: &[SidebarMenuItem] = &[
     SidebarMenuItem::OnlineJisu,
     SidebarMenuItem::OnlineJinbiao,
     SidebarMenuItem::OnlineJianshen,
+    SidebarMenuItem::Stats,
     SidebarMenuItem::Settings,
     SidebarMenuItem::Login,
 ];
@@ -1212,6 +1268,36 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                         KeyCode::Esc => app.state = AppState::Typing,
                         _ => {}
                     },
+                    AppState::Stats(ref mut stats_state) => {
+                        if is_open_settings(key) {
+                            app.state = AppState::Settings;
+                            continue;
+                        }
+                        match key.code {
+                            KeyCode::Char('1') => stats_state.tab = StatsTab::WpmTrend,
+                            KeyCode::Char('2') => stats_state.tab = StatsTab::Heatmap,
+                            KeyCode::Char('3') => stats_state.tab = StatsTab::ErrorRanking,
+                            KeyCode::Tab | KeyCode::Right => {
+                                stats_state.tab = match stats_state.tab {
+                                    StatsTab::WpmTrend => StatsTab::Heatmap,
+                                    StatsTab::Heatmap => StatsTab::ErrorRanking,
+                                    StatsTab::ErrorRanking => StatsTab::WpmTrend,
+                                };
+                            }
+                            KeyCode::BackTab | KeyCode::Left => {
+                                stats_state.tab = match stats_state.tab {
+                                    StatsTab::WpmTrend => StatsTab::ErrorRanking,
+                                    StatsTab::Heatmap => StatsTab::WpmTrend,
+                                    StatsTab::ErrorRanking => StatsTab::Heatmap,
+                                };
+                            }
+                            KeyCode::Char('r') | KeyCode::Char('R') => {
+                                stats_state.wpm_range = stats_state.wpm_range.next();
+                            }
+                            KeyCode::Esc => app.state = AppState::Typing,
+                            _ => {}
+                        }
+                    }
                 }
             }
             Event::Paste(committed) => {
@@ -1293,6 +1379,7 @@ fn activate_sidebar_menu_item<B: ratatui::backend::Backend>(
         SidebarMenuItem::OnlineJianshen => {
             trigger_online_competition(app, CompetitionType::Jianshen, terminal)?;
         }
+        SidebarMenuItem::Stats => app.state = AppState::Stats(StatsViewState::default()),
         SidebarMenuItem::Settings => app.state = AppState::Settings,
         SidebarMenuItem::Login => app.open_login(),
     }
@@ -1587,6 +1674,10 @@ fn handle_finished_key(app: &mut App, key: KeyEvent) -> bool {
         return true;
     }
     match key.code {
+        KeyCode::Char('s') | KeyCode::Char('S') => {
+            app.state = AppState::Stats(StatsViewState::default());
+            true
+        }
         KeyCode::Esc => {
             if app.text.is_online() {
                 app.text = load_builtin_text(BUILTIN_SETS[0]);
@@ -1802,6 +1893,10 @@ fn ui(frame: &mut Frame, app: &App) {
     } = &app.state
     {
         render_result_view(frame, app, stats, upload, *elapsed);
+        return;
+    }
+    if let AppState::Stats(stats_state) = &app.state {
+        render_stats_view(frame, app, stats_state);
         return;
     }
     let palette = app.palette();
@@ -2236,6 +2331,7 @@ fn render_sidebar(
                 SidebarMenuItem::OnlineJisu => ("F1 极速杯", false, false),
                 SidebarMenuItem::OnlineJinbiao => ("F2 锦标赛", false, false),
                 SidebarMenuItem::OnlineJianshen => ("F3 键神杯", false, false),
+                SidebarMenuItem::Stats => ("数据统计（s）", false, false),
                 SidebarMenuItem::Settings => ("设置（Ctrl-E）", false, false),
                 SidebarMenuItem::Login => {
                     if app.logged_in {
@@ -2249,9 +2345,9 @@ fn render_sidebar(
             if *item == SidebarMenuItem::OnlineJisu {
                 lines.push(Line::from(""));
                 lines.push(Line::from(" 在线比赛:").bold().fg(palette.fg));
-            } else if *item == SidebarMenuItem::Settings {
+            } else if *item == SidebarMenuItem::Stats {
                 lines.push(Line::from(""));
-                lines.push(Line::from(" 系统:").bold().fg(palette.fg));
+                lines.push(Line::from(" 统计与系统:").bold().fg(palette.fg));
             }
 
             let mut line = Line::from(format!("{prefix}{label}"));
@@ -2455,6 +2551,351 @@ fn render_builtin_preview(frame: &mut Frame, app: &App, area: ratatui::layout::R
     );
 }
 
+/// 统计数据中心全局视图：顶部三级 Tab 导航与内容区。
+fn render_stats_view(frame: &mut Frame, app: &App, stats_state: &StatsViewState) {
+    let palette = app.palette();
+    let total_area = frame.area();
+
+    // 渲染全屏底色
+    frame.render_widget(
+        Block::default().style(Style::default().bg(palette.bg).fg(palette.fg)),
+        total_area,
+    );
+
+    // 垂直切分：顶部导航 Tab (高度 3) + 主内容区 (Min 0) + 底部快捷键 (高度 3)
+    let [header_area, body_area, hint_area] = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Min(0),
+        Constraint::Length(3),
+    ])
+    .areas(total_area);
+
+    // 1. 顶部 Tab 栏
+    let tab_spans = vec![
+        Span::raw("  "),
+        if stats_state.tab == StatsTab::WpmTrend {
+            Span::styled(
+                " ◖ 1. 速度趋势 ◗ ",
+                Style::default()
+                    .fg(palette.accent)
+                    .bg(palette.selection)
+                    .bold(),
+            )
+        } else {
+            Span::styled(
+                "   1. 速度趋势   ",
+                Style::default().fg(palette.muted).bg(palette.bg),
+            )
+        },
+        Span::raw("  "),
+        if stats_state.tab == StatsTab::Heatmap {
+            Span::styled(
+                " ◖ 2. 键位热力图 ◗ ",
+                Style::default()
+                    .fg(palette.accent)
+                    .bg(palette.selection)
+                    .bold(),
+            )
+        } else {
+            Span::styled(
+                "   2. 键位热力图   ",
+                Style::default().fg(palette.muted).bg(palette.bg),
+            )
+        },
+        Span::raw("  "),
+        if stats_state.tab == StatsTab::ErrorRanking {
+            Span::styled(
+                " ◖ 3. 错字排行 ◗ ",
+                Style::default()
+                    .fg(palette.accent)
+                    .bg(palette.selection)
+                    .bold(),
+            )
+        } else {
+            Span::styled(
+                "   3. 错字排行   ",
+                Style::default().fg(palette.muted).bg(palette.bg),
+            )
+        },
+    ];
+
+    let header_title = Line::from(vec![Span::styled(
+        " 统计数据中心 ",
+        Style::default().bold().fg(palette.accent),
+    )]);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(tab_spans))
+            .block(themed_block(&palette, true).title(header_title)),
+        header_area,
+    );
+
+    // 2. 主体区内容（按当前选中的 Tab 渲染）
+    match stats_state.tab {
+        StatsTab::WpmTrend => {
+            render_wpm_trend_tab(frame, app, body_area, stats_state.wpm_range, &palette)
+        }
+        StatsTab::Heatmap => render_heatmap_tab(frame, app, body_area, &palette),
+        StatsTab::ErrorRanking => render_error_ranking_tab(frame, app, body_area, &palette),
+    }
+
+    // 3. 底部快捷键提示
+    let hint_str = " 1/2/3 切换选项卡 | r 切换时间范围 | Esc 返回跟打 | Ctrl-E 设置 | Ctrl-Q 退出 ";
+    let hint_title = Line::from(vec![Span::styled(
+        " 快捷键 ",
+        Style::default().bold().fg(palette.accent),
+    )]);
+    frame.render_widget(
+        Paragraph::new(hint_bar_line(hint_str, &palette))
+            .block(themed_block(&palette, false).title(hint_title)),
+        hint_area,
+    );
+}
+
+/// Tab 1: WPM 历史演进趋势图与历史概览卡片。
+fn render_wpm_trend_tab(
+    frame: &mut Frame,
+    _app: &App,
+    area: Rect,
+    range: WpmChartRange,
+    palette: &ThemePalette,
+) {
+    let db = StatsDb::with_default_path().ok();
+    let summary = db
+        .as_ref()
+        .and_then(|d| d.get_global_summary().ok())
+        .unwrap_or_default();
+    let history_points = db
+        .as_ref()
+        .and_then(|d| d.get_rolling_wpm_history_with_limit(10, range.limit()).ok())
+        .unwrap_or_default();
+
+    let [summary_area, chart_area] =
+        Layout::vertical([Constraint::Length(4), Constraint::Min(0)]).areas(area);
+
+    let total_hrs = summary.total_duration_secs / 3600.0;
+    let duration_str = if total_hrs >= 1.0 {
+        format!("{total_hrs:.1} 小时")
+    } else {
+        format!("{:.1} 分钟", summary.total_duration_secs / 60.0)
+    };
+
+    let summary_lines = vec![
+        Line::from(vec![
+            Span::styled(" 总练习场次: ", Style::default().fg(palette.muted)),
+            Span::styled(
+                format!("{} 场", summary.total_sessions),
+                Style::default().bold().fg(palette.accent),
+            ),
+            Span::raw("    "),
+            Span::styled(" 累计跟打用时: ", Style::default().fg(palette.muted)),
+            Span::styled(duration_str, Style::default().bold().fg(palette.fg)),
+            Span::raw("    "),
+            Span::styled(" 累计输入字符: ", Style::default().fg(palette.muted)),
+            Span::styled(
+                format!("{} 字", summary.total_typed_chars),
+                Style::default().bold().fg(palette.success),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(" 历史最高速度: ", Style::default().fg(palette.muted)),
+            Span::styled(
+                format!("{:.1} WPM", summary.best_wpm),
+                Style::default().bold().fg(palette.accent),
+            ),
+            Span::raw("    "),
+            Span::styled(" 历史平均速度: ", Style::default().fg(palette.muted)),
+            Span::styled(
+                format!("{:.1} WPM", summary.avg_wpm),
+                Style::default().bold().fg(palette.fg),
+            ),
+            Span::raw("    "),
+            Span::styled(" 近10场均速: ", Style::default().fg(palette.muted)),
+            Span::styled(
+                format!("{:.1} WPM", summary.recent_10_avg_wpm),
+                Style::default().bold().fg(palette.success),
+            ),
+            Span::raw("    "),
+            Span::styled(" 平均正确率: ", Style::default().fg(palette.muted)),
+            Span::styled(
+                format!("{:.1}%", summary.avg_accuracy * 100.0),
+                Style::default().bold().fg(palette.fg),
+            ),
+        ]),
+    ];
+
+    let summary_title = Line::from(vec![Span::styled(
+        " 历史练习总览 ",
+        Style::default().bold().fg(palette.accent),
+    )]);
+    frame.render_widget(
+        Paragraph::new(summary_lines).block(themed_block(palette, true).title(summary_title)),
+        summary_area,
+    );
+
+    let range_badge = range.label();
+    let chart_title = Line::from(vec![
+        Span::styled(
+            " WPM 历史演进趋势 ",
+            Style::default().bold().fg(palette.accent),
+        ),
+        Span::styled(
+            format!("— 当前范围: [{range_badge} (按 r 切换)] "),
+            Style::default().fg(palette.muted),
+        ),
+    ]);
+
+    if history_points.is_empty() {
+        let empty_msg = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                " 暂无有效跟打历史记录。完成跟打练习并进入成绩视图后，系统将在此自动绘制速度演进折线图与平滑趋势线。",
+                Style::default().fg(palette.muted),
+            )),
+        ];
+        frame.render_widget(
+            Paragraph::new(empty_msg).block(themed_block(palette, true).title(chart_title)),
+            chart_area,
+        );
+        return;
+    }
+
+    let mut raw_points: Vec<(f64, f64)> = history_points
+        .iter()
+        .enumerate()
+        .map(|(idx, (_time, wpm, _rolling))| (idx as f64 + 1.0, *wpm))
+        .collect();
+
+    let mut rolling_points: Vec<(f64, f64)> = history_points
+        .iter()
+        .enumerate()
+        .map(|(idx, (_time, _wpm, rolling))| (idx as f64 + 1.0, *rolling))
+        .collect();
+
+    if raw_points.len() > 100 {
+        raw_points = lttb_downsample(&raw_points, 100);
+        rolling_points = lttb_downsample(&rolling_points, 100);
+    }
+
+    let max_x = (history_points.len() as f64).max(5.0);
+    let max_y_raw = raw_points.iter().map(|p| p.1).fold(0.0, f64::max);
+    let max_y_rolling = rolling_points.iter().map(|p| p.1).fold(0.0, f64::max);
+    let max_y = (max_y_raw.max(max_y_rolling).max(30.0) * 1.15).ceil();
+
+    let x_labels = vec![
+        Span::styled("第 1 场", Style::default().fg(palette.muted).bg(palette.bg)),
+        Span::styled(
+            format!("第 {:.0} 场", max_x / 2.0),
+            Style::default().fg(palette.muted).bg(palette.bg),
+        ),
+        Span::styled(
+            format!("第 {:.0} 场", max_x),
+            Style::default().fg(palette.muted).bg(palette.bg),
+        ),
+    ];
+
+    let y_labels = vec![
+        Span::styled("0", Style::default().fg(palette.muted).bg(palette.bg)),
+        Span::styled(
+            format!("{:.0}", max_y / 2.0),
+            Style::default().fg(palette.muted).bg(palette.bg),
+        ),
+        Span::styled(
+            format!("{max_y:.0}"),
+            Style::default().fg(palette.muted).bg(palette.bg),
+        ),
+    ];
+
+    let datasets = vec![
+        Dataset::default()
+            .name("单场 WPM")
+            .marker(Marker::Braille)
+            .graph_type(GraphType::Line)
+            .style(Style::default().fg(palette.accent).bg(palette.bg))
+            .data(&raw_points),
+        Dataset::default()
+            .name("10场滚动平均")
+            .marker(Marker::Braille)
+            .graph_type(GraphType::Line)
+            .style(Style::default().fg(palette.success).bg(palette.bg))
+            .data(&rolling_points),
+    ];
+
+    let chart = Chart::new(datasets)
+        .block(themed_block(palette, true).title(chart_title))
+        .style(Style::default().bg(palette.bg).fg(palette.fg))
+        .x_axis(
+            Axis::default()
+                .title(Span::styled(
+                    "场次序数",
+                    Style::default().fg(palette.muted).bg(palette.bg),
+                ))
+                .style(Style::default().fg(palette.muted).bg(palette.bg))
+                .bounds([1.0, max_x])
+                .labels(x_labels),
+        )
+        .y_axis(
+            Axis::default()
+                .title(Span::styled(
+                    "WPM",
+                    Style::default().fg(palette.muted).bg(palette.bg),
+                ))
+                .style(Style::default().fg(palette.muted).bg(palette.bg))
+                .bounds([0.0, max_y])
+                .labels(y_labels),
+        );
+
+    frame.render_widget(chart, chart_area);
+}
+
+/// Tab 2: 键位热力图分析占位。
+fn render_heatmap_tab(frame: &mut Frame, _app: &App, area: Rect, palette: &ThemePalette) {
+    let title = Line::from(vec![Span::styled(
+        " 键位热力图分析 ",
+        Style::default().bold().fg(palette.accent),
+    )]);
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            " 键位热力图模块（标准斜列 ANSI 与直列 Ortholinear 4x12 矩阵切换）",
+            Style::default().fg(palette.muted),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            " 提示：按 1 切换回速度趋势图，按 3 切换至错字排行。",
+            Style::default().fg(palette.fg),
+        )),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines).block(themed_block(palette, true).title(title)),
+        area,
+    );
+}
+
+/// Tab 3: 高频错字与错词排行榜占位。
+fn render_error_ranking_tab(frame: &mut Frame, _app: &App, area: Rect, palette: &ThemePalette) {
+    let title = Line::from(vec![Span::styled(
+        " 高频错字与错词排行榜 ",
+        Style::default().bold().fg(palette.accent),
+    )]);
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            " 高频错字与错词排行榜双列滚动表格分析",
+            Style::default().fg(palette.muted),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            " 提示：按 1 切换回速度趋势图，按 2 切换至键位热力图。",
+            Style::default().fg(palette.fg),
+        )),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines).block(themed_block(palette, true).title(title)),
+        area,
+    );
+}
+
 /// 设置视图：焦点行 + 左右调整（主题/占比/粗体/字体）。
 fn render_settings(frame: &mut Frame, app: &App) {
     let palette = app.palette();
@@ -2649,12 +3090,12 @@ fn render_result_view(
             need_relogin: true, ..
         } = upload
         {
-            " Esc 返回 | Ctrl-O 登录并上传 | Ctrl-F 载文 | Ctrl-B 内置赛文 | Ctrl-Q 退出"
+            " Esc 返回 | s 数据统计 | Ctrl-O 登录并上传 | Ctrl-F 载文 | Ctrl-B 内置赛文 | Ctrl-Q 退出"
         } else {
-            " Esc 返回 | Ctrl-F 载文 | Ctrl-B 内置赛文 | Ctrl-Q 退出"
+            " Esc 返回 | s 数据统计 | Ctrl-F 载文 | Ctrl-B 内置赛文 | Ctrl-Q 退出"
         }
     } else {
-        " Esc 返回 | Enter/r 重打 | Ctrl-F 载文 | Ctrl-B 内置赛文 | Ctrl-Q 退出"
+        " Esc 返回 | Enter/r 重打 | s 数据统计 | Ctrl-F 载文 | Ctrl-B 内置赛文 | Ctrl-Q 退出"
     };
     let hint_line = hint_bar_line(hint_str, &palette);
 
@@ -5587,8 +6028,14 @@ mod tests {
         assert!(matches!(app.state, AppState::BrowsingBuiltin));
         app.state = AppState::Typing;
 
-        // 激活 设置 (index 7)
+        // 激活 数据统计 (index 7)
         app.sidebar_selected = 7;
+        activate_sidebar_menu_item(&mut app, &mut terminal).unwrap();
+        assert!(matches!(app.state, AppState::Stats(_)));
+        app.state = AppState::Typing;
+
+        // 激活 设置 (index 8)
+        app.sidebar_selected = 8;
         activate_sidebar_menu_item(&mut app, &mut terminal).unwrap();
         assert!(matches!(app.state, AppState::Settings));
         app.state = AppState::Typing;
@@ -5893,5 +6340,136 @@ mod tests {
         assert_eq!(top_chars.len(), 1);
         assert_eq!(top_chars[0].target_char, '世');
         assert_eq!(top_chars[0].error_count, 1);
+    }
+
+    #[test]
+    fn wpm_chart_range_cycling() {
+        assert_eq!(WpmChartRange::Recent30.next(), WpmChartRange::Recent100);
+        assert_eq!(WpmChartRange::Recent100.next(), WpmChartRange::All);
+        assert_eq!(WpmChartRange::All.next(), WpmChartRange::Recent30);
+
+        assert_eq!(WpmChartRange::Recent30.limit(), Some(30));
+        assert_eq!(WpmChartRange::Recent100.limit(), Some(100));
+        assert_eq!(WpmChartRange::All.limit(), None);
+    }
+
+    #[test]
+    fn finished_view_press_s_opens_stats_view() {
+        let mut app = test_app(file_text("你好"));
+        let stats = app.session.finish(Duration::from_secs(10));
+        app.state = AppState::Finished {
+            stats,
+            upload: UploadState::NotApplicable,
+            elapsed: Duration::from_secs(10),
+        };
+
+        let handled = handle_finished_key(&mut app, KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        assert!(handled);
+        assert!(matches!(app.state, AppState::Stats(_)));
+        if let AppState::Stats(s) = &app.state {
+            assert_eq!(s.tab, StatsTab::WpmTrend);
+            assert_eq!(s.wpm_range, WpmChartRange::Recent30);
+        }
+    }
+
+    #[test]
+    fn render_stats_view_tabs_and_overview() {
+        let mut app = test_app(file_text("测试赛文"));
+        app.state = AppState::Stats(StatsViewState {
+            tab: StatsTab::WpmTrend,
+            wpm_range: WpmChartRange::Recent30,
+        });
+
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+
+        terminal.draw(|f| ui(f, &app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+
+        // 校验标题与 Tab 渲染
+        let mut found_header = false;
+        let mut found_tab1 = false;
+        let mut found_tab2 = false;
+        let mut found_tab3 = false;
+        let mut found_overview = false;
+        let mut found_chart_title = false;
+
+        let full_text: String = (0..buffer.area.height)
+            .map(|y| {
+                let row: String = (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect();
+                row + "\n"
+            })
+            .collect();
+
+        let clean = full_text.replace(' ', "");
+
+        if clean.contains("统计数据中心") {
+            found_header = true;
+        }
+        if clean.contains("1.速度趋势") {
+            found_tab1 = true;
+        }
+        if clean.contains("2.键位热力图") {
+            found_tab2 = true;
+        }
+        if clean.contains("3.错字排行") {
+            found_tab3 = true;
+        }
+        if clean.contains("历史练习总览") {
+            found_overview = true;
+        }
+        if clean.contains("WPM历史演进趋势") {
+            found_chart_title = true;
+        }
+
+        assert!(found_header, "Header should contain '统计数据中心'");
+        assert!(found_tab1, "Tab 1 should be rendered");
+        assert!(found_tab2, "Tab 2 should be rendered");
+        assert!(found_tab3, "Tab 3 should be rendered");
+        assert!(found_overview, "Overview summary card should be rendered");
+        assert!(found_chart_title, "Chart title should be rendered");
+    }
+
+    #[test]
+    fn render_stats_view_heatmap_and_error_tabs() {
+        let mut app = test_app(file_text("测试赛文"));
+
+        // Tab 2: Heatmap
+        app.state = AppState::Stats(StatsViewState {
+            tab: StatsTab::Heatmap,
+            wpm_range: WpmChartRange::Recent30,
+        });
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| ui(f, &app)).unwrap();
+        let full_text: String = (0..terminal.backend().buffer().area.height)
+            .map(|y| {
+                (0..terminal.backend().buffer().area.width)
+                    .map(|x| terminal.backend().buffer()[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect();
+        let clean2 = full_text.replace(' ', "");
+        assert!(clean2.contains("键位热力图分析"));
+
+        // Tab 3: Error ranking
+        app.state = AppState::Stats(StatsViewState {
+            tab: StatsTab::ErrorRanking,
+            wpm_range: WpmChartRange::Recent30,
+        });
+        terminal.draw(|f| ui(f, &app)).unwrap();
+        let full_text3: String = (0..terminal.backend().buffer().area.height)
+            .map(|y| {
+                (0..terminal.backend().buffer().area.width)
+                    .map(|x| terminal.backend().buffer()[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect();
+        let clean3 = full_text3.replace(' ', "");
+        assert!(clean3.contains("高频错字与错词排行榜"));
     }
 }

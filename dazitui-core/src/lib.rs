@@ -1,6 +1,7 @@
 use std::path::Path;
 
 mod db;
+mod lttb;
 mod session;
 mod settings;
 
@@ -11,6 +12,7 @@ pub use db::{
     DbError, DbTask, DbWorker, ErrorRecordItem, GlobalStatsSummary, KeypressRecordItem,
     MistypedCharStat, MistypedWordStat, SessionRecord, StatsDb,
 };
+pub use lttb::lttb_downsample;
 pub use session::{CharStatus, ErrorPoint, ErrorType, GROUP_SIZE, Session, Stats, TypeResult};
 pub use settings::{
     FONT_SIZE_PT, Rgb, Settings, SettingsStore, Theme, ThemePreset, osc_font_size_sequence,

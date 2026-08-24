@@ -431,13 +431,22 @@ impl StatsDb {
         Ok(sessions)
     }
 
-    /// 查询带窗口滚动平均的 WPM 时序数据：Vec<(created_at, wpm, rolling_wpm)>。
+    /// 查询带窗口滚动平均的 WPM 时序数据：`Vec<(created_at, wpm, rolling_wpm)>`。
     pub fn get_rolling_wpm_history(
         &self,
         window_size: usize,
     ) -> Result<Vec<(String, f64, f64)>, DbError> {
+        self.get_rolling_wpm_history_with_limit(window_size, None)
+    }
+
+    /// 查询带窗口滚动平均的 WPM 时序数据，可限制最近场次数。
+    pub fn get_rolling_wpm_history_with_limit(
+        &self,
+        window_size: usize,
+        limit: Option<usize>,
+    ) -> Result<Vec<(String, f64, f64)>, DbError> {
         let preceding = window_size.saturating_sub(1);
-        let sql = format!(
+        let base_sql = format!(
             "SELECT created_at, wpm,
                     AVG(wpm) OVER (
                         ORDER BY created_at ASC
@@ -446,6 +455,12 @@ impl StatsDb {
              FROM sessions
              ORDER BY created_at ASC"
         );
+
+        let sql = if let Some(n) = limit {
+            format!("SELECT * FROM ({base_sql}) ORDER BY created_at DESC LIMIT {n}")
+        } else {
+            base_sql
+        };
 
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map([], |row| {
