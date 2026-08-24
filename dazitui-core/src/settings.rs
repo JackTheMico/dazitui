@@ -2,6 +2,7 @@
 //!
 //! 纯数据 + 纯函数 + 极简 key=value 文件读写，零 ratatui/网络依赖，可完全单测。
 
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -207,6 +208,8 @@ pub struct Settings {
     /// 输入法名称（上传与分享携带）；空串表示不配置（显示「无」）。
     /// 最多 20 字符（遵守 52dazi 协议限制）。
     pub input_method: String,
+    /// 自定义方案码表映射：输入法方案名 -> 码表文件绝对/相对路径。
+    pub scheme_dict_paths: HashMap<String, String>,
 }
 
 impl Settings {
@@ -237,6 +240,7 @@ impl Default for Settings {
             bold: false,
             font: false,
             input_method: String::new(),
+            scheme_dict_paths: HashMap::new(),
         }
     }
 }
@@ -283,7 +287,7 @@ impl SettingsStore {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let content = format!(
+        let mut content = format!(
             "theme={}\nreference_ratio={}\nbold={}\nfont={}\ninput_method={}\n",
             settings.theme.as_str(),
             settings.reference_ratio,
@@ -291,6 +295,9 @@ impl SettingsStore {
             settings.font,
             settings.input_method,
         );
+        for (scheme, path) in &settings.scheme_dict_paths {
+            content.push_str(&format!("scheme_dict.{}={}\n", scheme, path));
+        }
         std::fs::write(&self.path, content)
     }
 
@@ -325,7 +332,16 @@ impl SettingsStore {
                 "input_method" => {
                     settings.input_method = Settings::clamp_input_method(value);
                 }
-                _ => {}
+                _ => {
+                    if let Some(scheme) = key
+                        .strip_prefix("scheme_dict.")
+                        .filter(|s| !s.is_empty() && !value.is_empty())
+                    {
+                        settings
+                            .scheme_dict_paths
+                            .insert(scheme.to_string(), value.to_string());
+                    }
+                }
             }
         }
         settings
@@ -468,12 +484,15 @@ mod tests {
     #[test]
     fn store_roundtrip() {
         let store = SettingsStore::new(temp_path("roundtrip"));
+        let mut scheme_dict_paths = HashMap::new();
+        scheme_dict_paths.insert("麓鸣并击".to_string(), "/path/to/luming.txt".to_string());
         let s = Settings {
             theme: ThemePreset::Dracula,
             reference_ratio: 70,
             bold: true,
             font: false,
             input_method: "虎码".to_string(),
+            scheme_dict_paths,
         };
         store.save(&s).unwrap();
         assert_eq!(store.load(), s);

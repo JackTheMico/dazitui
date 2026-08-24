@@ -8,8 +8,8 @@ use dazitui_core::ThemePreset;
 use dazitui_core::{
     ApiClient, ApiError, AuthSession, BUILTIN_SETS, CharStatus, CompetitionType, DbTask, DbWorker,
     ErrorRecordItem, ErrorType, FONT_SIZE_PT, KeypressRecordItem, LoadError, LoadOptions, Rgb,
-    Session, SessionRecord, Settings, SettingsStore, Stats, StatsDb, Text, TextSource, Theme,
-    TokenStore, env_credentials, format_time, is_auth_failure, load_builtin_text,
+    SchemeDict, Session, SessionRecord, Settings, SettingsStore, Stats, StatsDb, Text, TextSource,
+    Theme, TokenStore, env_credentials, format_time, is_auth_failure, load_builtin_text,
     load_builtin_text_shuffled, load_text_from_clipboard, load_text_from_file,
     load_text_from_string, lttb_downsample, osc_font_size_sequence, osc52_clipboard,
     save_text_to_file,
@@ -69,11 +69,61 @@ impl WpmChartRange {
     }
 }
 
+/// 键位热力图布局模式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum HeatmapLayout {
+    #[default]
+    Staggered, // 标准斜列 (ANSI 60%)
+    Ortholinear, // 直列矩阵 (Planck 4x12)
+}
+
+impl HeatmapLayout {
+    fn next(self) -> Self {
+        match self {
+            Self::Staggered => Self::Ortholinear,
+            Self::Ortholinear => Self::Staggered,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Staggered => "标准斜列 (ANSI 60%)",
+            Self::Ortholinear => "直列矩阵 (4x12)",
+        }
+    }
+}
+
+/// 键位热力图数据视角。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum HeatmapSource {
+    #[default]
+    SchemeProjected, // 方案反查击键
+    RawKeypress,     // 物理捕获击键
+}
+
+impl HeatmapSource {
+    fn next(self) -> Self {
+        match self {
+            Self::SchemeProjected => Self::RawKeypress,
+            Self::RawKeypress => Self::SchemeProjected,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::SchemeProjected => "方案反查视角",
+            Self::RawKeypress => "物理击键视角",
+        }
+    }
+}
+
 /// 统计视图状态。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct StatsViewState {
     tab: StatsTab,
     wpm_range: WpmChartRange,
+    heatmap_layout: HeatmapLayout,
+    heatmap_source: HeatmapSource,
 }
 
 /// 将 core 的 ThemePreset 映射为 ratatui_themes 的 ThemePalette。
@@ -1293,6 +1343,12 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                             }
                             KeyCode::Char('r') | KeyCode::Char('R') => {
                                 stats_state.wpm_range = stats_state.wpm_range.next();
+                            }
+                            KeyCode::Char('l') | KeyCode::Char('L') => {
+                                stats_state.heatmap_layout = stats_state.heatmap_layout.next();
+                            }
+                            KeyCode::Char('m') | KeyCode::Char('M') => {
+                                stats_state.heatmap_source = stats_state.heatmap_source.next();
                             }
                             KeyCode::Esc => app.state = AppState::Typing,
                             _ => {}
@@ -2635,12 +2691,29 @@ fn render_stats_view(frame: &mut Frame, app: &App, stats_state: &StatsViewState)
         StatsTab::WpmTrend => {
             render_wpm_trend_tab(frame, app, body_area, stats_state.wpm_range, &palette)
         }
-        StatsTab::Heatmap => render_heatmap_tab(frame, app, body_area, &palette),
+        StatsTab::Heatmap => render_heatmap_tab(
+            frame,
+            app,
+            body_area,
+            stats_state.heatmap_layout,
+            stats_state.heatmap_source,
+            &palette,
+        ),
         StatsTab::ErrorRanking => render_error_ranking_tab(frame, app, body_area, &palette),
     }
 
     // 3. 底部快捷键提示
-    let hint_str = " 1/2/3 切换选项卡 | r 切换时间范围 | Esc 返回跟打 | Ctrl-E 设置 | Ctrl-Q 退出 ";
+    let hint_str = match stats_state.tab {
+        StatsTab::WpmTrend => {
+            " 1/2/3 切换选项卡 | r 切换时间范围 | Esc 返回跟打 | Ctrl-E 设置 | Ctrl-Q 退出 "
+        }
+        StatsTab::Heatmap => {
+            " 1/2/3 切换选项卡 | l 切换键盘布局(斜列/直列) | m 切换数据视角(方案/物理) | Esc 返回跟打 | Ctrl-E 设置 | Ctrl-Q 退出 "
+        }
+        StatsTab::ErrorRanking => {
+            " 1/2/3 切换选项卡 | ↑↓ 滚动查看 | Esc 返回跟打 | Ctrl-E 设置 | Ctrl-Q 退出 "
+        }
+    };
     let hint_title = Line::from(vec![Span::styled(
         " 快捷键 ",
         Style::default().bold().fg(palette.accent),
@@ -2848,27 +2921,358 @@ fn render_wpm_trend_tab(
     frame.render_widget(chart, chart_area);
 }
 
-/// Tab 2: 键位热力图分析占位。
-fn render_heatmap_tab(frame: &mut Frame, _app: &App, area: Rect, palette: &ThemePalette) {
-    let title = Line::from(vec![Span::styled(
-        " 键位热力图分析 ",
+/// Tab 2: 键位热力图分析（标准斜列 ANSI 60% 与直列矩阵 4x12 切换，方案反查与物理击键切换，对数平滑着色）。
+fn render_heatmap_tab(
+    frame: &mut Frame,
+    app: &App,
+    area: Rect,
+    layout: HeatmapLayout,
+    source: HeatmapSource,
+    palette: &ThemePalette,
+) {
+    let db = StatsDb::with_default_path().ok();
+    let mut scheme_dict_loaded = false;
+    let mut dict_path_display = String::new();
+
+    let key_counts = match source {
+        HeatmapSource::RawKeypress => db
+            .as_ref()
+            .and_then(|d| d.get_key_press_totals(Some(true)).ok())
+            .unwrap_or_default(),
+        HeatmapSource::SchemeProjected => {
+            let custom_paths = &app.settings.scheme_dict_paths;
+            let scheme_name = &app.settings.input_method;
+            if let Some(path) = SchemeDict::resolve_scheme_path(scheme_name, custom_paths) {
+                if let Ok(dict) = SchemeDict::load_from_file(&path) {
+                    scheme_dict_loaded = true;
+                    dict_path_display = path.display().to_string();
+                    let sessions = db
+                        .as_ref()
+                        .and_then(|d| d.get_all_sessions().ok())
+                        .unwrap_or_default();
+                    let mut counts = std::collections::HashMap::new();
+                    for s in sessions {
+                        let proj = dict.project_text_to_keys(&s.text_title);
+                        for (k, v) in proj {
+                            *counts.entry(k).or_insert(0) += v;
+                        }
+                    }
+                    if counts.is_empty() {
+                        db.as_ref()
+                            .and_then(|d| d.get_key_press_totals(Some(true)).ok())
+                            .unwrap_or_default()
+                    } else {
+                        counts
+                    }
+                } else {
+                    db.as_ref()
+                        .and_then(|d| d.get_key_press_totals(Some(true)).ok())
+                        .unwrap_or_default()
+                }
+            } else {
+                db.as_ref()
+                    .and_then(|d| d.get_key_press_totals(Some(true)).ok())
+                    .unwrap_or_default()
+            }
+        }
+    };
+
+    let max_count = key_counts.values().copied().max().unwrap_or(0).max(1) as f64;
+    let log_max = (1.0 + max_count).ln();
+    let total_presses: u32 = key_counts.values().copied().sum();
+
+    let [info_area, keyboard_area] =
+        Layout::vertical([Constraint::Length(5), Constraint::Min(0)]).areas(area);
+
+    // 1. 顶部控制与方案状态卡片
+    let layout_badge = layout.label();
+    let source_badge = source.label();
+    let scheme_status_str = if source == HeatmapSource::SchemeProjected {
+        if scheme_dict_loaded {
+            format!("已加载码表: {dict_path_display}")
+        } else if app.settings.input_method.is_empty() {
+            "未配置输入法方案（按 Ctrl-E 设置）".to_string()
+        } else {
+            format!(
+                "未找到方案 [{}] 码表文件 (可放至 ~/.config/dazitui/schemes/)，当前回退物理击键",
+                app.settings.input_method
+            )
+        }
+    } else {
+        "物理击键模式（直接统计键盘输入事件）".to_string()
+    };
+
+    let info_lines = vec![
+        Line::from(vec![
+            Span::styled(" 当前布局: ", Style::default().fg(palette.muted)),
+            Span::styled(
+                format!("[{layout_badge} (按 l 切换)]"),
+                Style::default().bold().fg(palette.accent),
+            ),
+            Span::raw("    "),
+            Span::styled(" 数据视角: ", Style::default().fg(palette.muted)),
+            Span::styled(
+                format!("[{source_badge} (按 m 切换)]"),
+                Style::default().bold().fg(palette.success),
+            ),
+            Span::raw("    "),
+            Span::styled(" 累计击键: ", Style::default().fg(palette.muted)),
+            Span::styled(
+                format!("{total_presses} 次"),
+                Style::default().bold().fg(palette.fg),
+            ),
+            Span::raw("    "),
+            Span::styled(" 峰值单键: ", Style::default().fg(palette.muted)),
+            Span::styled(
+                format!("{:.0} 次", max_count),
+                Style::default().bold().fg(palette.accent),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(" 方案状态: ", Style::default().fg(palette.muted)),
+            Span::styled(scheme_status_str, Style::default().fg(palette.fg)),
+        ]),
+        Line::from(vec![
+            Span::styled(" 热力图例: ", Style::default().fg(palette.muted)),
+            Span::styled(" [ 0次 ] ", Style::default().fg(palette.muted).bg(palette.bg)),
+            Span::styled(" [ 0-25% ] ", Style::default().fg(palette.muted)),
+            Span::styled(" [ 25-50% ] ", Style::default().fg(palette.fg)),
+            Span::styled(
+                " [ 50-75% ] ",
+                Style::default().fg(palette.success).bold(),
+            ),
+            Span::styled(
+                " [ >75% ] ",
+                Style::default()
+                    .fg(palette.accent)
+                    .bg(palette.selection)
+                    .bold(),
+            ),
+        ]),
+    ];
+
+    let info_title = Line::from(vec![Span::styled(
+        " 键位热力图参数 ",
         Style::default().bold().fg(palette.accent),
     )]);
-    let lines = vec![
-        Line::from(""),
-        Line::from(Span::styled(
-            " 键位热力图模块（标准斜列 ANSI 与直列 Ortholinear 4x12 矩阵切换）",
-            Style::default().fg(palette.muted),
-        )),
-        Line::from(""),
-        Line::from(Span::styled(
-            " 提示：按 1 切换回速度趋势图，按 3 切换至错字排行。",
-            Style::default().fg(palette.fg),
-        )),
-    ];
     frame.render_widget(
-        Paragraph::new(lines).block(themed_block(palette, true).title(title)),
-        area,
+        Paragraph::new(info_lines).block(themed_block(palette, true).title(info_title)),
+        info_area,
+    );
+
+    // 2. 键盘矩阵渲染
+    let get_key_data = |key_name: &str| -> (Style, u32) {
+        let count = *key_counts
+            .get(key_name)
+            .or_else(|| key_counts.get(&key_name.to_lowercase()))
+            .unwrap_or(&0);
+        if count == 0 {
+            (Style::default().fg(palette.muted).bg(palette.bg), 0)
+        } else {
+            let intensity = (1.0 + count as f64).ln() / log_max;
+            let style = if intensity > 0.75 {
+                Style::default()
+                    .fg(palette.accent)
+                    .bg(palette.selection)
+                    .bold()
+            } else if intensity > 0.50 {
+                Style::default().fg(palette.success).bold()
+            } else if intensity > 0.25 {
+                Style::default().fg(palette.fg)
+            } else {
+                Style::default().fg(palette.muted)
+            };
+            (style, count)
+        }
+    };
+
+    let mut keyboard_lines = Vec::new();
+    keyboard_lines.push(Line::from(""));
+
+    match layout {
+        HeatmapLayout::Staggered => {
+            // ANSI 60% 五行斜列布局
+            let rows: [&[(&str, &str)]; 5] = [
+                &[
+                    ("`", "~ `"),
+                    ("1", "1"),
+                    ("2", "2"),
+                    ("3", "3"),
+                    ("4", "4"),
+                    ("5", "5"),
+                    ("6", "6"),
+                    ("7", "7"),
+                    ("8", "8"),
+                    ("9", "9"),
+                    ("0", "0"),
+                    ("-", "-"),
+                    ("=", "="),
+                    ("Backspace", "Bksp"),
+                ],
+                &[
+                    ("Tab", "Tab"),
+                    ("q", "Q"),
+                    ("w", "W"),
+                    ("e", "E"),
+                    ("r", "R"),
+                    ("t", "T"),
+                    ("y", "Y"),
+                    ("u", "U"),
+                    ("i", "I"),
+                    ("o", "O"),
+                    ("p", "P"),
+                    ("[", "["),
+                    ("]", "]"),
+                    ("\\", "\\"),
+                ],
+                &[
+                    ("Caps", "Caps"),
+                    ("a", "A"),
+                    ("s", "S"),
+                    ("d", "D"),
+                    ("f", "F"),
+                    ("g", "G"),
+                    ("h", "H"),
+                    ("j", "J"),
+                    ("k", "K"),
+                    ("l", "L"),
+                    (";", ";"),
+                    ("'", "'"),
+                    ("Enter", "Enter"),
+                ],
+                &[
+                    ("Shift", "Shift"),
+                    ("z", "Z"),
+                    ("x", "X"),
+                    ("c", "C"),
+                    ("v", "V"),
+                    ("b", "B"),
+                    ("n", "N"),
+                    ("m", "M"),
+                    (",", ","),
+                    (".", "."),
+                    ("/", "/"),
+                    ("Shift", "Shift"),
+                ],
+                &[
+                    ("Ctrl", "Ctrl"),
+                    ("Alt", "Alt"),
+                    ("Space", "Space (空格)"),
+                    ("Alt", "Alt"),
+                    ("Ctrl", "Ctrl"),
+                ],
+            ];
+
+            let row_indents = ["  ", "   ", "    ", "      ", "        "];
+
+            for (r_idx, row) in rows.iter().enumerate() {
+                let mut spans = vec![Span::raw(row_indents[r_idx])];
+                for (k_lookup, k_display) in *row {
+                    let (style, count) = get_key_data(k_lookup);
+                    let badge = if *k_lookup == "Space" {
+                        format!(" [ {:^16} ({:>3}) ] ", k_display, count)
+                    } else if k_display.len() > 1 {
+                        format!(" [{:<4} {:>3}] ", k_display, count)
+                    } else {
+                        format!(" [{:^1} {:>3}] ", k_display, count)
+                    };
+                    spans.push(Span::styled(badge, style));
+                }
+                keyboard_lines.push(Line::from(spans));
+                keyboard_lines.push(Line::from(""));
+            }
+        }
+        HeatmapLayout::Ortholinear => {
+            // Planck 4x12 直列网格布局
+            let rows: [&[(&str, &str)]; 4] = [
+                &[
+                    ("Tab", "Tab"),
+                    ("q", "Q"),
+                    ("w", "W"),
+                    ("e", "E"),
+                    ("r", "R"),
+                    ("t", "T"),
+                    ("y", "Y"),
+                    ("u", "U"),
+                    ("i", "I"),
+                    ("o", "O"),
+                    ("p", "P"),
+                    ("Backspace", "Bksp"),
+                ],
+                &[
+                    ("Esc", "Esc"),
+                    ("a", "A"),
+                    ("s", "S"),
+                    ("d", "D"),
+                    ("f", "F"),
+                    ("g", "G"),
+                    ("h", "H"),
+                    ("j", "J"),
+                    ("k", "K"),
+                    ("l", "L"),
+                    (";", ";"),
+                    ("'", "'"),
+                ],
+                &[
+                    ("Shift", "Shift"),
+                    ("z", "Z"),
+                    ("x", "X"),
+                    ("c", "C"),
+                    ("v", "V"),
+                    ("b", "B"),
+                    ("n", "N"),
+                    ("m", "M"),
+                    (",", ","),
+                    (".", "."),
+                    ("/", "/"),
+                    ("Enter", "Enter"),
+                ],
+                &[
+                    ("Ctrl", "Ctrl"),
+                    ("Alt", "Alt"),
+                    ("Lower", "Lower"),
+                    ("Space", "Space (空格)"),
+                    ("Raise", "Raise"),
+                    ("Left", "←"),
+                    ("Down", "↓"),
+                    ("Up", "↑"),
+                    ("Right", "→"),
+                ],
+            ];
+
+            for row in rows {
+                let mut spans = vec![Span::raw("   ")];
+                for (k_lookup, k_display) in row {
+                    let (style, count) = get_key_data(k_lookup);
+                    let badge = if *k_lookup == "Space" {
+                        format!(" [ {:^16} ({:>3}) ] ", k_display, count)
+                    } else if k_display.len() > 1 {
+                        format!(" [{:<4} {:>3}] ", k_display, count)
+                    } else {
+                        format!(" [{:^1} {:>3}] ", k_display, count)
+                    };
+                    spans.push(Span::styled(badge, style));
+                }
+                keyboard_lines.push(Line::from(spans));
+                keyboard_lines.push(Line::from(""));
+            }
+        }
+    }
+
+    let keyboard_title = Line::from(vec![
+        Span::styled(
+            " 键盘热力矩阵 ",
+            Style::default().bold().fg(palette.accent),
+        ),
+        Span::styled(
+            format!("— 视图: [{layout_badge}] · 视角: [{source_badge}] "),
+            Style::default().fg(palette.muted),
+        ),
+    ]);
+
+    frame.render_widget(
+        Paragraph::new(keyboard_lines).block(themed_block(palette, true).title(keyboard_title)),
+        keyboard_area,
     );
 }
 
@@ -6378,6 +6782,8 @@ mod tests {
         app.state = AppState::Stats(StatsViewState {
             tab: StatsTab::WpmTrend,
             wpm_range: WpmChartRange::Recent30,
+            heatmap_layout: HeatmapLayout::Staggered,
+            heatmap_source: HeatmapSource::SchemeProjected,
         });
 
         let backend = ratatui::backend::TestBackend::new(100, 30);
@@ -6436,10 +6842,12 @@ mod tests {
     fn render_stats_view_heatmap_and_error_tabs() {
         let mut app = test_app(file_text("测试赛文"));
 
-        // Tab 2: Heatmap
+        // Tab 2: Heatmap (Staggered Layout)
         app.state = AppState::Stats(StatsViewState {
             tab: StatsTab::Heatmap,
             wpm_range: WpmChartRange::Recent30,
+            heatmap_layout: HeatmapLayout::Staggered,
+            heatmap_source: HeatmapSource::SchemeProjected,
         });
         let backend = ratatui::backend::TestBackend::new(100, 30);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -6453,23 +6861,60 @@ mod tests {
             })
             .collect();
         let clean2 = full_text.replace(' ', "");
-        assert!(clean2.contains("键位热力图分析"));
+        assert!(clean2.contains("键位热力图参数"));
+        assert!(clean2.contains("键盘热力矩阵"));
+        assert!(clean2.contains("标准斜列"));
+
+        // Tab 2: Heatmap (Ortholinear Layout)
+        app.state = AppState::Stats(StatsViewState {
+            tab: StatsTab::Heatmap,
+            wpm_range: WpmChartRange::Recent30,
+            heatmap_layout: HeatmapLayout::Ortholinear,
+            heatmap_source: HeatmapSource::RawKeypress,
+        });
+        let backend_ortho = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal_ortho = ratatui::Terminal::new(backend_ortho).unwrap();
+        terminal_ortho.draw(|f| ui(f, &app)).unwrap();
+        let full_text_ortho: String = (0..terminal_ortho.backend().buffer().area.height)
+            .map(|y| {
+                (0..terminal_ortho.backend().buffer().area.width)
+                    .map(|x| terminal_ortho.backend().buffer()[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect();
+        let clean_ortho = full_text_ortho.replace(' ', "");
+        assert!(clean_ortho.contains("直列矩阵"));
+        assert!(clean_ortho.contains("物理击键视角"));
 
         // Tab 3: Error ranking
         app.state = AppState::Stats(StatsViewState {
             tab: StatsTab::ErrorRanking,
             wpm_range: WpmChartRange::Recent30,
+            heatmap_layout: HeatmapLayout::Staggered,
+            heatmap_source: HeatmapSource::SchemeProjected,
         });
-        terminal.draw(|f| ui(f, &app)).unwrap();
-        let full_text3: String = (0..terminal.backend().buffer().area.height)
+        let backend_err = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal_err = ratatui::Terminal::new(backend_err).unwrap();
+        terminal_err.draw(|f| ui(f, &app)).unwrap();
+        let full_text3: String = (0..terminal_err.backend().buffer().area.height)
             .map(|y| {
-                (0..terminal.backend().buffer().area.width)
-                    .map(|x| terminal.backend().buffer()[(x, y)].symbol().to_string())
+                (0..terminal_err.backend().buffer().area.width)
+                    .map(|x| terminal_err.backend().buffer()[(x, y)].symbol().to_string())
                     .collect::<String>()
                     + "\n"
             })
             .collect();
         let clean3 = full_text3.replace(' ', "");
         assert!(clean3.contains("高频错字与错词排行榜"));
+    }
+
+    #[test]
+    fn heatmap_layout_and_source_cycling() {
+        assert_eq!(HeatmapLayout::Staggered.next(), HeatmapLayout::Ortholinear);
+        assert_eq!(HeatmapLayout::Ortholinear.next(), HeatmapLayout::Staggered);
+
+        assert_eq!(HeatmapSource::SchemeProjected.next(), HeatmapSource::RawKeypress);
+        assert_eq!(HeatmapSource::RawKeypress.next(), HeatmapSource::SchemeProjected);
     }
 }
