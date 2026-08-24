@@ -736,9 +736,8 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                         }
                     }
                     AppState::Finished { .. } => {
-                        // 离线赛文：任意键重打同一篇；在线赛文不支持重打。
-                        if !app.text.is_online() {
-                            app.restart();
+                        if handle_finished_key(&mut app, key) {
+                            continue;
                         }
                     }
                     AppState::Browsing => match key.code {
@@ -910,6 +909,40 @@ fn handle_key(session: &mut Session, key: KeyEvent) {
             session.type_text(&c.to_string());
         }
         _ => {}
+    }
+}
+
+/// 处理成绩视图（结果界面）下的按键事件：
+/// - Ctrl-F: 打开载文浏览
+/// - Ctrl-B: 打开内置赛文浏览
+/// - Ctrl-E: 打开设置视图
+/// - Esc: 返回主界面（重置会话为就绪状态，保持当前赛文）
+/// - Enter / r / R: 重新开始跟打当前赛文（仅限离线/内置赛文）
+fn handle_finished_key(app: &mut App, key: KeyEvent) -> bool {
+    if is_open_browser(key) {
+        app.open_browser();
+        return true;
+    }
+    if is_open_builtin_browser(key) {
+        app.open_builtin_browser();
+        return true;
+    }
+    if is_open_settings(key) {
+        app.state = AppState::Settings;
+        return true;
+    }
+    match key.code {
+        KeyCode::Esc => {
+            app.restart();
+            true
+        }
+        KeyCode::Enter | KeyCode::Char('r') | KeyCode::Char('R') => {
+            if !app.text.is_online() {
+                app.restart();
+            }
+            true
+        }
+        _ => false,
     }
 }
 
@@ -1555,13 +1588,20 @@ fn render_result_view(frame: &mut Frame, app: &App, stats: &Stats, upload: &Uplo
         } = upload
         {
             all.push(
-                Line::from(" Ctrl-O 登录并上传 | q 退出 | Ctrl-F 载文").fg(color(theme.muted)),
+                Line::from(" Esc 返回 | Ctrl-O 登录并上传 | Ctrl-F 载文 | Ctrl-B 内置赛文 | q 退出")
+                    .fg(color(theme.muted)),
             );
         } else {
-            all.push(Line::from(" q 退出 | Ctrl-F 载文").fg(color(theme.muted)));
+            all.push(
+                Line::from(" Esc 返回 | Ctrl-F 载文 | Ctrl-B 内置赛文 | q 退出")
+                    .fg(color(theme.muted)),
+            );
         }
     } else {
-        all.push(Line::from(" 按任意键重打 | q 退出").fg(color(theme.muted)));
+        all.push(
+            Line::from(" Esc 返回 | Enter/r 重打 | Ctrl-F 载文 | Ctrl-B 内置赛文 | q 退出")
+                .fg(color(theme.muted)),
+        );
     }
     frame.render_widget(
         Paragraph::new(all)
@@ -3611,5 +3651,112 @@ mod tests {
                 ..
             } if ranking.as_deref() == Some("1")
         ));
+    }
+
+    // ---- Issue #38 成绩视图快捷键导航测试 ----
+
+    #[test]
+    fn finished_key_esc_restarts_offline_to_typing() {
+        let mut app = test_app(file_text("测试文本"));
+        app.session.type_text("测试文本");
+        app.finish_typing();
+        assert!(matches!(app.state, AppState::Finished { .. }));
+
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        let handled = handle_finished_key(&mut app, esc);
+        assert!(handled);
+        assert!(matches!(app.state, AppState::Typing));
+        assert_eq!(app.session.len(), 0);
+    }
+
+    #[test]
+    fn finished_key_esc_restarts_online_to_typing() {
+        let mut app = test_app(online_text("在线文本"));
+        app.session.type_text("在线文本");
+        app.finish_typing();
+        assert!(matches!(app.state, AppState::Finished { .. }));
+
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        let handled = handle_finished_key(&mut app, esc);
+        assert!(handled);
+        assert!(matches!(app.state, AppState::Typing));
+    }
+
+    #[test]
+    fn finished_key_enter_and_r_restart_offline() {
+        let mut app = test_app(file_text("离线文本"));
+        app.session.type_text("离线文本");
+        app.finish_typing();
+
+        // Enter 重打
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(handle_finished_key(&mut app, enter));
+        assert!(matches!(app.state, AppState::Typing));
+        assert_eq!(app.session.len(), 0);
+
+        // 打完后按 r 重打
+        app.session.type_text("离线文本");
+        app.finish_typing();
+        let r_key = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE);
+        assert!(handle_finished_key(&mut app, r_key));
+        assert!(matches!(app.state, AppState::Typing));
+
+        // 打完后按 R 重打
+        app.session.type_text("离线文本");
+        app.finish_typing();
+        let r_upper = KeyEvent::new(KeyCode::Char('R'), KeyModifiers::NONE);
+        assert!(handle_finished_key(&mut app, r_upper));
+        assert!(matches!(app.state, AppState::Typing));
+    }
+
+    #[test]
+    fn finished_key_enter_and_r_do_not_restart_online() {
+        let mut app = test_app(online_text("在线比赛"));
+        app.session.type_text("在线比赛");
+        app.finish_typing();
+        assert!(matches!(app.state, AppState::Finished { .. }));
+
+        // 在线赛文按 Enter：handled 但不 restart（仍为 Finished）
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(handle_finished_key(&mut app, enter));
+        assert!(matches!(app.state, AppState::Finished { .. }));
+
+        // 在线赛文按 r：handled 但不 restart
+        let r_key = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE);
+        assert!(handle_finished_key(&mut app, r_key));
+        assert!(matches!(app.state, AppState::Finished { .. }));
+    }
+
+    #[test]
+    fn finished_key_ctrl_f_b_e_navigate() {
+        let mut app = test_app(file_text("文本"));
+        app.finish_typing();
+
+        // Ctrl-F 打开载文浏览
+        let ctrl_f = KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL);
+        assert!(handle_finished_key(&mut app, ctrl_f));
+        assert!(matches!(app.state, AppState::Browsing));
+
+        // 回到 Finished 测试 Ctrl-B
+        app.finish_typing();
+        let ctrl_b = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL);
+        assert!(handle_finished_key(&mut app, ctrl_b));
+        assert!(matches!(app.state, AppState::BrowsingBuiltin));
+
+        // 回到 Finished 测试 Ctrl-E
+        app.finish_typing();
+        let ctrl_e = KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL);
+        assert!(handle_finished_key(&mut app, ctrl_e));
+        assert!(matches!(app.state, AppState::Settings));
+    }
+
+    #[test]
+    fn finished_key_unhandled_returns_false() {
+        let mut app = test_app(file_text("文本"));
+        app.finish_typing();
+
+        let space = KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE);
+        assert!(!handle_finished_key(&mut app, space));
+        assert!(matches!(app.state, AppState::Finished { .. }));
     }
 }
