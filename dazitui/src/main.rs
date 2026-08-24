@@ -6,10 +6,11 @@ use std::time::{Duration, Instant};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use dazitui_core::ThemePreset;
 use dazitui_core::{
-    ApiClient, ApiError, AuthSession, BUILTIN_SETS, CharStatus, CompetitionType, ErrorType,
-    FONT_SIZE_PT, LoadError, LoadOptions, Rgb, Session, Settings, SettingsStore, Stats, Text,
-    TextSource, Theme, TokenStore, env_credentials, format_time, is_auth_failure,
-    load_builtin_text, load_builtin_text_shuffled, load_text_from_clipboard, load_text_from_file,
+    ApiClient, ApiError, AuthSession, BUILTIN_SETS, CharStatus, CompetitionType, DbTask, DbWorker,
+    ErrorRecordItem, ErrorType, FONT_SIZE_PT, KeypressRecordItem, LoadError, LoadOptions, Rgb,
+    Session, SessionRecord, Settings, SettingsStore, Stats, StatsDb, Text, TextSource, Theme,
+    TokenStore, env_credentials, format_time, is_auth_failure, load_builtin_text,
+    load_builtin_text_shuffled, load_text_from_clipboard, load_text_from_file,
     load_text_from_string, osc_font_size_sequence, osc52_clipboard, save_text_to_file,
 };
 use ratatui::Frame;
@@ -320,6 +321,8 @@ struct App {
     input_method_modal: Option<InputMethodModal>,
     /// 自由发文编辑弹窗（`None` = 未打开）。
     free_input_modal: Option<FreeInputModal>,
+    /// 后台数据库异步写入 Worker。
+    db_worker: Option<DbWorker>,
 }
 
 /// 登录模态框输入状态。
@@ -361,7 +364,6 @@ struct InputMethodModal {
 impl InputMethodModal {
     /// 新建弹窗，预填当前自定义值（若为「无」或预设，则置空）。
     fn new(current: &str) -> Self {
-        // 预设值（包括空串）在弹窗中置空，让用户从头输入；真正的自定义值预填
         let prefill = if INPUT_METHOD_PRESETS.contains(&current) {
             String::new()
         } else {
@@ -383,8 +385,6 @@ impl InputMethodModal {
         chars.next_back();
         self.input = chars.as_str().to_string();
     }
-
-    /// 保存：返回最终值（空串或截断后的值）。
     fn commit(&self) -> String {
         Settings::clamp_input_method(&self.input)
     }
@@ -397,6 +397,7 @@ impl App {
             TokenStore::with_default_path(),
             ApiClient::new(),
             SettingsStore::with_default_path(),
+            DbWorker::start(StatsDb::default_path()).ok(),
         )
     }
 
@@ -406,6 +407,7 @@ impl App {
         token_store: TokenStore,
         api: ApiClient,
         settings_store: SettingsStore,
+        db_worker: Option<DbWorker>,
     ) -> Self {
         let session = {
             let wb = text.session_word_boundaries();
@@ -455,6 +457,7 @@ impl App {
             builtin_preview: None,
             input_method_modal: None,
             free_input_modal: None,
+            db_worker,
         }
     }
 
@@ -672,6 +675,67 @@ impl App {
             self.accumulated_elapsed
         };
         let stats = self.session.finish(elapsed);
+
+        // 异步持久化有效练习流水到 SQLite 数据库
+        if let Some(worker) = &self.db_worker {
+            let accuracy = if stats.typed_chars == 0 {
+                1.0
+            } else {
+                stats.correct_chars as f64 / stats.typed_chars as f64
+            };
+            let session_record = SessionRecord::new(
+                elapsed.as_secs_f64(),
+                stats.wpm,
+                accuracy,
+                stats.correct_chars as u32,
+                stats.wrong_chars as u32,
+                stats.edits,
+                stats.typed_chars as u32,
+                &self.text.title,
+                &self.settings.input_method,
+            );
+            let session_id = session_record.id.clone();
+            let errors: Vec<ErrorRecordItem> = stats
+                .error_points
+                .iter()
+                .enumerate()
+                .map(|(idx, ep)| {
+                    let (target_char, actual_char, error_type_str) = match &ep.error_type {
+                        ErrorType::Mismatch { typed, expected } => {
+                            (*expected, Some(*typed), "Mismatch")
+                        }
+                        ErrorType::Backspace { deleted } => (None, Some(*deleted), "Backspace"),
+                    };
+                    ErrorRecordItem::new(
+                        &session_id,
+                        ep.time_secs,
+                        idx as u32,
+                        target_char,
+                        actual_char,
+                        None,
+                        error_type_str,
+                    )
+                })
+                .collect();
+
+            let keys: Vec<KeypressRecordItem> = stats
+                .key_frequency
+                .iter()
+                .map(|(k, count)| KeypressRecordItem {
+                    session_id: session_id.clone(),
+                    key_code: k.clone(),
+                    press_count: *count,
+                    is_raw: true,
+                })
+                .collect();
+
+            let _ = worker.send(DbTask::SaveSession {
+                session: session_record,
+                errors,
+                keys,
+            });
+        }
+
         let is_online = self.text.is_online();
         if is_online {
             self.state = AppState::Finished {
@@ -3250,6 +3314,7 @@ mod tests {
             store.clone(),
             ApiClient::with_base_url_and_store("http://127.0.0.1:1", Some(store)),
             temp_settings_store(),
+            None,
         )
     }
 
@@ -4600,6 +4665,7 @@ mod tests {
                 Some(store.clone()),
             ),
             temp_settings_store(),
+            None,
         );
         let stats = app.session.finish(Duration::from_secs(10));
         let up = app.perform_upload(&stats, Duration::from_secs(10));
@@ -4921,6 +4987,7 @@ mod tests {
             store.clone(),
             ApiClient::with_base_url_and_store("http://127.0.0.1:1", Some(store)), // 不发网络请求
             temp_settings_store(),
+            None,
         );
         assert_eq!(app.token.as_deref(), Some("saved-token"));
         assert!(app.logged_in);
@@ -4941,6 +5008,7 @@ mod tests {
             store.clone(),
             ApiClient::with_base_url_and_store(&format!("http://127.0.0.1:{port}"), Some(store)),
             temp_settings_store(),
+            None,
         );
         app.logged_in = true;
         app.online_loading = Some(CompetitionType::Jisu);
@@ -4964,6 +5032,7 @@ mod tests {
             store.clone(),
             ApiClient::with_base_url_and_store("http://127.0.0.1:1", Some(store)),
             temp_settings_store(),
+            None,
         );
         app.logged_in = true;
         app.online_loading = Some(CompetitionType::Jisu);
@@ -5195,7 +5264,7 @@ mod tests {
                         .symbol()
                         .chars()
                         .next()
-                        .map_or(false, |c| !c.is_ascii());
+                        .is_some_and(|c| !c.is_ascii());
                 if !is_wide_char_tail {
                     assert_eq!(
                         cell.bg,
@@ -5770,5 +5839,59 @@ mod tests {
             assert!(found_nav, "应当在底部提示栏找到 '菜'");
             assert!(found_key, "应当在底部提示栏找到按键胶囊 '↑'");
         }
+    }
+
+    #[test]
+    fn finish_typing_persists_session_to_database_asynchronously() {
+        let (worker, shared_db) = DbWorker::start_in_memory().unwrap();
+        let store = temp_token_store();
+        let mut app = App::new_with(
+            file_text("你好世界"),
+            store.clone(),
+            ApiClient::with_base_url_and_store("http://127.0.0.1:1", Some(store)),
+            temp_settings_store(),
+            Some(worker),
+        );
+        app.text.title = "测试赛文".to_string();
+
+        app.settings.input_method = "虎码".to_string();
+
+        // 模拟打字：输入 "你好四界"，打错一个字，记录击键与错字
+        handle_key(&mut app.session, KeyEvent::new(KeyCode::Char('你'), KeyModifiers::NONE), Duration::from_secs(1));
+        handle_key(&mut app.session, KeyEvent::new(KeyCode::Char('好'), KeyModifiers::NONE), Duration::from_secs(2));
+        handle_key(&mut app.session, KeyEvent::new(KeyCode::Char('四'), KeyModifiers::NONE), Duration::from_secs(3));
+        handle_key(&mut app.session, KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE), Duration::from_secs(4));
+        handle_key(&mut app.session, KeyEvent::new(KeyCode::Char('世'), KeyModifiers::NONE), Duration::from_secs(5));
+        handle_key(&mut app.session, KeyEvent::new(KeyCode::Char('界'), KeyModifiers::NONE), Duration::from_secs(6));
+
+        assert!(app.session.is_complete());
+
+        // 触发完成
+        let _ = app.finish_typing();
+
+        // 优雅停机刷盘
+        if let Some(w) = app.db_worker.take() {
+            w.flush_and_stop();
+        }
+
+        // 校验 SQLite 数据库中的记录
+        let db = shared_db.lock().unwrap();
+        assert_eq!(db.get_session_count().unwrap(), 1);
+
+        let sessions = db.get_all_sessions().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].text_title, "测试赛文");
+        assert_eq!(sessions[0].input_scheme, "虎码");
+        assert_eq!(sessions[0].correct_chars, 4);
+        assert_eq!(sessions[0].edits, 1);
+
+        let key_totals = db.get_key_press_totals(Some(true)).unwrap();
+        assert_eq!(key_totals.get("你"), Some(&1));
+        assert_eq!(key_totals.get("Backspace"), Some(&1));
+
+        let top_chars = db.get_top_mistyped_chars(5).unwrap();
+        assert_eq!(top_chars.len(), 1);
+        assert_eq!(top_chars[0].target_char, '世');
+        assert_eq!(top_chars[0].error_count, 1);
     }
 }

@@ -1,11 +1,16 @@
 use std::path::Path;
 
+mod db;
 mod session;
 mod settings;
 
 #[cfg(feature = "online")]
 mod online;
 
+pub use db::{
+    DbError, DbTask, DbWorker, ErrorRecordItem, GlobalStatsSummary, KeypressRecordItem,
+    MistypedCharStat, MistypedWordStat, SessionRecord, StatsDb,
+};
 pub use session::{CharStatus, ErrorPoint, ErrorType, GROUP_SIZE, Session, Stats, TypeResult};
 pub use settings::{
     FONT_SIZE_PT, Rgb, Settings, SettingsStore, Theme, ThemePreset, osc_font_size_sequence,
