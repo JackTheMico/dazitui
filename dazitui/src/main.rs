@@ -7,7 +7,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use dazitui_core::ThemePreset;
 use dazitui_core::{
     ApiClient, ApiError, AuthSession, BUILTIN_SETS, CharStatus, CompetitionType, DbTask, DbWorker,
-    ErrorRecordItem, ErrorType, KeyboardMode, KeypressRecordItem, LoadError,
+    ErrorRecordItem, ErrorType, HeatmapLayout, KeyboardMode, KeypressRecordItem, LoadError,
     LoadOptions, Rgb, SchemeDict, Session, SessionRecord, Settings, SettingsStore, Stats, StatsDb,
     Text, TextSource, Theme, TokenStore, env_credentials, format_time, is_auth_failure,
     load_builtin_text, load_builtin_text_shuffled, load_text_from_clipboard, load_text_from_file,
@@ -24,6 +24,7 @@ use ratatui::widgets::{
     Axis, Block, BorderType, Chart, Clear, Dataset, GraphType, Paragraph, Wrap,
 };
 use ratatui_themes::{ThemeName, ThemePalette};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// 统计视图子页面 / Tab。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -65,30 +66,6 @@ impl WpmChartRange {
             Self::Recent30 => "近 30 场",
             Self::Recent100 => "近 100 场",
             Self::All => "全部历史",
-        }
-    }
-}
-
-/// 键位热力图布局模式。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-enum HeatmapLayout {
-    #[default]
-    Staggered, // 标准斜列 (ANSI 60%)
-    Ortholinear, // 直列矩阵 (Planck 4x12)
-}
-
-impl HeatmapLayout {
-    fn next(self) -> Self {
-        match self {
-            Self::Staggered => Self::Ortholinear,
-            Self::Ortholinear => Self::Staggered,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Staggered => "标准斜列 (ANSI 60%)",
-            Self::Ortholinear => "直列矩阵 (4x12)",
         }
     }
 }
@@ -153,11 +130,25 @@ struct StatsViewState {
     word_scroll: usize,
 }
 
+impl StatsViewState {
+    fn new(heatmap_layout: HeatmapLayout) -> Self {
+        Self {
+            tab: StatsTab::default(),
+            wpm_range: WpmChartRange::default(),
+            heatmap_layout,
+            heatmap_source: HeatmapSource::default(),
+            error_ranking_focus: ErrorRankingFocus::default(),
+            char_scroll: 0,
+            word_scroll: 0,
+        }
+    }
+}
+
 /// 将 core 的 ThemePreset 映射为 ratatui_themes 的 ThemePalette。
 pub fn theme_palette(preset: ThemePreset) -> ThemePalette {
     let name = match preset {
         ThemePreset::CatppuccinMocha => ThemeName::CatppuccinMocha,
-        ThemePreset::TokyoNight => ThemeName::TokyoNight,
+        ThemePreset::Cyberpunk => ThemeName::Cyberpunk,
         ThemePreset::Nord => ThemeName::Nord,
         ThemePreset::Dracula => ThemeName::Dracula,
         ThemePreset::Gruvbox => ThemeName::GruvboxDark,
@@ -1608,6 +1599,8 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                             }
                             KeyCode::Char('l') | KeyCode::Char('L') => {
                                 stats_state.heatmap_layout = stats_state.heatmap_layout.next();
+                                app.settings.heatmap_layout = stats_state.heatmap_layout;
+                                let _ = app.settings_store.save(&app.settings);
                             }
                             KeyCode::Char('m') | KeyCode::Char('M') => {
                                 stats_state.heatmap_source = stats_state.heatmap_source.next();
@@ -1770,7 +1763,9 @@ fn activate_sidebar_menu_item<B: ratatui::backend::Backend>(
         SidebarMenuItem::OnlineJianshen => {
             trigger_online_competition(app, CompetitionType::Jianshen, terminal)?;
         }
-        SidebarMenuItem::Stats => app.state = AppState::Stats(StatsViewState::default()),
+        SidebarMenuItem::Stats => {
+            app.state = AppState::Stats(StatsViewState::new(app.settings.heatmap_layout));
+        }
         SidebarMenuItem::Settings => app.state = AppState::Settings,
         SidebarMenuItem::Login => app.open_login(),
     }
@@ -2095,7 +2090,7 @@ fn handle_finished_key(app: &mut App, key: KeyEvent) -> bool {
     }
     match key.code {
         KeyCode::Char('s') | KeyCode::Char('S') => {
-            app.state = AppState::Stats(StatsViewState::default());
+            app.state = AppState::Stats(StatsViewState::new(app.settings.heatmap_layout));
             true
         }
         KeyCode::Esc => {
@@ -2298,6 +2293,36 @@ fn list_text_files(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
+/// 计算字符序列在指定内宽 `inner_width`（字符列数）下的折行后光标坐标 `(line, col)`。
+///
+/// 中文/全角字符宽度为 2 列，ASCII/半角字符为 1 列，换行符 `\n` 换行且列清零。
+pub fn calculate_text_layout_position(
+    chars: impl IntoIterator<Item = char>,
+    inner_width: u16,
+) -> (u16, u16) {
+    if inner_width == 0 {
+        return (0, 0);
+    }
+    let mut line = 0u16;
+    let mut col = 0u16;
+
+    for c in chars {
+        if c == '\n' {
+            line = line.saturating_add(1);
+            col = 0;
+        } else {
+            let w = UnicodeWidthChar::width(c).unwrap_or(1) as u16;
+            if w > 0 && col.saturating_add(w) > inner_width {
+                line = line.saturating_add(1);
+                col = w;
+            } else {
+                col = col.saturating_add(w);
+            }
+        }
+    }
+    (line, col)
+}
+
 fn ui(frame: &mut Frame, app: &App) {
     if let AppState::Finished {
         stats,
@@ -2409,6 +2434,19 @@ fn ui(frame: &mut Frame, app: &App) {
             }
             ref_block = ref_block.title_bottom(Line::from(spans).right_aligned());
         }
+
+        let ref_inner_width = ref_area.width.saturating_sub(2);
+        let ref_inner_height = ref_area.height.saturating_sub(2);
+        let (ref_target_line, _) = calculate_text_layout_position(
+            app.text.content.chars().take(app.session.len()),
+            ref_inner_width,
+        );
+        let ref_scroll_y = if ref_inner_height > 0 {
+            ref_target_line.saturating_sub(ref_inner_height / 2)
+        } else {
+            0
+        };
+
         frame.render_widget(
             Paragraph::new(original_line(
                 &app.session,
@@ -2417,7 +2455,8 @@ fn ui(frame: &mut Frame, app: &App) {
                 app.settings.bold,
             ))
             .block(ref_block)
-            .wrap(Wrap { trim: false }),
+            .wrap(Wrap { trim: false })
+            .scroll((ref_scroll_y, 0)),
             ref_area,
         );
 
@@ -2457,6 +2496,18 @@ fn ui(frame: &mut Frame, app: &App) {
             Style::default().fg(palette.fg),
         ));
         let typing_title = Line::from(typing_title_spans);
+
+        let type_inner_width = type_area.width.saturating_sub(2);
+        let type_inner_height = type_area.height.saturating_sub(2);
+        let typed_chars: Vec<char> = app.session.display().into_iter().map(|(c, _)| c).collect();
+        let (type_cursor_line, type_cursor_col) =
+            calculate_text_layout_position(typed_chars.iter().copied(), type_inner_width);
+        let type_scroll_y = if type_inner_height > 0 {
+            type_cursor_line.saturating_sub(type_inner_height / 2)
+        } else {
+            0
+        };
+
         frame.render_widget(
             Paragraph::new(type_line(
                 &app.session,
@@ -2465,9 +2516,31 @@ fn ui(frame: &mut Frame, app: &App) {
                 app.settings.bold,
             ))
             .block(themed_block(&palette, typing_active).title(typing_title))
-            .wrap(Wrap { trim: false }),
+            .wrap(Wrap { trim: false })
+            .scroll((type_scroll_y, 0)),
             type_area,
         );
+
+        if !app.paused && matches!(app.state, AppState::Typing) {
+            let eff_line = if type_cursor_col >= type_inner_width {
+                type_cursor_line.saturating_add(1)
+            } else {
+                type_cursor_line
+            };
+            let eff_col = if type_cursor_col >= type_inner_width {
+                0
+            } else {
+                type_cursor_col
+            };
+            let cursor_inner_row = eff_line.saturating_sub(type_scroll_y);
+            let cursor_x = type_area.x + 1 + eff_col;
+            let cursor_y = type_area.y + 1 + cursor_inner_row;
+            if cursor_y < type_area.y + type_area.height.saturating_sub(1)
+                && cursor_x < type_area.x + type_area.width.saturating_sub(1)
+            {
+                frame.set_cursor_position((cursor_x, cursor_y));
+            }
+        }
     }
 
     // 底部快捷键提示 bar（带圆角边框与结构化标题）
@@ -2490,18 +2563,19 @@ fn ui(frame: &mut Frame, app: &App) {
         help_bar,
     );
 
-    // 模态框（覆盖层）
+    if matches!(app.state, AppState::Settings) {
+        render_settings(frame, app);
+    }
+
+    // 模态框（覆盖层，必须在最顶层渲染）
     if let Some(form) = &app.login_form {
         render_login_modal(frame, form, &palette, app.theme());
-    }
-    if let Some(modal) = &app.text_setting_modal {
-        render_text_setting_modal(frame, modal, &palette, app.theme());
     }
     if let Some(modal) = &app.free_input_modal {
         render_free_input_modal(frame, modal, &palette, app.theme());
     }
-    if matches!(app.state, AppState::Settings) {
-        render_settings(frame, app);
+    if let Some(modal) = &app.text_setting_modal {
+        render_text_setting_modal(frame, modal, &palette, app.theme());
     }
 }
 
@@ -2543,6 +2617,17 @@ fn render_login_modal(frame: &mut Frame, form: &LoginForm, palette: &ThemePalett
             .wrap(Wrap { trim: false }),
         area,
     );
+
+    let (field_x, field_y) = if form.focus == 0 {
+        let w = UnicodeWidthStr::width(form.username.as_str()) as u16;
+        (area.x + 1 + 10 + w, area.y + 1 + 2)
+    } else {
+        let w = UnicodeWidthStr::width(mask_password(&form.password).as_str()) as u16;
+        (area.x + 1 + 10 + w, area.y + 1 + 3)
+    };
+    if field_y < area.y + area.height.saturating_sub(1) && field_x < area.x + area.width.saturating_sub(1) {
+        frame.set_cursor_position((field_x, field_y));
+    }
 }
 
 /// 自定义设置文本弹窗（方案路径 / 输入法名称）：居中弹层，单行文本输入。
@@ -2561,18 +2646,18 @@ fn render_text_setting_modal(
             let remaining = Settings::INPUT_METHOD_MAX_CHARS.saturating_sub(modal.input.chars().count());
             (
                 " 自定义上传输入法名称 ",
-                Line::from(format!(" 还可输入 {remaining} 字（52dazi 上报展示）")).fg(palette.fg),
+                Line::from(format!(" 还可输入 {remaining} 字（52dazi 上报展示）")).fg(palette.muted),
             )
         }
     };
-    let area = centered_rect(frame.area(), 54, 7);
+    let area = centered_rect(frame.area(), 56, 8);
     frame.render_widget(Clear, area);
     let lines = vec![
-        Line::from(title).bold().fg(palette.fg),
         Line::from(""),
-        Line::from(format!(" ▸ {}", modal.input))
-            .fg(palette.accent)
-            .bold(),
+        Line::from(vec![
+            Span::styled(" ▸ ", Style::default().fg(palette.accent).bold()),
+            Span::styled(&modal.input, Style::default().fg(palette.fg).bold()),
+        ]),
         Line::from(""),
         hint_line,
         hint_bar_line(" Enter 保存 | Esc 取消 ", palette),
@@ -2586,6 +2671,13 @@ fn render_text_setting_modal(
             .wrap(Wrap { trim: false }),
         area,
     );
+
+    let input_w = UnicodeWidthStr::width(modal.input.as_str()) as u16;
+    let cursor_x = (area.x + 1 + 3 + input_w).min(area.x + area.width.saturating_sub(2));
+    let cursor_y = area.y + 1 + 1;
+    if cursor_y < area.y + area.height.saturating_sub(1) && cursor_x < area.x + area.width.saturating_sub(1) {
+        frame.set_cursor_position((cursor_x, cursor_y));
+    }
 }
 
 /// 自由发文模态框：居中弹层，标题 + 多行正文 + 保存选项。
@@ -2732,6 +2824,30 @@ fn render_free_input_modal(
         )]
     };
     frame.render_widget(Paragraph::new(hint_lines), hint_rect);
+
+    if is_title_focus {
+        let w = UnicodeWidthStr::width(modal.title.as_str()) as u16;
+        let c_x = (title_rect.x + 8 + w).min(title_rect.x + title_rect.width.saturating_sub(1));
+        let c_y = title_rect.y;
+        if c_y < area.y + area.height.saturating_sub(1) && c_x < area.x + area.width.saturating_sub(1) {
+            frame.set_cursor_position((c_x, c_y));
+        }
+    } else if is_content_focus {
+        let content_w = content_rect.width.saturating_sub(2);
+        let (c_line, c_col) = calculate_text_layout_position(modal.content.chars(), content_w);
+        let c_x = (content_rect.x + 1 + c_col).min(content_rect.x + content_rect.width.saturating_sub(1));
+        let c_y = content_rect.y + 1 + c_line;
+        if c_y < content_rect.y + content_rect.height.saturating_sub(1) && c_x < content_rect.x + content_rect.width.saturating_sub(1) {
+            frame.set_cursor_position((c_x, c_y));
+        }
+    } else if is_path_focus {
+        let w = UnicodeWidthStr::width(modal.save_path.as_str()) as u16;
+        let c_x = (save_rect.x + 12 + w).min(save_rect.x + save_rect.width.saturating_sub(1));
+        let c_y = save_rect.y + 1;
+        if c_y < save_rect.y + save_rect.height.saturating_sub(1) && c_x < save_rect.x + save_rect.width.saturating_sub(1) {
+            frame.set_cursor_position((c_x, c_y));
+        }
+    }
 }
 
 /// 计算居中矩形。
@@ -4069,6 +4185,7 @@ pub fn generate_live_keyboard_lines(
     mode: KeyboardMode,
     palette: &ThemePalette,
     now: Instant,
+    target_width: u16,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     match mode {
@@ -4145,21 +4262,91 @@ pub fn generate_live_keyboard_lines(
                 ],
             ];
 
-            let row_indents = ["  ", "   ", "    ", "     ", "        "];
+            let row_indents = ["", " ", "  ", "    ", "        "];
+            let max_layout_width = 60u16;
+            let center_pad = target_width.saturating_sub(max_layout_width) / 2;
+            let pad_prefix = " ".repeat(center_pad as usize);
 
             for (r_idx, row) in rows.iter().enumerate() {
-                let mut spans = vec![Span::raw(row_indents[r_idx])];
+                let mut spans = vec![Span::raw(format!("{}{}", pad_prefix, row_indents[r_idx]))];
                 for (k_idx, (k_lookup, k_display)) in row.iter().enumerate() {
-                    let style = live_kb.get_key_style(k_lookup, palette, now);
-                    let badge = if *k_lookup == "Space" {
-                        format!("[ {:^14} ]", k_display)
-                    } else {
-                        format!("[{k_display}]")
-                    };
+                    let norm = LiveKeyboard::normalize_key(k_lookup);
+                    let is_homing = *k_lookup == "f" || *k_lookup == "j";
+                    let is_modifier = matches!(
+                        *k_lookup,
+                        "Tab"
+                            | "Caps"
+                            | "Shift"
+                            | "Enter"
+                            | "Backspace"
+                            | "Ctrl"
+                            | "Alt"
+                            | "Esc"
+                            | "Lower"
+                            | "Raise"
+                            | "Left"
+                            | "Down"
+                            | "Up"
+                            | "Right"
+                    );
+
+                    let elapsed_opt = live_kb
+                        .active_keys
+                        .get(&norm)
+                        .map(|&t| now.saturating_duration_since(t).as_millis());
+
                     if k_idx > 0 {
                         spans.push(Span::raw(" "));
                     }
-                    spans.push(Span::styled(badge, style));
+
+                    if let Some(elapsed_ms) = elapsed_opt {
+                        if elapsed_ms <= 100 {
+                            // 强高亮 (0-100ms): 实体按键反色高亮
+                            let active_style = Style::default()
+                                .fg(palette.bg)
+                                .bg(palette.accent)
+                                .add_modifier(Modifier::BOLD);
+                            let badge = if *k_lookup == "Space" {
+                                format!("[ {:^14} ]", k_display)
+                            } else {
+                                format!("[{k_display}]")
+                            };
+                            spans.push(Span::styled(badge, active_style));
+                        } else if elapsed_ms <= 250 {
+                            // 余温衰减 (100-250ms): 强调色渐隐
+                            let decay_style = Style::default()
+                                .fg(palette.accent)
+                                .add_modifier(Modifier::BOLD);
+                            let badge = if *k_lookup == "Space" {
+                                format!("[ {:^14} ]", k_display)
+                            } else {
+                                format!("[{k_display}]")
+                            };
+                            spans.push(Span::styled(badge, decay_style));
+                        } else {
+                            // 恢复常态
+                            append_idle_key_spans(
+                                &mut spans,
+                                k_lookup,
+                                k_display,
+                                is_homing,
+                                is_modifier,
+                                palette,
+                                14,
+                            );
+                        }
+                    } else {
+                        // 常态
+                        append_idle_key_spans(
+                            &mut spans,
+                            k_lookup,
+                            k_display,
+                            is_homing,
+                            is_modifier,
+                            palette,
+                            14,
+                        );
+                    }
                 }
                 lines.push(Line::from(spans));
             }
@@ -4222,21 +4409,87 @@ pub fn generate_live_keyboard_lines(
                 ],
             ];
 
-            let row_indents = ["    ", "    ", "    ", "    "];
+            let row_indents = ["", "", "", ""];
+            let max_layout_width = 59u16;
+            let center_pad = target_width.saturating_sub(max_layout_width) / 2;
+            let pad_prefix = " ".repeat(center_pad as usize);
 
             for (r_idx, row) in rows.iter().enumerate() {
-                let mut spans = vec![Span::raw(row_indents[r_idx])];
+                let mut spans = vec![Span::raw(format!("{}{}", pad_prefix, row_indents[r_idx]))];
                 for (k_idx, (k_lookup, k_display)) in row.iter().enumerate() {
-                    let style = live_kb.get_key_style(k_lookup, palette, now);
-                    let badge = if *k_lookup == "Space" {
-                        format!("[ {:^12} ]", k_display)
-                    } else {
-                        format!("[{k_display}]")
-                    };
+                    let norm = LiveKeyboard::normalize_key(k_lookup);
+                    let is_homing = *k_lookup == "f" || *k_lookup == "j";
+                    let is_modifier = matches!(
+                        *k_lookup,
+                        "Tab"
+                            | "Caps"
+                            | "Shift"
+                            | "Enter"
+                            | "Backspace"
+                            | "Ctrl"
+                            | "Alt"
+                            | "Esc"
+                            | "Lower"
+                            | "Raise"
+                            | "Left"
+                            | "Down"
+                            | "Up"
+                            | "Right"
+                    );
+
+                    let elapsed_opt = live_kb
+                        .active_keys
+                        .get(&norm)
+                        .map(|&t| now.saturating_duration_since(t).as_millis());
+
                     if k_idx > 0 {
                         spans.push(Span::raw(" "));
                     }
-                    spans.push(Span::styled(badge, style));
+
+                    if let Some(elapsed_ms) = elapsed_opt {
+                        if elapsed_ms <= 100 {
+                            let active_style = Style::default()
+                                .fg(palette.bg)
+                                .bg(palette.accent)
+                                .add_modifier(Modifier::BOLD);
+                            let badge = if *k_lookup == "Space" {
+                                format!("[ {:^12} ]", k_display)
+                            } else {
+                                format!("[{k_display}]")
+                            };
+                            spans.push(Span::styled(badge, active_style));
+                        } else if elapsed_ms <= 250 {
+                            let decay_style = Style::default()
+                                .fg(palette.accent)
+                                .add_modifier(Modifier::BOLD);
+                            let badge = if *k_lookup == "Space" {
+                                format!("[ {:^12} ]", k_display)
+                            } else {
+                                format!("[{k_display}]")
+                            };
+                            spans.push(Span::styled(badge, decay_style));
+                        } else {
+                            append_idle_key_spans(
+                                &mut spans,
+                                k_lookup,
+                                k_display,
+                                is_homing,
+                                is_modifier,
+                                palette,
+                                12,
+                            );
+                        }
+                    } else {
+                        append_idle_key_spans(
+                            &mut spans,
+                            k_lookup,
+                            k_display,
+                            is_homing,
+                            is_modifier,
+                            palette,
+                            12,
+                        );
+                    }
                 }
                 lines.push(Line::from(spans));
             }
@@ -4244,6 +4497,49 @@ pub fn generate_live_keyboard_lines(
         KeyboardMode::Off => {}
     }
     lines
+}
+
+/// 辅助函数：构造常态（未击键）下的键帽 Span 结构，实现主题配色层级化与盲打定位键强调。
+fn append_idle_key_spans(
+    spans: &mut Vec<Span<'static>>,
+    k_lookup: &str,
+    k_display: &str,
+    is_homing: bool,
+    is_modifier: bool,
+    palette: &ThemePalette,
+    space_width: usize,
+) {
+    let delim_style = Style::default().fg(palette.muted);
+    if k_lookup == "Space" {
+        spans.push(Span::styled("[", delim_style));
+        spans.push(Span::styled(
+            format!(" {:^width$} ", k_display, width = space_width),
+            Style::default().fg(palette.muted),
+        ));
+        spans.push(Span::styled("]", delim_style));
+    } else if is_homing {
+        // 定位键 (F / J): 鲜明主题强调色 + 粗体，形成视觉瞄点
+        spans.push(Span::styled("[", delim_style));
+        spans.push(Span::styled(
+            k_display.to_string(),
+            Style::default().fg(palette.accent).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled("]", delim_style));
+    } else if is_modifier {
+        // 修饰/功能键: 柔和次要色，避免喧宾夺主
+        spans.push(Span::styled(
+            format!("[{k_display}]"),
+            Style::default().fg(palette.muted),
+        ));
+    } else {
+        // 核心字母/符号键: 高对比度主题前景色，清晰易读
+        spans.push(Span::styled("[", delim_style));
+        spans.push(Span::styled(
+            k_display.to_string(),
+            Style::default().fg(palette.fg),
+        ));
+        spans.push(Span::styled("]", delim_style));
+    }
 }
 
 /// 渲染实时虚拟键盘 Widget。
@@ -4255,7 +4551,7 @@ fn render_live_keyboard(
     palette: &ThemePalette,
     now: Instant,
 ) {
-    let lines = generate_live_keyboard_lines(live_kb, mode, palette, now);
+    let lines = generate_live_keyboard_lines(live_kb, mode, palette, now, area.width);
     if !lines.is_empty() {
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
     }
@@ -5912,8 +6208,8 @@ mod tests {
         assert_eq!(app.settings.theme, ThemePreset::CatppuccinMocha);
         // 切下一主题并持久化。
         app.next_theme();
-        assert_eq!(app.settings.theme, ThemePreset::TokyoNight);
-        assert_eq!(app.settings_store.load().theme, ThemePreset::TokyoNight);
+        assert_eq!(app.settings.theme, ThemePreset::Cyberpunk);
+        assert_eq!(app.settings_store.load().theme, ThemePreset::Cyberpunk);
         // 循环回绕：往前退回到 CatppuccinMocha。
         app.prev_theme();
         assert_eq!(app.settings.theme, ThemePreset::CatppuccinMocha);
@@ -7501,8 +7797,8 @@ mod tests {
 
     #[test]
     fn settings_row_styling_focused() {
-        let palette = theme_palette(ThemePreset::TokyoNight);
-        let focused = settings_row("主题", "Tokyo Night", true, &palette);
+        let palette = theme_palette(ThemePreset::Cyberpunk);
+        let focused = settings_row("主题", "Cyberpunk", true, &palette);
         let unfocused = settings_row("粗体", "关", false, &palette);
 
         assert!(focused.spans[0].content.contains('>'));
@@ -7571,7 +7867,7 @@ mod tests {
     fn main_ui_renders_high_contrast_theme_background_and_sidebar_unselected_items_visible() {
         for preset in [
             ThemePreset::CatppuccinMocha,
-            ThemePreset::TokyoNight,
+            ThemePreset::Cyberpunk,
             ThemePreset::Nord,
             ThemePreset::Dracula,
             ThemePreset::Gruvbox,
@@ -7965,14 +8261,91 @@ mod tests {
         let kb = LiveKeyboard::new();
         let now = Instant::now();
 
-        let staggered_lines = generate_live_keyboard_lines(&kb, KeyboardMode::Staggered, &palette, now);
+        let staggered_lines = generate_live_keyboard_lines(&kb, KeyboardMode::Staggered, &palette, now, 80);
         assert_eq!(staggered_lines.len(), 5);
 
-        let ortho_lines = generate_live_keyboard_lines(&kb, KeyboardMode::Ortholinear, &palette, now);
+        let ortho_lines = generate_live_keyboard_lines(&kb, KeyboardMode::Ortholinear, &palette, now, 80);
         assert_eq!(ortho_lines.len(), 4);
 
-        let off_lines = generate_live_keyboard_lines(&kb, KeyboardMode::Off, &palette, now);
+        let off_lines = generate_live_keyboard_lines(&kb, KeyboardMode::Off, &palette, now, 80);
         assert_eq!(off_lines.len(), 0);
+    }
+
+    #[test]
+    fn test_live_keyboard_centering_offsets() {
+        let palette = theme_palette(ThemePreset::CatppuccinMocha);
+        let kb = LiveKeyboard::new();
+        let now = Instant::now();
+
+        // 1. 宽度 60（刚好容纳 60% 键盘）：无居中额外填充
+        let lines_60 = generate_live_keyboard_lines(&kb, KeyboardMode::Staggered, &palette, now, 60);
+        let first_row_60 = lines_60[0].spans[0].content.as_ref();
+        assert_eq!(first_row_60, ""); // Row 0 indent is ""
+
+        // 2. 宽度 80：居中填充 (80 - 60) / 2 = 10 空格
+        let lines_80 = generate_live_keyboard_lines(&kb, KeyboardMode::Staggered, &palette, now, 80);
+        let first_row_80 = lines_80[0].spans[0].content.as_ref();
+        assert_eq!(first_row_80, " ".repeat(10));
+
+        // 3. 宽度 100：居中填充 (100 - 60) / 2 = 20 空格
+        let lines_100 = generate_live_keyboard_lines(&kb, KeyboardMode::Staggered, &palette, now, 100);
+        let first_row_100 = lines_100[0].spans[0].content.as_ref();
+        assert_eq!(first_row_100, " ".repeat(20));
+
+        // 验证各行阶梯缩进保持相对正确 (Row 1: +1 space, Row 2: +2 spaces, Row 3: +4 spaces, Row 4: +8 spaces)
+        let row1_100 = lines_100[1].spans[0].content.as_ref();
+        assert_eq!(row1_100, format!("{} ", " ".repeat(20)));
+        let row2_100 = lines_100[2].spans[0].content.as_ref();
+        assert_eq!(row2_100, format!("{}  ", " ".repeat(20)));
+    }
+
+    #[test]
+    fn test_live_keyboard_theme_hierarchy_spans() {
+        let palette = theme_palette(ThemePreset::CatppuccinMocha);
+        let mut kb = LiveKeyboard::new();
+        let now = Instant::now();
+
+        // 1. 常态（未击键）：测试主题颜色分层
+        let lines = generate_live_keyboard_lines(&kb, KeyboardMode::Staggered, &palette, now, 80);
+
+        // Row 2 包含 Caps, A, S, D, F, G, H, J, K, L, ;, ', Enter
+        let row2 = &lines[2];
+
+        // 验证定位键 F 与 J 在常态下被高亮为 accent + bold
+        let mut found_f = false;
+        let mut found_j = false;
+        let mut found_a = false;
+        for span in &row2.spans {
+            if span.content == "F" {
+                assert_eq!(span.style.fg, Some(palette.accent));
+                assert!(span.style.add_modifier.contains(Modifier::BOLD));
+                found_f = true;
+            } else if span.content == "J" {
+                assert_eq!(span.style.fg, Some(palette.accent));
+                assert!(span.style.add_modifier.contains(Modifier::BOLD));
+                found_j = true;
+            } else if span.content == "A" {
+                // 普通字母键为主要前景色 fg
+                assert_eq!(span.style.fg, Some(palette.fg));
+                found_a = true;
+            }
+        }
+        assert!(found_f && found_j && found_a);
+
+        // 2. 按键按下时：测试强高亮 (0-100ms) 反色填充 (bg: accent, fg: bg)
+        kb.press_char('a', now);
+        let active_lines = generate_live_keyboard_lines(&kb, KeyboardMode::Staggered, &palette, now, 80);
+        let active_row2 = &active_lines[2];
+        let mut found_active_a = false;
+        for span in &active_row2.spans {
+            if span.content == "[A]" {
+                assert_eq!(span.style.bg, Some(palette.accent));
+                assert_eq!(span.style.fg, Some(palette.bg));
+                assert!(span.style.add_modifier.contains(Modifier::BOLD));
+                found_active_a = true;
+            }
+        }
+        assert!(found_active_a, "按下瞬间 'A' 键应渲染为反色实体高亮 [A]");
     }
 
     #[test]
@@ -8238,6 +8611,204 @@ mod tests {
             .collect();
         assert!(!clean_resumed.contains("[暂停]"));
         assert!(clean_resumed.contains("WPM"));
+    }
+
+    #[test]
+    fn test_calculate_text_layout_position_cjk_ascii_newlines() {
+        // 1. 空字符序列
+        assert_eq!(calculate_text_layout_position("".chars(), 10), (0, 0));
+        assert_eq!(calculate_text_layout_position("".chars(), 0), (0, 0));
+
+        // 2. 纯 ASCII 字符
+        // "abcde" 在宽 10 下占 5 列，行 0
+        assert_eq!(calculate_text_layout_position("abcde".chars(), 10), (0, 5));
+        // "abcdefghij" 满 10 列
+        assert_eq!(calculate_text_layout_position("abcdefghij".chars(), 10), (0, 10));
+        // "abcdefghijk" 溢出换行：'k' 处于第 1 行第 1 列
+        assert_eq!(calculate_text_layout_position("abcdefghijk".chars(), 10), (1, 1));
+
+        // 3. 中文字符（每个宽 2）
+        // "中文" 占 4 列，行 0
+        assert_eq!(calculate_text_layout_position("中文".chars(), 10), (0, 4));
+        // "中文测试一" 占 10 列，行 0
+        assert_eq!(calculate_text_layout_position("中文测试一".chars(), 10), (0, 10));
+        // "中文测试二号" 在宽 10 下，第 6 字 "号" 溢出到行 1 列 2
+        assert_eq!(calculate_text_layout_position("中文测试二号".chars(), 10), (1, 2));
+
+        // 4. 换行符重置列
+        assert_eq!(calculate_text_layout_position("abc\ndef".chars(), 10), (1, 3));
+        assert_eq!(calculate_text_layout_position("你好\n世界".chars(), 10), (1, 4));
+    }
+
+    #[test]
+    fn test_text_setting_modal_rendered_on_top_of_settings_with_cursor() {
+        let text = load_text_from_string(
+            "测试",
+            "这是测试".into(),
+            TextSource::Custom,
+            &LoadOptions::default(),
+        )
+        .unwrap();
+        let mut app = test_app(text);
+        app.state = AppState::Settings;
+        app.settings_focus = FOCUS_INPUT_METHOD;
+        app.text_setting_modal = Some(TextSettingModal::new(
+            TextSettingTarget::InputMethod,
+            "我的自定义输入法",
+        ));
+
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| ui(f, &app)).unwrap();
+        let buffer = term.backend().buffer();
+        let content = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let clean: String = content
+            .chars()
+            .filter(|c| *c != ' ' && *c != '─')
+            .collect();
+
+        // 验证弹窗标题与自定义输入法内容在最顶层清晰可见（未被 settings 覆盖）
+        assert!(clean.contains("自定义上传输入法名称"));
+        assert!(clean.contains("我的自定义输入法"));
+
+        // 验证硬件光标已定位在弹窗输入框处
+        let (cx, cy): (u16, u16) = term.get_cursor_position().unwrap().into();
+        assert!(cx > 0 && cy > 0);
+        assert!(cy < 24 && cx < 80);
+    }
+
+    #[test]
+    fn test_long_text_typing_scrolls_and_centers_cursor_within_bounds() {
+        // 创建超过单页容量的超长赛文（500 字，在宽 60 的跟打区中折行超过 15 行）
+        let long_raw = "天地玄黄宇宙洪荒日月盈昃辰宿列张寒来暑往秋收冬藏闰余成岁律吕调阳云腾致雨露结为霜".repeat(6);
+        let text = load_text_from_string(
+            "长文本测试",
+            long_raw.clone(),
+            TextSource::Custom,
+            &LoadOptions::default(),
+        )
+        .unwrap();
+        let mut app = test_app(text);
+
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+
+        // 1. 就绪态（未输入）：光标在跟打区左上角，对照区未滚动
+        term.draw(|f| ui(f, &app)).unwrap();
+        let initial_cursor: (u16, u16) = term.get_cursor_position().unwrap().into();
+        assert!(initial_cursor.0 > 0 && initial_cursor.1 > 0);
+
+        // 2. 打入 200 个汉字（已推进到多行之后）
+        let prefix: String = long_raw.chars().take(200).collect();
+        app.session.type_text(&prefix);
+
+        term.draw(|f| ui(f, &app)).unwrap();
+        let (cx, cy): (u16, u16) = term.get_cursor_position().unwrap().into();
+
+        // 3. 验证光标始终位于终端可视区域内，绝不会溢出或被下边框遮挡
+        assert!(cy > 0 && cy < 23, "光标纵坐标 y={} 应在可视区域内部", cy);
+        assert!(cx > 0 && cx < 79, "光标横坐标 x={} 应在可视区域内部", cx);
+
+        // 4. 验证渲染缓冲区中能够找到当前最新的跟打字符（证明已自动向下滚动到当前打字处）
+        let buffer = term.backend().buffer();
+        let content = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        // 第 200 个字附近的字符应当在缓冲区可见
+        let recent_char = prefix.chars().last().unwrap();
+        assert!(
+            content.contains(recent_char),
+            "缓冲区应包含当前打字处字符: {}",
+            recent_char
+        );
+    }
+
+    #[test]
+    fn test_reference_area_scrolls_with_progress_on_long_text() {
+        // 创建超过单页容量的超长赛文
+        let long_raw = "甲乙丙丁戊己庚辛壬癸子丑寅卯辰巳午未申酉戌亥".repeat(10);
+        let text = load_text_from_string(
+            "对照区长文测试",
+            long_raw.clone(),
+            TextSource::Custom,
+            &LoadOptions::default(),
+        )
+        .unwrap();
+        let mut app = test_app(text);
+
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 20)).unwrap();
+
+        // 推进到第 150 个字符
+        let typed_count = 150;
+        let prefix: String = long_raw.chars().take(typed_count).collect();
+        app.session.type_text(&prefix);
+
+        term.draw(|f| ui(f, &app)).unwrap();
+        let buffer = term.backend().buffer();
+        let content = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // 验证待打字符（第 150 个字符及其后续字符）在对照区缓冲区中清晰可见
+        let target_char = long_raw.chars().nth(typed_count).unwrap();
+        assert!(
+            content.contains(target_char),
+            "对照区应滚动并显示当前待打目标字符: {}",
+            target_char
+        );
+    }
+
+    #[test]
+    fn test_heatmap_layout_persists_when_toggled_in_stats_view() {
+        let text = load_text_from_string(
+            "测试",
+            "测试内容".into(),
+            TextSource::Custom,
+            &LoadOptions::default(),
+        )
+        .unwrap();
+        let mut app = test_app(text);
+        assert_eq!(app.settings.heatmap_layout, HeatmapLayout::Staggered);
+
+        // 1. 打开统计视图
+        app.state = AppState::Stats(StatsViewState::new(app.settings.heatmap_layout));
+        if let AppState::Stats(ref s) = app.state {
+            assert_eq!(s.heatmap_layout, HeatmapLayout::Staggered);
+        }
+
+        // 2. 模拟按下 'l' 切换为直列布局
+        if let AppState::Stats(ref mut s) = app.state {
+            s.heatmap_layout = s.heatmap_layout.next();
+            app.settings.heatmap_layout = s.heatmap_layout;
+            let _ = app.settings_store.save(&app.settings);
+        }
+
+        // 3. 验证内存中的 settings 和已保存到磁盘的 settings 均已变为 Ortholinear
+        assert_eq!(app.settings.heatmap_layout, HeatmapLayout::Ortholinear);
+        let loaded = app.settings_store.load();
+        assert_eq!(loaded.heatmap_layout, HeatmapLayout::Ortholinear);
+
+        // 4. 用户退出统计视图并重新打开，验证保留了直列矩阵状态
+        app.state = AppState::Typing;
+        app.state = AppState::Stats(StatsViewState::new(app.settings.heatmap_layout));
+        if let AppState::Stats(ref s) = app.state {
+            assert_eq!(s.heatmap_layout, HeatmapLayout::Ortholinear);
+        }
     }
 }
 

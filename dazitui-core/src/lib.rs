@@ -19,7 +19,7 @@ pub use scheme::{ChordAlgebra, RimeSchemaResolver, SchemeDict, YamlValue, parse_
 pub use segmenter::{WordIndex, WordToken};
 pub use session::{CharStatus, ErrorPoint, ErrorType, GROUP_SIZE, Session, Stats, TypeResult};
 pub use settings::{
-    FONT_SIZE_PT, KeyboardMode, Rgb, Settings, SettingsStore, Theme, ThemePreset,
+    FONT_SIZE_PT, HeatmapLayout, KeyboardMode, Rgb, Settings, SettingsStore, Theme, ThemePreset,
     osc_font_size_sequence,
 };
 

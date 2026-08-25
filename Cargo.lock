@@ -439,6 +439,7 @@ dependencies = [
  "dazitui-core",
  "ratatui",
  "ratatui-themes",
+ "unicode-width",
 ]
 
 [[package]]

@@ -12,8 +12,8 @@ pub enum ThemePreset {
     /// Catppuccin Mocha（默认）。
     #[default]
     CatppuccinMocha,
-    /// Tokyo Night。
-    TokyoNight,
+    /// Cyberpunk（赛博朋克霓虹）。
+    Cyberpunk,
     /// Nord。
     Nord,
     /// Dracula。
@@ -32,7 +32,7 @@ impl ThemePreset {
     /// 全部预设，按设置视图展示顺序排列。
     pub const ALL: [ThemePreset; 8] = [
         ThemePreset::CatppuccinMocha,
-        ThemePreset::TokyoNight,
+        ThemePreset::Cyberpunk,
         ThemePreset::Nord,
         ThemePreset::Dracula,
         ThemePreset::Gruvbox,
@@ -45,7 +45,7 @@ impl ThemePreset {
     pub fn name(&self) -> &'static str {
         match self {
             Self::CatppuccinMocha => "Catppuccin Mocha",
-            Self::TokyoNight => "Tokyo Night",
+            Self::Cyberpunk => "Cyberpunk",
             Self::Nord => "Nord",
             Self::Dracula => "Dracula",
             Self::Gruvbox => "Gruvbox Dark",
@@ -59,7 +59,7 @@ impl ThemePreset {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::CatppuccinMocha => "catppuccin-mocha",
-            Self::TokyoNight => "tokyo-night",
+            Self::Cyberpunk => "cyberpunk",
             Self::Nord => "nord",
             Self::Dracula => "dracula",
             Self::Gruvbox => "gruvbox",
@@ -73,7 +73,8 @@ impl ThemePreset {
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().replace('_', "-").as_str() {
             "default" | "catppuccin" | "catppuccin-mocha" => Some(Self::CatppuccinMocha),
-            "tokyo-night" | "tokyonight" => Some(Self::TokyoNight),
+            "cyberpunk" | "neon" => Some(Self::Cyberpunk),
+            "tokyo-night" | "tokyonight" => Some(Self::CatppuccinMocha),
             "nord" => Some(Self::Nord),
             "dracula" => Some(Self::Dracula),
             "gruvbox" | "gruvbox-dark" => Some(Self::Gruvbox),
@@ -134,13 +135,13 @@ impl Theme {
                 warn: Rgb(0xf9, 0xe2, 0xaf),
                 muted: Rgb(0x6c, 0x70, 0x86),
             },
-            ThemePreset::TokyoNight => Self {
-                text: Rgb(192, 202, 245),
-                correct: Rgb(158, 206, 106),
-                wrong: Rgb(247, 118, 142),
-                accent: Rgb(122, 162, 247),
-                warn: Rgb(224, 175, 104),
-                muted: Rgb(86, 95, 137),
+            ThemePreset::Cyberpunk => Self {
+                text: Rgb(240, 240, 240),
+                correct: Rgb(0, 255, 100),
+                wrong: Rgb(255, 0, 60),
+                accent: Rgb(0, 255, 255),
+                warn: Rgb(255, 230, 0),
+                muted: Rgb(100, 100, 140),
             },
             ThemePreset::Nord => Self {
                 text: Rgb(236, 239, 244),
@@ -264,6 +265,57 @@ impl KeyboardMode {
     }
 }
 
+/// 键位热力图布局模式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HeatmapLayout {
+    /// 标准斜列 (ANSI 60%)。
+    #[default]
+    Staggered,
+    /// 直列矩阵 (Planck 4x12)。
+    Ortholinear,
+}
+
+impl HeatmapLayout {
+    /// 全部模式。
+    pub const ALL: [HeatmapLayout; 2] = [
+        HeatmapLayout::Staggered,
+        HeatmapLayout::Ortholinear,
+    ];
+
+    /// 布局显示名。
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Staggered => "标准斜列 (ANSI 60%)",
+            Self::Ortholinear => "直列矩阵 (4x12)",
+        }
+    }
+
+    /// 序列化标识（用于 settings 文件）。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Staggered => "staggered",
+            Self::Ortholinear => "ortholinear",
+        }
+    }
+
+    /// 从字符串解析（忽略大小写与首尾空白）；未知值返回 `None`。
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "staggered" | "standard" | "ansi" => Some(Self::Staggered),
+            "ortholinear" | "ortho" | "matrix" | "planck" => Some(Self::Ortholinear),
+            _ => None,
+        }
+    }
+
+    /// 下一个模式（循环）。
+    pub fn next(self) -> Self {
+        match self {
+            Self::Staggered => Self::Ortholinear,
+            Self::Ortholinear => Self::Staggered,
+        }
+    }
+}
+
 /// 应用外观设置。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
@@ -282,6 +334,8 @@ pub struct Settings {
     pub input_method: String,
     /// 自定义方案码表映射：输入法方案名 -> 码表文件绝对/相对路径。
     pub scheme_dict_paths: HashMap<String, String>,
+    /// 键位热力图布局模式。
+    pub heatmap_layout: HeatmapLayout,
 }
 
 impl Settings {
@@ -314,6 +368,7 @@ impl Default for Settings {
             scheme: String::new(),
             input_method: String::new(),
             scheme_dict_paths: HashMap::new(),
+            heatmap_layout: HeatmapLayout::Staggered,
         }
     }
 }
@@ -361,13 +416,14 @@ impl SettingsStore {
             std::fs::create_dir_all(parent)?;
         }
         let mut content = format!(
-            "theme={}\nreference_ratio={}\nbold={}\nkeyboard_mode={}\nscheme={}\ninput_method={}\n",
+            "theme={}\nreference_ratio={}\nbold={}\nkeyboard_mode={}\nscheme={}\ninput_method={}\nheatmap_layout={}\n",
             settings.theme.as_str(),
             settings.reference_ratio,
             settings.bold,
             settings.keyboard_mode.as_str(),
             settings.scheme,
             settings.input_method,
+            settings.heatmap_layout.as_str(),
         );
         for (scheme, path) in &settings.scheme_dict_paths {
             content.push_str(&format!("scheme_dict.{}={}\n", scheme, path));
@@ -415,6 +471,11 @@ impl SettingsStore {
                 }
                 "input_method" => {
                     settings.input_method = Settings::clamp_input_method(value);
+                }
+                "heatmap_layout" => {
+                    if let Some(layout) = HeatmapLayout::parse(value) {
+                        settings.heatmap_layout = layout;
+                    }
                 }
                 _ => {
                     if let Some(scheme) = key
@@ -483,14 +544,14 @@ mod tests {
     }
 
     #[test]
-    fn preset_tokyo_night_rgb_exact() {
-        let t = Theme::preset(ThemePreset::TokyoNight);
-        assert_eq!(t.text, Rgb(192, 202, 245));
-        assert_eq!(t.correct, Rgb(158, 206, 106));
-        assert_eq!(t.wrong, Rgb(247, 118, 142));
-        assert_eq!(t.accent, Rgb(122, 162, 247));
-        assert_eq!(t.warn, Rgb(224, 175, 104));
-        assert_eq!(t.muted, Rgb(86, 95, 137));
+    fn preset_cyberpunk_rgb_exact() {
+        let t = Theme::preset(ThemePreset::Cyberpunk);
+        assert_eq!(t.text, Rgb(240, 240, 240));
+        assert_eq!(t.correct, Rgb(0, 255, 100));
+        assert_eq!(t.wrong, Rgb(255, 0, 60));
+        assert_eq!(t.accent, Rgb(0, 255, 255));
+        assert_eq!(t.warn, Rgb(255, 230, 0));
+        assert_eq!(t.muted, Rgb(100, 100, 140));
     }
 
     #[test]
@@ -518,8 +579,16 @@ mod tests {
             Some(ThemePreset::CatppuccinMocha)
         );
         assert_eq!(
+            ThemePreset::parse("CYBERPUNK"),
+            Some(ThemePreset::Cyberpunk)
+        );
+        assert_eq!(
+            ThemePreset::parse("neon"),
+            Some(ThemePreset::Cyberpunk)
+        );
+        assert_eq!(
             ThemePreset::parse("TOKYO_NIGHT"),
-            Some(ThemePreset::TokyoNight)
+            Some(ThemePreset::CatppuccinMocha)
         );
         assert_eq!(ThemePreset::parse("solarized"), None);
         assert_eq!(ThemePreset::parse(""), None);
@@ -527,10 +596,10 @@ mod tests {
 
     #[test]
     fn preset_next_and_prev_wrap_around() {
-        assert_eq!(ThemePreset::CatppuccinMocha.next(), ThemePreset::TokyoNight);
+        assert_eq!(ThemePreset::CatppuccinMocha.next(), ThemePreset::Cyberpunk);
         assert_eq!(ThemePreset::OneDark.next(), ThemePreset::CatppuccinMocha);
         assert_eq!(ThemePreset::CatppuccinMocha.prev(), ThemePreset::OneDark);
-        assert_eq!(ThemePreset::TokyoNight.prev(), ThemePreset::CatppuccinMocha);
+        assert_eq!(ThemePreset::Cyberpunk.prev(), ThemePreset::CatppuccinMocha);
     }
 
     #[test]
@@ -581,6 +650,7 @@ mod tests {
             scheme: "yoyo-pure".to_string(),
             input_method: "虎码".to_string(),
             scheme_dict_paths,
+            heatmap_layout: HeatmapLayout::Ortholinear,
         };
         store.save(&s).unwrap();
         assert_eq!(store.load(), s);
@@ -761,5 +831,39 @@ mod tests {
         assert_eq!(osc_font_size_sequence(16), "\x1b]50;font_size=16\x07");
         assert_eq!(osc_font_size_sequence(20), "\x1b]50;font_size=20\x07");
         assert_eq!(FONT_SIZE_PT, 16);
+    }
+
+    #[test]
+    fn heatmap_layout_parse_and_roundtrip() {
+        for layout in HeatmapLayout::ALL {
+            assert_eq!(HeatmapLayout::parse(layout.as_str()), Some(layout));
+        }
+        assert_eq!(HeatmapLayout::parse("standard"), Some(HeatmapLayout::Staggered));
+        assert_eq!(HeatmapLayout::parse("ansi"), Some(HeatmapLayout::Staggered));
+        assert_eq!(HeatmapLayout::parse("ortho"), Some(HeatmapLayout::Ortholinear));
+        assert_eq!(HeatmapLayout::parse("matrix"), Some(HeatmapLayout::Ortholinear));
+        assert_eq!(HeatmapLayout::parse("planck"), Some(HeatmapLayout::Ortholinear));
+        assert_eq!(HeatmapLayout::parse("invalid"), None);
+    }
+
+    #[test]
+    fn store_heatmap_layout_roundtrip() {
+        let store = SettingsStore::new(temp_path("heatmap_layout_roundtrip"));
+        let s = Settings {
+            heatmap_layout: HeatmapLayout::Ortholinear,
+            ..Default::default()
+        };
+        store.save(&s).unwrap();
+        let loaded = store.load();
+        assert_eq!(loaded.heatmap_layout, HeatmapLayout::Ortholinear);
+
+        let s2 = Settings {
+            heatmap_layout: HeatmapLayout::Staggered,
+            ..Default::default()
+        };
+        store.save(&s2).unwrap();
+        let loaded2 = store.load();
+        assert_eq!(loaded2.heatmap_layout, HeatmapLayout::Staggered);
+        let _ = std::fs::remove_file(store.path());
     }
 }
