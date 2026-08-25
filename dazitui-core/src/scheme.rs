@@ -306,6 +306,45 @@ impl SchemeDict {
         self.word_to_codes.get(word).and_then(|c| c.first()).map(|s| s.as_str())
     }
 
+    /// 计算指定编码的实际物理击数（Stroke Count）。
+    ///
+    /// 核心规则（并击算一击）：
+    /// - 过滤手区修饰符（'_', '+', '-', '\'', '/'）与空白符；
+    /// - 每个独立逻辑码元（无论单键还是并击码元，如 '.' 对应 xv，'W' 对应 vw，'Q' 对应 esf）严格计为 1 击。
+    pub fn calculate_code_strokes(code: &str) -> u32 {
+        let count = code
+            .chars()
+            .filter(|&c| c != '_' && c != '+' && c != '-' && c != '\'' && c != '/' && !c.is_whitespace())
+            .count() as u32;
+        count.max(1)
+    }
+
+    /// 解析指定文本对应的物理击数与展开的按键列表。
+    ///
+    /// - 若在方案码表中命中词条：通过编码码元计算真实击数（并击算 1 击），并展开物理按键；
+    /// - 若未命中（ASCII、标点或无方案）：按字符数计算击数（每个字符 1 击）。
+    pub fn resolve_strokes_and_keys(&self, text: &str) -> (u32, Vec<String>) {
+        if let Some(code) = self.get_primary_code(text) {
+            let strokes = Self::calculate_code_strokes(code);
+            let keys = self.decompose_code(code);
+            (strokes, keys)
+        } else {
+            let count = text.chars().count() as u32;
+            let strokes = count.max(1);
+            let keys = text
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_graphic() {
+                        c.to_ascii_lowercase().to_string()
+                    } else {
+                        c.to_string()
+                    }
+                })
+                .collect();
+            (strokes, keys)
+        }
+    }
+
     /// 分解编码为物理按键序列。
     /// 若方案附带 `chord_composer.algebra` 指法规则，则由指法代数引擎完成逆向映射；
     /// 否则按单字符过滤展开。
@@ -803,12 +842,8 @@ impl RimeSchemaResolver {
         // 查找 chord_composer/algebra 或 __patch 下的 chord_composer/algebra
         if let Some(algebra_node) = doc.get("chord_composer/algebra").or_else(|| doc.get("__patch/chord_composer/algebra")) {
             self.resolve_node_rules(&doc, algebra_node, &base_dir, &mut rules, &mut visited);
-        } else if let Some(patch_node) = doc.get("__patch") {
-            if let Some(cc) = patch_node.get("chord_composer") {
-                if let Some(alg) = cc.get("algebra") {
-                    self.resolve_node_rules(&doc, alg, &base_dir, &mut rules, &mut visited);
-                }
-            }
+        } else if let Some(alg) = doc.get("__patch").and_then(|p| p.get("chord_composer")).and_then(|cc| cc.get("algebra")) {
+            self.resolve_node_rules(&doc, alg, &base_dir, &mut rules, &mut visited);
         }
 
         rules
@@ -878,15 +913,15 @@ impl RimeSchemaResolver {
                 base_dir.join(format!("{file_prefix}.yaml")),
                 base_dir.join(format!("{file_prefix}.schema.yaml")),
             ];
-            if let Some(target_file) = candidate_files.into_iter().find(|p| p.exists()) {
-                if self.load_doc(&target_file).is_ok() {
-                    let canonical = target_file.canonicalize().unwrap_or(target_file);
-                    if let Some(ext_doc) = self.docs.get(&canonical).cloned() {
-                        if section_path.is_empty() {
-                            self.resolve_node_rules(&ext_doc, &ext_doc, base_dir, rules, visited);
-                        } else if let Some(sec_node) = ext_doc.get(section_path) {
-                            self.resolve_node_rules(&ext_doc, sec_node, base_dir, rules, visited);
-                        }
+            if let Some(target_file) = candidate_files.into_iter().find(|p| p.exists())
+                && self.load_doc(&target_file).is_ok()
+            {
+                let canonical = target_file.canonicalize().unwrap_or(target_file);
+                if let Some(ext_doc) = self.docs.get(&canonical).cloned() {
+                    if section_path.is_empty() {
+                        self.resolve_node_rules(&ext_doc, &ext_doc, base_dir, rules, visited);
+                    } else if let Some(sec_node) = ext_doc.get(section_path) {
+                        self.resolve_node_rules(&ext_doc, sec_node, base_dir, rules, visited);
                     }
                 }
             }
@@ -1088,15 +1123,29 @@ algebra:
     }
 
     #[test]
-    fn test_user_config_dir_live_diagnostic() {
-        let custom = HashMap::new();
-        if let Some(path) = SchemeDict::resolve_scheme_path("yoyo-pure-km", &custom) {
-            let dict = SchemeDict::load_from_file(&path).unwrap();
-            assert_eq!(dict.name(), Some("麓鸣·纯形·空明"));
-            assert!(dict.entry_count() > 1000);
-            assert!(dict.chord_algebra().is_some());
-            assert_eq!(dict.get_primary_code("到"), Some("_."));
-            assert_eq!(dict.decompose_code("_."), vec!["v", "x"]);
-        }
+    fn test_calculate_code_strokes_and_resolve() {
+        assert_eq!(SchemeDict::calculate_code_strokes("_."), 1);
+        assert_eq!(SchemeDict::calculate_code_strokes(".Wd"), 3);
+        assert_eq!(SchemeDict::calculate_code_strokes("wCs"), 3);
+        assert_eq!(SchemeDict::calculate_code_strokes("ggll"), 4);
+        assert_eq!(SchemeDict::calculate_code_strokes("+e"), 1);
+        assert_eq!(SchemeDict::calculate_code_strokes(""), 1);
+
+        let mut dict = SchemeDict::default();
+        dict.add_entry("到", "_.");
+        dict.add_entry("是", "wCs");
+
+        let (strokes_dao, keys_dao) = dict.resolve_strokes_and_keys("到");
+        assert_eq!(strokes_dao, 1);
+        assert_eq!(keys_dao, vec!["."]); // 未挂载代数引擎时的单键过滤
+
+        let (strokes_shi, keys_shi) = dict.resolve_strokes_and_keys("是");
+        assert_eq!(strokes_shi, 3);
+        assert_eq!(keys_shi, vec!["w", "c", "s"]);
+
+        let (strokes_en, keys_en) = dict.resolve_strokes_and_keys("hello");
+        assert_eq!(strokes_en, 5);
+        assert_eq!(keys_en, vec!["h", "e", "l", "l", "o"]);
     }
 }
+

@@ -69,6 +69,9 @@ pub struct SessionRecord {
     pub typed_chars: u32,
     pub text_title: String,
     pub input_scheme: String,
+    pub kps: f64,
+    pub key_length: f64,
+    pub total_strokes: u32,
 }
 
 impl SessionRecord {
@@ -85,6 +88,12 @@ impl SessionRecord {
         text_title: impl Into<String>,
         input_scheme: impl Into<String>,
     ) -> Self {
+        let kps = if duration_secs > 0.0 {
+            typed_chars as f64 / duration_secs
+        } else {
+            0.0
+        };
+        let key_length = if typed_chars > 0 { 1.0 } else { 0.0 };
         Self {
             id: generate_unique_id(),
             created_at: current_iso_timestamp(),
@@ -97,6 +106,43 @@ impl SessionRecord {
             typed_chars,
             text_title: text_title.into(),
             input_scheme: input_scheme.into(),
+            kps,
+            key_length,
+            total_strokes: typed_chars,
+        }
+    }
+
+    /// 创建一个指定击数与击速的练习记录。
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_strokes(
+        duration_secs: f64,
+        wpm: f64,
+        accuracy: f64,
+        correct_chars: u32,
+        wrong_chars: u32,
+        edits: u32,
+        typed_chars: u32,
+        text_title: impl Into<String>,
+        input_scheme: impl Into<String>,
+        kps: f64,
+        key_length: f64,
+        total_strokes: u32,
+    ) -> Self {
+        Self {
+            id: generate_unique_id(),
+            created_at: current_iso_timestamp(),
+            duration_secs,
+            wpm,
+            accuracy,
+            correct_chars,
+            wrong_chars,
+            edits,
+            typed_chars,
+            text_title: text_title.into(),
+            input_scheme: input_scheme.into(),
+            kps,
+            key_length,
+            total_strokes,
         }
     }
 }
@@ -161,6 +207,9 @@ pub struct GlobalStatsSummary {
     pub avg_wpm: f64,
     pub recent_10_avg_wpm: f64,
     pub avg_accuracy: f64,
+    pub avg_kps: f64,
+    pub avg_key_length: f64,
+    pub total_strokes: u64,
 }
 
 /// 高频错字统计。
@@ -250,7 +299,10 @@ impl StatsDb {
                  edits INTEGER NOT NULL,
                  typed_chars INTEGER NOT NULL,
                  text_title TEXT NOT NULL,
-                 input_scheme TEXT NOT NULL
+                 input_scheme TEXT NOT NULL,
+                 kps REAL NOT NULL DEFAULT 0.0,
+                 key_length REAL NOT NULL DEFAULT 0.0,
+                 total_strokes INTEGER NOT NULL DEFAULT 0
              );
 
              CREATE TABLE IF NOT EXISTS error_records (
@@ -279,6 +331,18 @@ impl StatsDb {
              CREATE INDEX IF NOT EXISTS idx_error_records_target_word ON error_records(target_word);
              CREATE INDEX IF NOT EXISTS idx_keypress_stats_key_code ON keypress_stats(key_code);",
         )?;
+
+        // 向前兼容现有数据库迁移
+        let _ = self
+            .conn
+            .execute("ALTER TABLE sessions ADD COLUMN kps REAL NOT NULL DEFAULT 0.0", []);
+        let _ = self
+            .conn
+            .execute("ALTER TABLE sessions ADD COLUMN key_length REAL NOT NULL DEFAULT 0.0", []);
+        let _ = self
+            .conn
+            .execute("ALTER TABLE sessions ADD COLUMN total_strokes INTEGER NOT NULL DEFAULT 0", []);
+
         Ok(())
     }
 
@@ -295,8 +359,9 @@ impl StatsDb {
         tx.execute(
             "INSERT INTO sessions (
                 id, created_at, duration_secs, wpm, accuracy,
-                correct_chars, wrong_chars, edits, typed_chars, text_title, input_scheme
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                correct_chars, wrong_chars, edits, typed_chars, text_title, input_scheme,
+                kps, key_length, total_strokes
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 session.id,
                 session.created_at,
@@ -309,6 +374,9 @@ impl StatsDb {
                 session.typed_chars,
                 session.text_title,
                 session.input_scheme,
+                session.kps,
+                session.key_length,
+                session.total_strokes,
             ],
         )?;
 
@@ -370,7 +438,8 @@ impl StatsDb {
     pub fn get_all_sessions(&self) -> Result<Vec<SessionRecord>, DbError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, created_at, duration_secs, wpm, accuracy,
-                    correct_chars, wrong_chars, edits, typed_chars, text_title, input_scheme
+                    correct_chars, wrong_chars, edits, typed_chars, text_title, input_scheme,
+                    kps, key_length, total_strokes
              FROM sessions
              ORDER BY created_at ASC",
         )?;
@@ -388,6 +457,9 @@ impl StatsDb {
                 typed_chars: row.get(8)?,
                 text_title: row.get(9)?,
                 input_scheme: row.get(10)?,
+                kps: row.get(11)?,
+                key_length: row.get(12)?,
+                total_strokes: row.get(13)?,
             })
         })?;
 
@@ -402,7 +474,8 @@ impl StatsDb {
     pub fn get_recent_sessions(&self, limit: usize) -> Result<Vec<SessionRecord>, DbError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, created_at, duration_secs, wpm, accuracy,
-                    correct_chars, wrong_chars, edits, typed_chars, text_title, input_scheme
+                    correct_chars, wrong_chars, edits, typed_chars, text_title, input_scheme,
+                    kps, key_length, total_strokes
              FROM sessions
              ORDER BY created_at DESC
              LIMIT ?1",
@@ -421,6 +494,9 @@ impl StatsDb {
                 typed_chars: row.get(8)?,
                 text_title: row.get(9)?,
                 input_scheme: row.get(10)?,
+                kps: row.get(11)?,
+                key_length: row.get(12)?,
+                total_strokes: row.get(13)?,
             })
         })?;
 
@@ -497,7 +573,10 @@ impl StatsDb {
                 COALESCE(SUM(edits), 0),
                 COALESCE(MAX(wpm), 0.0),
                 COALESCE(AVG(wpm), 0.0),
-                COALESCE(AVG(accuracy), 0.0)
+                COALESCE(AVG(accuracy), 0.0),
+                COALESCE(AVG(kps), 0.0),
+                COALESCE(AVG(key_length), 0.0),
+                COALESCE(SUM(total_strokes), 0)
              FROM sessions",
             [],
             |row| {
@@ -509,6 +588,9 @@ impl StatsDb {
                 summary.best_wpm = row.get(5)?;
                 summary.avg_wpm = row.get(6)?;
                 summary.avg_accuracy = row.get(7)?;
+                summary.avg_kps = row.get(8)?;
+                summary.avg_key_length = row.get(9)?;
+                summary.total_strokes = row.get::<_, i64>(10)? as u64;
                 Ok(())
             },
         )?;

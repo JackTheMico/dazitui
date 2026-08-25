@@ -45,8 +45,26 @@ pub struct ErrorPoint {
 #[derive(Debug, Clone, PartialEq)]
 struct TypingEvent {
     elapsed: Duration,
+    strokes: u32,
     is_correct: bool,
     error: Option<ErrorType>,
+}
+
+/// 跟打进行中的实时指标读数（用于 TUI 对照区右下角实时渲染）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct RealtimeMetrics {
+    /// 累计平均 WPM（正确字数 / 已用时分钟）。
+    pub cumulative_wpm: f64,
+    /// 即时平滑 WPM（近 2.0 秒滑动窗口）。
+    pub rolling_wpm: f64,
+    /// 累计平均击速 KPS（总击数 / 已用时秒）。
+    pub cumulative_kps: f64,
+    /// 即时平滑击速 KPS（近 2.0 秒滑动窗口）。
+    pub rolling_kps: f64,
+    /// 平均码长（总击数 / 已上屏字数）。
+    pub key_length: f64,
+    /// 累计总击数（并击算 1 击，含回改）。
+    pub total_strokes: u32,
 }
 
 /// 跟打统计结果（完成或提前结束时计算）。
@@ -54,6 +72,12 @@ struct TypingEvent {
 pub struct Stats {
     /// WPM：每分钟正确字数（正确字数 / 用时分钟）。
     pub wpm: f64,
+    /// KPS：每秒击键数（总击数 / 用时秒）。
+    pub kps: f64,
+    /// 码长：总击数 / 已上屏字数。
+    pub key_length: f64,
+    /// 总击数（含回改，并击算一击）。
+    pub total_strokes: u32,
     /// 最终比对一致的字符数（正确字数）。
     pub correct_chars: usize,
     /// 最终比对不一致的字符数（不含回改）。
@@ -70,6 +94,8 @@ pub struct Stats {
     pub edit_details: Vec<char>,
     /// 速度折线采样点：[(时间秒, 即时/平滑WPM)]。
     pub speed_samples: Vec<(f64, f64)>,
+    /// 击速折线采样点：[(时间秒, 即时/平滑KPS)]。
+    pub kps_samples: Vec<(f64, f64)>,
     /// 打错点集合（按时间排序）。
     pub error_points: Vec<ErrorPoint>,
 }
@@ -92,6 +118,7 @@ pub struct Session {
     original: Vec<char>,
     input: Vec<char>,
     edits: u32,
+    total_strokes: u32,
     key_counts: HashMap<String, u32>,
     edit_details: Vec<char>,
     completed_groups: usize,
@@ -137,6 +164,7 @@ impl Session {
             original: original.chars().collect(),
             input: Vec::new(),
             edits: 0,
+            total_strokes: 0,
             key_counts: HashMap::new(),
             edit_details: Vec::new(),
             completed_groups: 0,
@@ -146,9 +174,14 @@ impl Session {
         }
     }
 
+    /// 获取当前总击数（并击算一击，含回改）。
+    pub fn total_strokes(&self) -> u32 {
+        self.total_strokes
+    }
+
     /// 上屏一段文本：追加到输入末尾，重新与原文比对，返回本次字符的对/错。
     pub fn type_text(&mut self, committed: &str) -> TypeResult {
-        self.type_text_at(committed, Duration::ZERO)
+        self.type_text_with_strokes_at(committed, committed.chars().count() as u32, Duration::ZERO)
     }
 
     /// 上屏一段文本并携带相对时间戳。
@@ -156,6 +189,16 @@ impl Session {
     /// 组边界门槛（内置赛文）：当前组（`GROUP_SIZE` 字）全对才放行。
     /// 多字符输入跨组边界时只接受到当前组末尾，超出部分丢弃。
     pub fn type_text_at(&mut self, committed: &str, elapsed: Duration) -> TypeResult {
+        self.type_text_with_strokes_at(committed, committed.chars().count() as u32, elapsed)
+    }
+
+    /// 上屏一段文本，指定本次物理击数（支持并击算一击）并携带相对时间戳。
+    pub fn type_text_with_strokes_at(
+        &mut self,
+        committed: &str,
+        strokes: u32,
+        elapsed: Duration,
+    ) -> TypeResult {
         let chars: Vec<char> = committed.chars().collect();
         let start = self.input.len();
         let accept_len = if self.group_gated {
@@ -170,6 +213,9 @@ impl Session {
         let all_statuses = self.align();
         let statuses = all_statuses[start..].to_vec();
 
+        let effective_strokes = if accept_len == 0 { 0 } else { strokes.max(1) };
+        self.total_strokes += effective_strokes;
+
         for (offset, &c) in chars[..accept_len].iter().enumerate() {
             let pos = start + offset;
             let is_correct = statuses.get(offset) == Some(&CharStatus::Correct);
@@ -179,8 +225,10 @@ impl Session {
             } else {
                 Some(ErrorType::Mismatch { typed: c, expected })
             };
+            let ev_strokes = if offset == 0 { effective_strokes } else { 0 };
             self.events.push(TypingEvent {
                 elapsed,
+                strokes: ev_strokes,
                 is_correct,
                 error,
             });
@@ -220,9 +268,11 @@ impl Session {
         }
         if let Some(c) = self.input.pop() {
             self.edits += 1;
+            self.total_strokes += 1;
             self.edit_details.push(c);
             self.events.push(TypingEvent {
                 elapsed,
+                strokes: 1,
                 is_correct: false,
                 error: Some(ErrorType::Backspace { deleted: c }),
             });
@@ -266,6 +316,33 @@ impl Session {
         (correct_count as f64 / dt) * 60.0
     }
 
+    /// 计算给定时间点 `t` 处的即时/平滑 KPS（基于 2 秒滑动窗口）。
+    fn calc_rolling_kps(&self, t: f64) -> f64 {
+        if t <= 0.0 {
+            return 0.0;
+        }
+        let window = 2.0;
+        let t_start = (t - window).max(0.0);
+        let dt = t - t_start;
+        if dt <= 0.0 {
+            return 0.0;
+        }
+        let stroke_count: u32 = self
+            .events
+            .iter()
+            .filter(|e| {
+                let s = e.elapsed.as_secs_f64();
+                if t_start == 0.0 {
+                    s >= 0.0 && s <= t
+                } else {
+                    s > t_start && s <= t
+                }
+            })
+            .map(|e| e.strokes)
+            .sum();
+        stroke_count as f64 / dt
+    }
+
     /// 计算时间序列速度采样点。
     fn compute_speed_samples(&self, total_secs: f64) -> Vec<(f64, f64)> {
         if total_secs <= 0.0 {
@@ -290,6 +367,30 @@ impl Session {
         samples
     }
 
+    /// 计算时间序列击速采样点。
+    fn compute_kps_samples(&self, total_secs: f64) -> Vec<(f64, f64)> {
+        if total_secs <= 0.0 {
+            return vec![(0.0, 0.0)];
+        }
+        let mut samples = Vec::new();
+        samples.push((0.0, 0.0));
+
+        let mut t = 1.0;
+        while t < total_secs {
+            let kps = self.calc_rolling_kps(t);
+            samples.push((t, kps));
+            t += 1.0;
+        }
+        if total_secs > 0.0 {
+            let last_t = samples.last().map(|s| s.0).unwrap_or(0.0);
+            if (total_secs - last_t).abs() > 0.01 {
+                let kps = self.calc_rolling_kps(total_secs);
+                samples.push((total_secs, kps));
+            }
+        }
+        samples
+    }
+
     /// 计算打错点信息列表。
     fn compute_error_points(&self) -> Vec<ErrorPoint> {
         self.events
@@ -308,6 +409,42 @@ impl Session {
             .collect()
     }
 
+    /// 获取当前时刻的实时复合指标（用于 TUI 对照区右下角实时渲染）。
+    pub fn realtime_metrics(&self, elapsed: Duration) -> RealtimeMetrics {
+        let secs = elapsed.as_secs_f64();
+        let statuses = self.align();
+        let correct = statuses
+            .iter()
+            .filter(|s| **s == CharStatus::Correct)
+            .count();
+        let effective_secs = secs.max(0.5);
+        let cumulative_wpm = if secs <= 0.0 {
+            0.0
+        } else {
+            (correct as f64 / effective_secs) * 60.0
+        };
+        let cumulative_kps = if secs <= 0.0 {
+            0.0
+        } else {
+            self.total_strokes as f64 / effective_secs
+        };
+        let rolling_wpm = self.calc_rolling_wpm(secs);
+        let rolling_kps = self.calc_rolling_kps(secs);
+        let key_length = if self.input.is_empty() {
+            0.0
+        } else {
+            self.total_strokes as f64 / self.input.len() as f64
+        };
+        RealtimeMetrics {
+            cumulative_wpm,
+            rolling_wpm,
+            cumulative_kps,
+            rolling_kps,
+            key_length,
+            total_strokes: self.total_strokes,
+        }
+    }
+
     /// 计算跟打统计（完成或提前结束时调用，不消耗会话）。
     pub fn finish(&self, elapsed: Duration) -> Stats {
         let statuses = self.align();
@@ -316,10 +453,21 @@ impl Session {
             .filter(|s| **s == CharStatus::Correct)
             .count();
         let wrong = statuses.len() - correct;
-        let wpm = if elapsed.is_zero() {
+        let total_secs = elapsed.as_secs_f64();
+        let wpm = if total_secs <= 0.0 {
             0.0
         } else {
-            correct as f64 / elapsed.as_secs_f64() * 60.0
+            correct as f64 / total_secs * 60.0
+        };
+        let kps = if total_secs <= 0.0 {
+            0.0
+        } else {
+            self.total_strokes as f64 / total_secs
+        };
+        let key_length = if self.input.is_empty() {
+            0.0
+        } else {
+            self.total_strokes as f64 / self.input.len() as f64
         };
         let mut key_frequency: Vec<(String, u32)> = self
             .key_counts
@@ -327,11 +475,14 @@ impl Session {
             .map(|(k, v)| (k.clone(), *v))
             .collect();
         key_frequency.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-        let total_secs = elapsed.as_secs_f64();
         let speed_samples = self.compute_speed_samples(total_secs);
+        let kps_samples = self.compute_kps_samples(total_secs);
         let error_points = self.compute_error_points();
         Stats {
             wpm,
+            kps,
+            key_length,
+            total_strokes: self.total_strokes,
             correct_chars: correct,
             wrong_chars: wrong,
             edits: self.edits,
@@ -340,6 +491,7 @@ impl Session {
             key_frequency,
             edit_details: self.edit_details.clone(),
             speed_samples,
+            kps_samples,
             error_points,
         }
     }
@@ -820,6 +972,69 @@ mod tests {
         let session = Session::new("你好");
         let stats = session.finish(Duration::ZERO);
         assert_eq!(stats.speed_samples, vec![(0.0, 0.0)]);
+        assert_eq!(stats.kps_samples, vec![(0.0, 0.0)]);
+        assert_eq!(stats.kps, 0.0);
+        assert_eq!(stats.key_length, 0.0);
+        assert_eq!(stats.total_strokes, 0);
         assert!(stats.error_points.is_empty());
     }
+
+    #[test]
+    fn strokes_and_chording_kps_calculation() {
+        let mut session = Session::new("到是王");
+        // 「到」：并击 1 击，用时 1.0s
+        session.type_text_with_strokes_at("到", 1, Duration::from_secs_f64(1.0));
+        assert_eq!(session.total_strokes(), 1);
+
+        // 「是」：三码 3 击，用时 2.0s
+        session.type_text_with_strokes_at("是", 3, Duration::from_secs_f64(2.0));
+        assert_eq!(session.total_strokes(), 4);
+
+        // 回改 1 击（删「是」），用时 2.5s
+        session.backspace_at(Duration::from_secs_f64(2.5));
+        assert_eq!(session.total_strokes(), 5);
+
+        // 重新打「是」3 击，用时 3.0s
+        session.type_text_with_strokes_at("是", 3, Duration::from_secs_f64(3.0));
+        assert_eq!(session.total_strokes(), 8);
+
+        // 打「王」4 击，用时 4.0s
+        session.type_text_with_strokes_at("王", 4, Duration::from_secs_f64(4.0));
+        assert_eq!(session.total_strokes(), 12);
+
+        let stats = session.finish(Duration::from_secs_f64(4.0));
+        assert_eq!(stats.total_strokes, 12);
+        // KPS = 12 击 / 4s = 3.0
+        assert_eq!(stats.kps, 3.0);
+        // 码长 = 12 击 / 3 字 = 4.0
+        assert_eq!(stats.key_length, 4.0);
+        assert_eq!(stats.correct_chars, 3);
+        assert_eq!(stats.edits, 1);
+        assert!(!stats.kps_samples.is_empty());
+    }
+
+    #[test]
+    fn realtime_metrics_cumulative_and_rolling() {
+        let mut session = Session::new("一二三四五六");
+        // 0.0s 初始状态
+        let m0 = session.realtime_metrics(Duration::ZERO);
+        assert_eq!(m0.cumulative_wpm, 0.0);
+        assert_eq!(m0.cumulative_kps, 0.0);
+        assert_eq!(m0.rolling_wpm, 0.0);
+        assert_eq!(m0.rolling_kps, 0.0);
+
+        // 1.0s: 打 2 字（2 击）
+        session.type_text_with_strokes_at("一二", 2, Duration::from_secs_f64(1.0));
+        let m1 = session.realtime_metrics(Duration::from_secs_f64(1.0));
+        assert_eq!(m1.cumulative_wpm, 120.0); // 2 字 / 1s * 60 = 120
+        assert_eq!(m1.cumulative_kps, 2.0);   // 2 击 / 1s = 2.0
+        assert_eq!(m1.key_length, 1.0);       // 2 击 / 2 字 = 1.0
+
+        // 2.0s: 打 2 字（2 击）
+        session.type_text_with_strokes_at("三四", 2, Duration::from_secs_f64(2.0));
+        let m2 = session.realtime_metrics(Duration::from_secs_f64(2.0));
+        assert_eq!(m2.cumulative_wpm, 120.0); // 4 字 / 2s * 60 = 120
+        assert_eq!(m2.cumulative_kps, 2.0);   // 4 击 / 2s = 2.0
+    }
 }
+

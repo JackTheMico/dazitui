@@ -1157,6 +1157,9 @@ mod tests {
         };
         let stats = Stats {
             wpm: 92.5,
+            kps: 1.0,
+            key_length: 1.67,
+            total_strokes: 10,
             typed_chars: 6,
             correct_chars: 6,
             wrong_chars: 0,
@@ -1165,6 +1168,7 @@ mod tests {
             key_frequency: vec![("a".into(), 10)],
             edit_details: Vec::new(),
             speed_samples: Vec::new(),
+            kps_samples: Vec::new(),
             error_points: Vec::new(),
         };
 
@@ -1214,6 +1218,9 @@ mod tests {
             .expect("get_content failed");
         let stats = Stats {
             wpm: 60.0,
+            kps: 1.67,
+            key_length: 1.0,
+            total_strokes: 100,
             typed_chars: text.content.chars().count(),
             correct_chars: text.content.chars().count(),
             wrong_chars: 0,
@@ -1222,6 +1229,7 @@ mod tests {
             key_frequency: vec![("a".into(), 100)],
             edit_details: Vec::new(),
             speed_samples: Vec::new(),
+            kps_samples: Vec::new(),
             error_points: Vec::new(),
         };
         let upload_stats = crate::online::share::to_upload_stats(&stats, Duration::from_secs(60));

@@ -20,15 +20,20 @@ pub struct UploadStats {
 
 /// 把本地 `Stats` 映射为 52dazi.cn 上传字段。
 pub fn to_upload_stats(stats: &Stats, elapsed: Duration) -> UploadStats {
-    let total_keys: u32 = stats.key_frequency.iter().map(|(_, n)| n).sum();
     let keystrokes = if elapsed.is_zero() {
         0.0
+    } else if stats.kps > 0.0 {
+        stats.kps
     } else {
+        let total_keys: u32 = stats.key_frequency.iter().map(|(_, n)| n).sum();
         total_keys as f64 / elapsed.as_secs_f64()
     };
     let key_length = if stats.typed_chars == 0 {
         0.0
+    } else if stats.key_length > 0.0 {
+        stats.key_length
     } else {
+        let total_keys: u32 = stats.key_frequency.iter().map(|(_, n)| n).sum();
         total_keys as f64 / stats.typed_chars as f64
     };
     UploadStats {
@@ -78,11 +83,6 @@ pub fn format_time(elapsed: Duration) -> String {
 /// 构造 52dazi.cn 上传请求体（业务字段，公共字段由 `client.upload_result` 自动合并）。
 ///
 /// 字段名与前端 `resultPostData`（app.js 中的 vuex getter）逐项对齐：
-/// dazitui 不采集的字段用与前端一致的兜底值——`repeatNum`/`xuanChong`=0、
-/// `daCi`/`keyMethod`="0%"、`challengeFlag`/`isFirstSubmit`/`isGroupText`
-/// 沿用前端默认 0 / 空串。可采集字段：
-/// - `jianZhun`（击准率）= 正确字数 / 已上屏字数，百分比字符串（与前端 `e.accuracy+"%"` 同构）；
-/// - `wrongNum`/`jianShu`/`backspace`/`huiGai` 仍来自 `Stats`。
 /// - `inputMethod` 来自用户配置的输入法名称。
 ///
 /// 缺字段会让服务端字段对齐校验失败（错误信息可表现为 token/username 解析异常），
@@ -146,6 +146,9 @@ mod tests {
     fn sample_stats() -> Stats {
         Stats {
             wpm: 85.2,
+            kps: 3.5,
+            key_length: 3.5,
+            total_strokes: 140,
             correct_chars: 40,
             wrong_chars: 2,
             edits: 1,
@@ -154,6 +157,7 @@ mod tests {
             key_frequency: vec![("a".to_string(), 100), ("b".to_string(), 40)],
             edit_details: vec![],
             speed_samples: vec![],
+            kps_samples: vec![],
             error_points: vec![],
         }
     }

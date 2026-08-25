@@ -1027,7 +1027,7 @@ impl App {
             } else {
                 stats.correct_chars as f64 / stats.typed_chars as f64
             };
-            let session_record = SessionRecord::new(
+            let session_record = SessionRecord::new_with_strokes(
                 elapsed.as_secs_f64(),
                 stats.wpm,
                 accuracy,
@@ -1037,6 +1037,9 @@ impl App {
                 stats.typed_chars as u32,
                 &self.text.title,
                 &self.settings.input_method,
+                stats.kps,
+                stats.key_length,
+                stats.total_strokes,
             );
             let session_id = session_record.id.clone();
             let word_index = self.text.build_word_index();
@@ -1703,22 +1706,31 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                     app.touch_typing();
                     let elapsed = app.current_elapsed();
                     let now = Instant::now();
+                    let mut total_strokes = 0;
                     for c in committed.chars() {
                         let s = c.to_string();
-                        if c == ' ' {
-                            app.live_keyboard.press_key("Space", now);
-                        } else if c.is_ascii() {
-                            app.live_keyboard.press_char(c, now);
-                        } else if let Some(ref dict) = app.scheme_dict {
-                            if let Some(code) = dict.get_primary_code(&s) {
-                                let keys = dict.decompose_code(code);
+                        if let Some(ref dict) = app.scheme_dict {
+                            let (strokes, keys) = dict.resolve_strokes_and_keys(&s);
+                            total_strokes += strokes;
+                            if c == ' ' {
+                                app.live_keyboard.press_key("Space", now);
+                            } else if c.is_ascii() {
+                                app.live_keyboard.press_char(c, now);
+                            } else {
                                 for k in &keys {
                                     app.live_keyboard.press_key(k, now);
                                 }
                             }
+                        } else {
+                            total_strokes += 1;
+                            if c == ' ' {
+                                app.live_keyboard.press_key("Space", now);
+                            } else if c.is_ascii() {
+                                app.live_keyboard.press_char(c, now);
+                            }
                         }
                     }
-                    app.session.type_text_at(&committed, elapsed);
+                    app.session.type_text_with_strokes_at(&committed, total_strokes, elapsed);
                     if app.session.is_complete() {
                         finish_and_maybe_upload(&mut app, terminal)?;
                     }
@@ -2048,18 +2060,26 @@ fn handle_key(
         }
         KeyCode::Char(c) => {
             let s = c.to_string();
-            session.record_key(&s);
-            session.type_text_at(&s, elapsed);
-            if c == ' ' {
-                live_kb.press_key("Space", now);
-            } else if c.is_ascii() {
-                live_kb.press_char(c, now);
-            } else if let Some(dict) = scheme_dict {
-                if let Some(code) = dict.get_primary_code(&s) {
-                    let keys = dict.decompose_code(code);
+            if let Some(dict) = scheme_dict {
+                let (strokes, keys) = dict.resolve_strokes_and_keys(&s);
+                session.record_key(&s);
+                session.type_text_with_strokes_at(&s, strokes, elapsed);
+                if c == ' ' {
+                    live_kb.press_key("Space", now);
+                } else if c.is_ascii() {
+                    live_kb.press_char(c, now);
+                } else {
                     for k in &keys {
                         live_kb.press_key(k, now);
                     }
+                }
+            } else {
+                session.record_key(&s);
+                session.type_text_with_strokes_at(&s, 1, elapsed);
+                if c == ' ' {
+                    live_kb.press_key("Space", now);
+                } else if c.is_ascii() {
+                    live_kb.press_char(c, now);
                 }
             }
         }
@@ -2357,7 +2377,7 @@ fn ui(frame: &mut Frame, app: &App) {
                 (ref_area, None, type_area)
             };
 
-        // 上：对照原文区（已跟打部分绿/红着色，非活动暗边框，复合双色标题）
+        // 上：对照原文区（已跟打部分绿/红着色，非活动暗边框，复合双色标题，右下角实时复合指标）
         let ref_title = Line::from(vec![
             Span::styled(
                 " 对照区 ",
@@ -2370,6 +2390,36 @@ fn ui(frame: &mut Frame, app: &App) {
                 Style::default().fg(palette.fg),
             ),
         ]);
+        let mut ref_block = themed_block(&palette, false).title(ref_title);
+        if !app.session.is_empty() {
+            let elapsed = app.current_elapsed();
+            let metrics = app.session.realtime_metrics(elapsed);
+            let mut spans = vec![
+                Span::styled(" WPM ", Style::default().fg(palette.muted)),
+                Span::styled(
+                    format!("{:.1}", metrics.cumulative_wpm),
+                    Style::default().fg(palette.accent).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(" ({:.0}) ", metrics.rolling_wpm),
+                    Style::default().fg(palette.fg),
+                ),
+                Span::styled("· ", Style::default().fg(palette.muted)),
+                Span::styled("击键 ", Style::default().fg(palette.muted)),
+                Span::styled(
+                    format!("{:.1}", metrics.cumulative_kps),
+                    Style::default().fg(palette.accent).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(" ({:.1}) ", metrics.rolling_kps),
+                    Style::default().fg(palette.fg),
+                ),
+            ];
+            if app.paused {
+                spans.push(Span::styled("[暂停] ", Style::default().fg(palette.warning)));
+            }
+            ref_block = ref_block.title_bottom(Line::from(spans).right_aligned());
+        }
         frame.render_widget(
             Paragraph::new(original_line(
                 &app.session,
@@ -2377,7 +2427,7 @@ fn ui(frame: &mut Frame, app: &App) {
                 app.theme(),
                 app.settings.bold,
             ))
-            .block(themed_block(&palette, false).title(ref_title))
+            .block(ref_block)
             .wrap(Wrap { trim: false }),
             ref_area,
         );
@@ -4234,6 +4284,16 @@ fn render_result_view(
         Span::styled(
             format!("{:.1}", stats.wpm),
             Style::default().bold().fg(palette.accent),
+        ),
+        Span::raw("   击键: "),
+        Span::styled(
+            format!("{:.2}", stats.kps),
+            Style::default().bold().fg(palette.accent),
+        ),
+        Span::raw("   码长: "),
+        Span::styled(
+            format!("{:.2}", stats.key_length),
+            Style::default().bold().fg(palette.success),
         ),
         Span::raw("   正确字数: "),
         Span::styled(
@@ -8074,5 +8134,59 @@ mod tests {
         assert!(live_kb.active_keys.contains_key("s"));
         assert_eq!(live_kb.active_keys.get("c"), Some(&t2));
         assert_eq!(live_kb.active_keys.get("f"), Some(&t2));
+
+        // 验证 session 的击数：到 (1击) + 是 (3击) = 4击
+        assert_eq!(session.total_strokes(), 4);
+    }
+
+    #[test]
+    fn reference_area_renders_realtime_compound_metrics_on_typing() {
+        let mut app = test_app(file_text("你好世界"));
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+
+        // 1. 就绪态（未开打）：右下角不应包含 WPM/击键 指标
+        terminal.draw(|f| ui(f, &app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let ready_content = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!ready_content.contains("击键"));
+
+        // 2. 开打后（输入字符）：对照区底边框右侧应显示 WPM 和 击键 指标
+        app.touch_typing();
+        handle_key(
+            &mut app.session,
+            &mut app.live_keyboard,
+            app.scheme_dict.as_ref(),
+            KeyEvent::new(KeyCode::Char('你'), KeyModifiers::NONE),
+            Duration::from_secs(1),
+            Instant::now(),
+        );
+
+        terminal.draw(|f| ui(f, &app)).unwrap();
+        let buffer2 = terminal.backend().buffer();
+        let typing_content = (0..buffer2.area.height)
+            .map(|y| {
+                (0..buffer2.area.width)
+                    .map(|x| buffer2[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let clean_typing: String = typing_content
+            .chars()
+            .filter(|c| *c != ' ' && *c != '─')
+            .collect();
+        assert!(clean_typing.contains("WPM"));
+        assert!(clean_typing.contains("击键"));
     }
 }
+
+
+
