@@ -395,6 +395,107 @@ enum FreeInputAction {
     Cancel,
 }
 
+/// 实时虚拟键盘按键状态机。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LiveKeyboard {
+    /// 键名（规范化后的小写字符或特殊键名）-> 最近触发激活的时间戳。
+    pub active_keys: std::collections::HashMap<String, Instant>,
+}
+
+impl LiveKeyboard {
+    /// 创建新实例。
+    pub fn new() -> Self {
+        Self {
+            active_keys: std::collections::HashMap::new(),
+        }
+    }
+
+    /// 重置所有激活按键。
+    pub fn clear(&mut self) {
+        self.active_keys.clear();
+    }
+
+    /// 规范化按键标识。
+    pub fn normalize_key(key: &str) -> String {
+        match key {
+            " " | "Space" | "space" | "Space (空格)" => "Space".to_string(),
+            "Backspace" | "backspace" | "Bksp" | "bksp" => "Backspace".to_string(),
+            "Tab" | "tab" => "Tab".to_string(),
+            "Enter" | "enter" => "Enter".to_string(),
+            "Caps" | "caps" | "CapsLock" => "Caps".to_string(),
+            "Shift" | "shift" => "Shift".to_string(),
+            "Ctrl" | "ctrl" | "Control" => "Ctrl".to_string(),
+            "Alt" | "alt" => "Alt".to_string(),
+            "Esc" | "esc" => "Esc".to_string(),
+            "Lower" | "lower" => "Lower".to_string(),
+            "Raise" | "raise" => "Raise".to_string(),
+            "Left" | "←" => "Left".to_string(),
+            "Down" | "↓" => "Down".to_string(),
+            "Up" | "↑" => "Up".to_string(),
+            "Right" | "→" => "Right".to_string(),
+            other => {
+                if other.chars().count() == 1 {
+                    let c = other.chars().next().unwrap();
+                    c.to_ascii_lowercase().to_string()
+                } else {
+                    other.to_ascii_lowercase()
+                }
+            }
+        }
+    }
+
+    /// 触发单个按键激活。
+    pub fn press_key(&mut self, key: &str, now: Instant) {
+        let norm = Self::normalize_key(key);
+        self.active_keys.insert(norm, now);
+    }
+
+    /// 触发单字符按键激活。
+    pub fn press_char(&mut self, c: char, now: Instant) {
+        if c == ' ' {
+            self.press_key("Space", now);
+        } else if c.is_ascii() {
+            self.press_key(&c.to_string(), now);
+        }
+    }
+
+    /// 批量触发按键激活（用于汉字方案反查）。
+    pub fn press_keys<'a, I>(&mut self, keys: I, now: Instant)
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        for k in keys {
+            self.press_key(k, now);
+        }
+    }
+
+    /// 计算给定键位在时间点 `now` 的样式（高亮/衰减/常态）。
+    pub fn get_key_style(&self, key: &str, palette: &ThemePalette, now: Instant) -> Style {
+        let norm = Self::normalize_key(key);
+        if let Some(&pressed_at) = self.active_keys.get(&norm) {
+            let elapsed_ms = now.saturating_duration_since(pressed_at).as_millis();
+            if elapsed_ms <= 100 {
+                // 强高亮 (0-100ms): 强调色背景反白 + 加粗
+                Style::default()
+                    .fg(palette.bg)
+                    .bg(palette.accent)
+                    .add_modifier(Modifier::BOLD)
+            } else if elapsed_ms <= 250 {
+                // 余温衰减 (100-250ms): 强调色前景色 + 加粗
+                Style::default()
+                    .fg(palette.accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                // 常态
+                Style::default().fg(palette.muted)
+            }
+        } else {
+            // 常态
+            Style::default().fg(palette.muted)
+        }
+    }
+}
+
 /// 应用全部状态（TUI 层）。
 struct App {
     /// 当前赛文（载文后替换）。
@@ -443,7 +544,7 @@ struct App {
     settings: Settings,
     /// 设置持久化存储。
     settings_store: SettingsStore,
-    /// 设置视图当前焦点项（FOCUS_THEME/FOCUS_RATIO/FOCUS_BOLD/FOCUS_FONT/FOCUS_INPUT_METHOD）。
+    /// 设置视图当前焦点项（FOCUS_THEME/FOCUS_RATIO/FOCUS_BOLD/FOCUS_FONT/FOCUS_KEYBOARD/FOCUS_INPUT_METHOD）。
     settings_focus: usize,
     /// 内置赛文浏览中的乱序开关（`true` = 载入时打乱顺序）。
     builtin_shuffle: bool,
@@ -455,6 +556,8 @@ struct App {
     input_method_modal: Option<InputMethodModal>,
     /// 自由发文编辑弹窗（`None` = 未打开）。
     free_input_modal: Option<FreeInputModal>,
+    /// 实时虚拟键盘状态。
+    live_keyboard: LiveKeyboard,
     /// 后台数据库异步写入 Worker。
     db_worker: Option<DbWorker>,
 }
@@ -591,6 +694,7 @@ impl App {
             builtin_preview: None,
             input_method_modal: None,
             free_input_modal: None,
+            live_keyboard: LiveKeyboard::new(),
             db_worker,
         }
     }
@@ -803,6 +907,7 @@ impl App {
         self.accumulated_elapsed = Duration::ZERO;
         self.active_start = None;
         self.paused = false;
+        self.live_keyboard.clear();
         self.state = AppState::Typing;
         self.browse_error = None;
     }
@@ -1275,7 +1380,13 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                         if matches!(key.code, KeyCode::Backspace | KeyCode::Char(_)) {
                             app.touch_typing();
                             let elapsed = app.current_elapsed();
-                            handle_key(&mut app.session, key, elapsed);
+                            handle_key(
+                                &mut app.session,
+                                &mut app.live_keyboard,
+                                key,
+                                elapsed,
+                                Instant::now(),
+                            );
                             if app.session.is_complete() {
                                 finish_and_maybe_upload(&mut app, terminal)?;
                             }
@@ -1795,16 +1906,28 @@ fn is_open_builtin_browser(key: KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('b')
 }
 
-/// 处理跟打键：退格回改，可打印字符上屏；同时记录按键频率与时序事件。
-fn handle_key(session: &mut Session, key: KeyEvent, elapsed: Duration) {
+/// 处理跟打键：退格回改，可打印字符上屏；同时记录按键频率与时序事件，并触发实时虚拟键盘高亮。
+fn handle_key(
+    session: &mut Session,
+    live_kb: &mut LiveKeyboard,
+    key: KeyEvent,
+    elapsed: Duration,
+    now: Instant,
+) {
     match key.code {
         KeyCode::Backspace => {
             session.record_key("Backspace");
             session.backspace_at(elapsed);
+            live_kb.press_key("Backspace", now);
         }
         KeyCode::Char(c) => {
             session.record_key(&c.to_string());
             session.type_text_at(&c.to_string(), elapsed);
+            if c == ' ' {
+                live_kb.press_key("Space", now);
+            } else if c.is_ascii() {
+                live_kb.press_char(c, now);
+            }
         }
         _ => {}
     }
@@ -2081,13 +2204,32 @@ fn ui(frame: &mut Frame, app: &App) {
     } else if browsing_builtin {
         render_builtin_preview(frame, app, content);
     } else {
-        // 内容区：上对照区 + 下跟打区（按设置占比分配）
+        // 内容区：上对照区 + (中实时键盘) + 下跟打区（按设置占比分配）
         let (ref_pct, type_pct) = area_ratios(app.settings.reference_ratio);
-        let [ref_area, type_area] = Layout::vertical([
-            Constraint::Percentage(ref_pct),
-            Constraint::Percentage(type_pct),
-        ])
-        .areas(content);
+        let kb_height = match app.settings.keyboard_mode {
+            KeyboardMode::Staggered => 5,
+            KeyboardMode::Ortholinear => 4,
+            KeyboardMode::Off => 0,
+        };
+
+        let (ref_area, kb_area_opt, type_area) =
+            if kb_height > 0 && content.height >= kb_height + 6 {
+                let [ref_area, kb_area, type_area] = Layout::vertical([
+                    Constraint::Percentage(ref_pct),
+                    Constraint::Length(kb_height),
+                    Constraint::Percentage(type_pct),
+                ])
+                .areas(content);
+                (ref_area, Some(kb_area), type_area)
+            } else {
+                let [ref_area, type_area] = Layout::vertical([
+                    Constraint::Percentage(ref_pct),
+                    Constraint::Percentage(type_pct),
+                ])
+                .areas(content);
+                (ref_area, None, type_area)
+            };
+
         // 上：对照原文区（已跟打部分绿/红着色，非活动暗边框，复合双色标题）
         let ref_title = Line::from(vec![
             Span::styled(
@@ -2112,6 +2254,18 @@ fn ui(frame: &mut Frame, app: &App) {
             .wrap(Wrap { trim: false }),
             ref_area,
         );
+
+        // 中：实时按键虚拟键盘（紧凑无边框）
+        if let Some(kb_area) = kb_area_opt {
+            render_live_keyboard(
+                frame,
+                &app.live_keyboard,
+                app.settings.keyboard_mode,
+                kb_area,
+                &palette,
+                Instant::now(),
+            );
+        }
         // 下：跟打区（实时绿/红渲染，打字活跃时高亮，复合双色标题与状态徽标）
         let typing_active = !app.paused && !app.session.is_empty();
         let mut typing_title_spans = vec![Span::styled(
@@ -3717,6 +3871,204 @@ fn on_off(v: bool) -> &'static str {
     if v { "开" } else { "关" }
 }
 
+/// 生成实时虚拟键盘的渲染行（纯函数，易单测）。
+pub fn generate_live_keyboard_lines(
+    live_kb: &LiveKeyboard,
+    mode: KeyboardMode,
+    palette: &ThemePalette,
+    now: Instant,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    match mode {
+        KeyboardMode::Staggered => {
+            // ANSI 60% 五行斜列紧凑布局
+            let rows: [&[(&str, &str)]; 5] = [
+                &[
+                    ("`", "~ `"),
+                    ("1", "1"),
+                    ("2", "2"),
+                    ("3", "3"),
+                    ("4", "4"),
+                    ("5", "5"),
+                    ("6", "6"),
+                    ("7", "7"),
+                    ("8", "8"),
+                    ("9", "9"),
+                    ("0", "0"),
+                    ("-", "-"),
+                    ("=", "="),
+                    ("Backspace", "Bksp"),
+                ],
+                &[
+                    ("Tab", "Tab"),
+                    ("q", "Q"),
+                    ("w", "W"),
+                    ("e", "E"),
+                    ("r", "R"),
+                    ("t", "T"),
+                    ("y", "Y"),
+                    ("u", "U"),
+                    ("i", "I"),
+                    ("o", "O"),
+                    ("p", "P"),
+                    ("[", "["),
+                    ("]", "]"),
+                    ("\\", "\\"),
+                ],
+                &[
+                    ("Caps", "Caps"),
+                    ("a", "A"),
+                    ("s", "S"),
+                    ("d", "D"),
+                    ("f", "F"),
+                    ("g", "G"),
+                    ("h", "H"),
+                    ("j", "J"),
+                    ("k", "K"),
+                    ("l", "L"),
+                    (";", ";"),
+                    ("'", "'"),
+                    ("Enter", "Enter"),
+                ],
+                &[
+                    ("Shift", "Shift"),
+                    ("z", "Z"),
+                    ("x", "X"),
+                    ("c", "C"),
+                    ("v", "V"),
+                    ("b", "B"),
+                    ("n", "N"),
+                    ("m", "M"),
+                    (",", ","),
+                    (".", "."),
+                    ("/", "/"),
+                    ("Shift", "Shift"),
+                ],
+                &[
+                    ("Ctrl", "Ctrl"),
+                    ("Alt", "Alt"),
+                    ("Space", "Space (空格)"),
+                    ("Alt", "Alt"),
+                    ("Ctrl", "Ctrl"),
+                ],
+            ];
+
+            let row_indents = ["  ", "   ", "    ", "     ", "        "];
+
+            for (r_idx, row) in rows.iter().enumerate() {
+                let mut spans = vec![Span::raw(row_indents[r_idx])];
+                for (k_idx, (k_lookup, k_display)) in row.iter().enumerate() {
+                    let style = live_kb.get_key_style(k_lookup, palette, now);
+                    let badge = if *k_lookup == "Space" {
+                        format!("[ {:^14} ]", k_display)
+                    } else {
+                        format!("[{k_display}]")
+                    };
+                    if k_idx > 0 {
+                        spans.push(Span::raw(" "));
+                    }
+                    spans.push(Span::styled(badge, style));
+                }
+                lines.push(Line::from(spans));
+            }
+        }
+        KeyboardMode::Ortholinear => {
+            // Planck 4x12 直列网格紧凑布局
+            let rows: [&[(&str, &str)]; 4] = [
+                &[
+                    ("Tab", "Tab"),
+                    ("q", "Q"),
+                    ("w", "W"),
+                    ("e", "E"),
+                    ("r", "R"),
+                    ("t", "T"),
+                    ("y", "Y"),
+                    ("u", "U"),
+                    ("i", "I"),
+                    ("o", "O"),
+                    ("p", "P"),
+                    ("Backspace", "Bksp"),
+                ],
+                &[
+                    ("Esc", "Esc"),
+                    ("a", "A"),
+                    ("s", "S"),
+                    ("d", "D"),
+                    ("f", "F"),
+                    ("g", "G"),
+                    ("h", "H"),
+                    ("j", "J"),
+                    ("k", "K"),
+                    ("l", "L"),
+                    (";", ";"),
+                    ("'", "'"),
+                ],
+                &[
+                    ("Shift", "Shift"),
+                    ("z", "Z"),
+                    ("x", "X"),
+                    ("c", "C"),
+                    ("v", "V"),
+                    ("b", "B"),
+                    ("n", "N"),
+                    ("m", "M"),
+                    (",", ","),
+                    (".", "."),
+                    ("/", "/"),
+                    ("Enter", "Enter"),
+                ],
+                &[
+                    ("Ctrl", "Ctrl"),
+                    ("Alt", "Alt"),
+                    ("Lower", "Lower"),
+                    ("Space", "Space (空格)"),
+                    ("Raise", "Raise"),
+                    ("Left", "←"),
+                    ("Down", "↓"),
+                    ("Up", "↑"),
+                    ("Right", "→"),
+                ],
+            ];
+
+            let row_indents = ["    ", "    ", "    ", "    "];
+
+            for (r_idx, row) in rows.iter().enumerate() {
+                let mut spans = vec![Span::raw(row_indents[r_idx])];
+                for (k_idx, (k_lookup, k_display)) in row.iter().enumerate() {
+                    let style = live_kb.get_key_style(k_lookup, palette, now);
+                    let badge = if *k_lookup == "Space" {
+                        format!("[ {:^12} ]", k_display)
+                    } else {
+                        format!("[{k_display}]")
+                    };
+                    if k_idx > 0 {
+                        spans.push(Span::raw(" "));
+                    }
+                    spans.push(Span::styled(badge, style));
+                }
+                lines.push(Line::from(spans));
+            }
+        }
+        KeyboardMode::Off => {}
+    }
+    lines
+}
+
+/// 渲染实时虚拟键盘 Widget。
+fn render_live_keyboard(
+    frame: &mut Frame,
+    live_kb: &LiveKeyboard,
+    mode: KeyboardMode,
+    area: Rect,
+    palette: &ThemePalette,
+    now: Instant,
+) {
+    let lines = generate_live_keyboard_lines(live_kb, mode, palette, now);
+    if !lines.is_empty() {
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+    }
+}
+
 /// 全屏成绩视图：WPM/错字/用时摘要卡片 + WPM 速度折线图与打错标记 + 错字时间线明细 + 导航快捷键。
 fn render_result_view(
     frame: &mut Frame,
@@ -4895,36 +5247,48 @@ mod tests {
     #[test]
     fn handle_key_records_key_frequency() {
         let mut session = Session::new("你好世界");
+        let mut live_kb = LiveKeyboard::new();
+        let now = Instant::now();
         handle_key(
             &mut session,
+            &mut live_kb,
             KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
             Duration::ZERO,
+            now,
         );
         handle_key(
             &mut session,
+            &mut live_kb,
             KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
             Duration::ZERO,
+            now,
         );
         handle_key(
             &mut session,
+            &mut live_kb,
             KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
             Duration::ZERO,
+            now,
         );
         let stats = session.finish(Duration::from_secs(60));
         assert_eq!(stats.key_frequency[0], ("n".to_string(), 2));
         assert_eq!(stats.key_frequency[1], ("Backspace".to_string(), 1));
+        assert!(live_kb.active_keys.contains_key("n"));
+        assert!(live_kb.active_keys.contains_key("Backspace"));
     }
 
     #[test]
     fn backspace_key_edits_session() {
         let mut session = Session::new("你好世界");
+        let mut live_kb = LiveKeyboard::new();
+        let now = Instant::now();
         session.type_text("你好");
         let mut key = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
-        handle_key(&mut session, key, Duration::ZERO);
+        handle_key(&mut session, &mut live_kb, key, Duration::ZERO, now);
         assert_eq!(session.len(), 1);
         assert_eq!(session.edit_count(), 1);
         key = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
-        handle_key(&mut session, key, Duration::ZERO);
+        handle_key(&mut session, &mut live_kb, key, Duration::ZERO, now);
         assert_eq!(session.len(), 2);
     }
 
@@ -7077,12 +7441,13 @@ mod tests {
         app.settings.input_method = "虎码".to_string();
 
         // 模拟打字：输入 "你好四界"，打错一个字，记录击键与错字
-        handle_key(&mut app.session, KeyEvent::new(KeyCode::Char('你'), KeyModifiers::NONE), Duration::from_secs(1));
-        handle_key(&mut app.session, KeyEvent::new(KeyCode::Char('好'), KeyModifiers::NONE), Duration::from_secs(2));
-        handle_key(&mut app.session, KeyEvent::new(KeyCode::Char('四'), KeyModifiers::NONE), Duration::from_secs(3));
-        handle_key(&mut app.session, KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE), Duration::from_secs(4));
-        handle_key(&mut app.session, KeyEvent::new(KeyCode::Char('世'), KeyModifiers::NONE), Duration::from_secs(5));
-        handle_key(&mut app.session, KeyEvent::new(KeyCode::Char('界'), KeyModifiers::NONE), Duration::from_secs(6));
+        let now = Instant::now();
+        handle_key(&mut app.session, &mut app.live_keyboard, KeyEvent::new(KeyCode::Char('你'), KeyModifiers::NONE), Duration::from_secs(1), now);
+        handle_key(&mut app.session, &mut app.live_keyboard, KeyEvent::new(KeyCode::Char('好'), KeyModifiers::NONE), Duration::from_secs(2), now);
+        handle_key(&mut app.session, &mut app.live_keyboard, KeyEvent::new(KeyCode::Char('四'), KeyModifiers::NONE), Duration::from_secs(3), now);
+        handle_key(&mut app.session, &mut app.live_keyboard, KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE), Duration::from_secs(4), now);
+        handle_key(&mut app.session, &mut app.live_keyboard, KeyEvent::new(KeyCode::Char('世'), KeyModifiers::NONE), Duration::from_secs(5), now);
+        handle_key(&mut app.session, &mut app.live_keyboard, KeyEvent::new(KeyCode::Char('界'), KeyModifiers::NONE), Duration::from_secs(6), now);
 
         assert!(app.session.is_complete());
 
@@ -7299,5 +7664,101 @@ mod tests {
     fn error_ranking_focus_toggle() {
         assert_eq!(ErrorRankingFocus::Chars.toggle(), ErrorRankingFocus::Words);
         assert_eq!(ErrorRankingFocus::Words.toggle(), ErrorRankingFocus::Chars);
+    }
+
+    #[test]
+    fn live_keyboard_normalize_and_press() {
+        assert_eq!(LiveKeyboard::normalize_key("A"), "a");
+        assert_eq!(LiveKeyboard::normalize_key("Space (空格)"), "Space");
+        assert_eq!(LiveKeyboard::normalize_key("Bksp"), "Backspace");
+        assert_eq!(LiveKeyboard::normalize_key("tab"), "Tab");
+        assert_eq!(LiveKeyboard::normalize_key("Enter"), "Enter");
+
+        let mut kb = LiveKeyboard::new();
+        let now = Instant::now();
+        kb.press_char('w', now);
+        kb.press_char(' ', now);
+        assert!(kb.active_keys.contains_key("w"));
+        assert!(kb.active_keys.contains_key("Space"));
+
+        kb.clear();
+        assert!(kb.active_keys.is_empty());
+
+        kb.press_keys(["n", "i"], now);
+        assert!(kb.active_keys.contains_key("n"));
+        assert!(kb.active_keys.contains_key("i"));
+    }
+
+    #[test]
+    fn live_keyboard_styles_and_decay() {
+        let palette = theme_palette(ThemePreset::CatppuccinMocha);
+        let mut kb = LiveKeyboard::new();
+        let t0 = Instant::now();
+
+        // 未按下的键 -> muted
+        let idle_style = kb.get_key_style("a", &palette, t0);
+        assert_eq!(idle_style.fg, Some(palette.muted));
+
+        // 按下瞬间 -> 强高亮 (bg: accent, fg: bg)
+        kb.press_key("a", t0);
+        let active_style = kb.get_key_style("a", &palette, t0);
+        assert_eq!(active_style.bg, Some(palette.accent));
+        assert_eq!(active_style.fg, Some(palette.bg));
+        assert!(active_style.add_modifier.contains(Modifier::BOLD));
+
+        // 150ms 衰减 -> 次高亮 (fg: accent)
+        let t_decay = t0 + Duration::from_millis(150);
+        let decay_style = kb.get_key_style("a", &palette, t_decay);
+        assert_eq!(decay_style.fg, Some(palette.accent));
+        assert_eq!(decay_style.bg, None);
+
+        // 300ms 后 -> 恢复常态 muted
+        let t_end = t0 + Duration::from_millis(300);
+        let end_style = kb.get_key_style("a", &palette, t_end);
+        assert_eq!(end_style.fg, Some(palette.muted));
+    }
+
+    #[test]
+    fn live_keyboard_generate_lines_rows_count() {
+        let palette = theme_palette(ThemePreset::CatppuccinMocha);
+        let kb = LiveKeyboard::new();
+        let now = Instant::now();
+
+        let staggered_lines = generate_live_keyboard_lines(&kb, KeyboardMode::Staggered, &palette, now);
+        assert_eq!(staggered_lines.len(), 5);
+
+        let ortho_lines = generate_live_keyboard_lines(&kb, KeyboardMode::Ortholinear, &palette, now);
+        assert_eq!(ortho_lines.len(), 4);
+
+        let off_lines = generate_live_keyboard_lines(&kb, KeyboardMode::Off, &palette, now);
+        assert_eq!(off_lines.len(), 0);
+    }
+
+    #[test]
+    fn ui_renders_live_keyboard_when_enabled() {
+        let store = temp_token_store();
+        let mut app = App::new_with(
+            file_text("你好世界"),
+            store.clone(),
+            ApiClient::with_base_url_and_store("http://127.0.0.1:1", Some(store)),
+            temp_settings_store(),
+            None,
+        );
+        app.settings.keyboard_mode = KeyboardMode::Staggered;
+
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| ui(f, &app)).unwrap();
+
+        let full_text: String = (0..terminal.backend().buffer().area.height)
+            .map(|y| {
+                (0..terminal.backend().buffer().area.width)
+                    .map(|x| terminal.backend().buffer()[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect();
+        assert!(full_text.contains("[Bksp]"));
+        assert!(full_text.contains("[Space (空格)]") || full_text.contains("Space"));
     }
 }
