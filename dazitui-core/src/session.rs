@@ -289,30 +289,28 @@ impl Session {
         *self.key_counts.entry(key.to_string()).or_insert(0) += 1;
     }
 
+    /// 筛选在滑动窗口 `(t_start, t]` 内的打字事件及有效时间跨度（带前 0.5s 平滑防抖）。
+    fn events_in_window(&self, t: f64, window: f64) -> (impl Iterator<Item = &TypingEvent>, f64) {
+        let t_start = (t - window).max(0.0);
+        let dt = (t - t_start).max(0.5);
+        let iter = self.events.iter().filter(move |e| {
+            let s = e.elapsed.as_secs_f64();
+            if t_start == 0.0 {
+                s >= 0.0 && s <= t
+            } else {
+                s > t_start && s <= t
+            }
+        });
+        (iter, dt)
+    }
+
     /// 计算给定时间点 `t` 处的即时/平滑 WPM（基于 2 秒滑动窗口）。
     fn calc_rolling_wpm(&self, t: f64) -> f64 {
         if t <= 0.0 {
             return 0.0;
         }
-        let window = 2.0;
-        let t_start = (t - window).max(0.0);
-        let dt = t - t_start;
-        if dt <= 0.0 {
-            return 0.0;
-        }
-        let correct_count = self
-            .events
-            .iter()
-            .filter(|e| {
-                let s = e.elapsed.as_secs_f64();
-                let in_window = if t_start == 0.0 {
-                    s >= 0.0 && s <= t
-                } else {
-                    s > t_start && s <= t
-                };
-                in_window && e.is_correct
-            })
-            .count();
+        let (events, dt) = self.events_in_window(t, 2.0);
+        let correct_count = events.filter(|e| e.is_correct).count();
         (correct_count as f64 / dt) * 60.0
     }
 
@@ -321,25 +319,8 @@ impl Session {
         if t <= 0.0 {
             return 0.0;
         }
-        let window = 2.0;
-        let t_start = (t - window).max(0.0);
-        let dt = t - t_start;
-        if dt <= 0.0 {
-            return 0.0;
-        }
-        let stroke_count: u32 = self
-            .events
-            .iter()
-            .filter(|e| {
-                let s = e.elapsed.as_secs_f64();
-                if t_start == 0.0 {
-                    s >= 0.0 && s <= t
-                } else {
-                    s > t_start && s <= t
-                }
-            })
-            .map(|e| e.strokes)
-            .sum();
+        let (events, dt) = self.events_in_window(t, 2.0);
+        let stroke_count: u32 = events.map(|e| e.strokes).sum();
         stroke_count as f64 / dt
     }
 
