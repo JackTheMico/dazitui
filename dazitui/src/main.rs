@@ -558,6 +558,8 @@ struct App {
     free_input_modal: Option<FreeInputModal>,
     /// 实时虚拟键盘状态。
     live_keyboard: LiveKeyboard,
+    /// 当前输入法方案码表（用于汉字方案反查击键与键盘涟漪点亮）。
+    scheme_dict: Option<SchemeDict>,
     /// 后台数据库异步写入 Worker。
     db_worker: Option<DbWorker>,
 }
@@ -664,7 +666,7 @@ impl App {
         };
         let logged_in = api.is_logged_in();
         let token = api.current_token();
-        Self {
+        let mut app = Self {
             text,
             session,
             start: Instant::now(),
@@ -695,7 +697,21 @@ impl App {
             input_method_modal: None,
             free_input_modal: None,
             live_keyboard: LiveKeyboard::new(),
+            scheme_dict: None,
             db_worker,
+        };
+        app.reload_scheme_dict();
+        app
+    }
+
+    /// 根据当前设置中的输入法名称与自定义码表路径重新加载方案码表。
+    pub fn reload_scheme_dict(&mut self) {
+        let scheme_name = &self.settings.input_method;
+        let custom_paths = &self.settings.scheme_dict_paths;
+        if let Some(path) = SchemeDict::resolve_scheme_path(scheme_name, custom_paths) {
+            self.scheme_dict = SchemeDict::load_from_file(&path).ok();
+        } else {
+            self.scheme_dict = None;
         }
     }
 
@@ -1282,6 +1298,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                             app.input_method_modal = None;
                             app.settings.input_method = value;
                             let _ = app.settings_store.save(&app.settings);
+                            app.reload_scheme_dict();
                         }
                         InputMethodModalAction::None => {}
                     }
@@ -1383,6 +1400,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                             handle_key(
                                 &mut app.session,
                                 &mut app.live_keyboard,
+                                app.scheme_dict.as_ref(),
                                 key,
                                 elapsed,
                                 Instant::now(),
@@ -1465,6 +1483,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                                     };
                                     app.settings.input_method = next;
                                     let _ = app.settings_store.save(&app.settings);
+                                    app.reload_scheme_dict();
                                 }
                                 _ => {}
                             }
@@ -1906,10 +1925,11 @@ fn is_open_builtin_browser(key: KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('b')
 }
 
-/// 处理跟打键：退格回改，可打印字符上屏；同时记录按键频率与时序事件，并触发实时虚拟键盘高亮。
+/// 处理跟打键：退格回改，可打印字符上屏；同时记录按键频率与时序事件，并触发实时虚拟键盘（物理击键/汉字方案反查）高亮。
 fn handle_key(
     session: &mut Session,
     live_kb: &mut LiveKeyboard,
+    scheme_dict: Option<&SchemeDict>,
     key: KeyEvent,
     elapsed: Duration,
     now: Instant,
@@ -1921,12 +1941,20 @@ fn handle_key(
             live_kb.press_key("Backspace", now);
         }
         KeyCode::Char(c) => {
-            session.record_key(&c.to_string());
-            session.type_text_at(&c.to_string(), elapsed);
+            let s = c.to_string();
+            session.record_key(&s);
+            session.type_text_at(&s, elapsed);
             if c == ' ' {
                 live_kb.press_key("Space", now);
             } else if c.is_ascii() {
                 live_kb.press_char(c, now);
+            } else if let Some(dict) = scheme_dict {
+                if let Some(code) = dict.get_primary_code(&s) {
+                    let keys = SchemeDict::decompose_code_to_keys(code);
+                    for k in &keys {
+                        live_kb.press_key(k, now);
+                    }
+                }
             }
         }
         _ => {}
@@ -5252,6 +5280,7 @@ mod tests {
         handle_key(
             &mut session,
             &mut live_kb,
+            None,
             KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
             Duration::ZERO,
             now,
@@ -5259,6 +5288,7 @@ mod tests {
         handle_key(
             &mut session,
             &mut live_kb,
+            None,
             KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
             Duration::ZERO,
             now,
@@ -5266,6 +5296,7 @@ mod tests {
         handle_key(
             &mut session,
             &mut live_kb,
+            None,
             KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
             Duration::ZERO,
             now,
@@ -5284,11 +5315,11 @@ mod tests {
         let now = Instant::now();
         session.type_text("你好");
         let mut key = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
-        handle_key(&mut session, &mut live_kb, key, Duration::ZERO, now);
+        handle_key(&mut session, &mut live_kb, None, key, Duration::ZERO, now);
         assert_eq!(session.len(), 1);
         assert_eq!(session.edit_count(), 1);
         key = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
-        handle_key(&mut session, &mut live_kb, key, Duration::ZERO, now);
+        handle_key(&mut session, &mut live_kb, None, key, Duration::ZERO, now);
         assert_eq!(session.len(), 2);
     }
 
@@ -7442,12 +7473,12 @@ mod tests {
 
         // 模拟打字：输入 "你好四界"，打错一个字，记录击键与错字
         let now = Instant::now();
-        handle_key(&mut app.session, &mut app.live_keyboard, KeyEvent::new(KeyCode::Char('你'), KeyModifiers::NONE), Duration::from_secs(1), now);
-        handle_key(&mut app.session, &mut app.live_keyboard, KeyEvent::new(KeyCode::Char('好'), KeyModifiers::NONE), Duration::from_secs(2), now);
-        handle_key(&mut app.session, &mut app.live_keyboard, KeyEvent::new(KeyCode::Char('四'), KeyModifiers::NONE), Duration::from_secs(3), now);
-        handle_key(&mut app.session, &mut app.live_keyboard, KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE), Duration::from_secs(4), now);
-        handle_key(&mut app.session, &mut app.live_keyboard, KeyEvent::new(KeyCode::Char('世'), KeyModifiers::NONE), Duration::from_secs(5), now);
-        handle_key(&mut app.session, &mut app.live_keyboard, KeyEvent::new(KeyCode::Char('界'), KeyModifiers::NONE), Duration::from_secs(6), now);
+        handle_key(&mut app.session, &mut app.live_keyboard, app.scheme_dict.as_ref(), KeyEvent::new(KeyCode::Char('你'), KeyModifiers::NONE), Duration::from_secs(1), now);
+        handle_key(&mut app.session, &mut app.live_keyboard, app.scheme_dict.as_ref(), KeyEvent::new(KeyCode::Char('好'), KeyModifiers::NONE), Duration::from_secs(2), now);
+        handle_key(&mut app.session, &mut app.live_keyboard, app.scheme_dict.as_ref(), KeyEvent::new(KeyCode::Char('四'), KeyModifiers::NONE), Duration::from_secs(3), now);
+        handle_key(&mut app.session, &mut app.live_keyboard, app.scheme_dict.as_ref(), KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE), Duration::from_secs(4), now);
+        handle_key(&mut app.session, &mut app.live_keyboard, app.scheme_dict.as_ref(), KeyEvent::new(KeyCode::Char('世'), KeyModifiers::NONE), Duration::from_secs(5), now);
+        handle_key(&mut app.session, &mut app.live_keyboard, app.scheme_dict.as_ref(), KeyEvent::new(KeyCode::Char('界'), KeyModifiers::NONE), Duration::from_secs(6), now);
 
         assert!(app.session.is_complete());
 
@@ -7760,5 +7791,101 @@ mod tests {
             .collect();
         assert!(full_text.contains("[Bksp]"));
         assert!(full_text.contains("[Space (空格)]") || full_text.contains("Space"));
+    }
+
+    #[test]
+    fn handle_key_chinese_char_with_scheme_dict_activates_ripple_keys() {
+        let dict = SchemeDict::parse("你\tvb\n好\tvr\n世\tvy\n界\tvj\n");
+        let mut session = Session::new("你好世界");
+        let mut live_kb = LiveKeyboard::new();
+        let now = Instant::now();
+
+        // 输入汉字 '你' -> 反查 'vb' -> 激活 'v' 和 'b'
+        handle_key(
+            &mut session,
+            &mut live_kb,
+            Some(&dict),
+            KeyEvent::new(KeyCode::Char('你'), KeyModifiers::NONE),
+            Duration::from_millis(500),
+            now,
+        );
+        assert_eq!(session.len(), 1);
+        assert!(live_kb.active_keys.contains_key("v"));
+        assert!(live_kb.active_keys.contains_key("b"));
+
+        // 输入汉字 '好' -> 反查 'vr' -> 激活 'r'
+        handle_key(
+            &mut session,
+            &mut live_kb,
+            Some(&dict),
+            KeyEvent::new(KeyCode::Char('好'), KeyModifiers::NONE),
+            Duration::from_millis(1000),
+            now,
+        );
+        assert_eq!(session.len(), 2);
+        assert!(live_kb.active_keys.contains_key("r"));
+    }
+
+    #[test]
+    fn handle_key_chinese_char_without_scheme_or_missing_char_does_not_panic() {
+        let dict = SchemeDict::parse("你\tvb\n");
+        let mut session = Session::new("你好世界");
+        let mut live_kb = LiveKeyboard::new();
+        let now = Instant::now();
+
+        // 1. 无 SchemeDict
+        handle_key(
+            &mut session,
+            &mut live_kb,
+            None,
+            KeyEvent::new(KeyCode::Char('你'), KeyModifiers::NONE),
+            Duration::from_millis(500),
+            now,
+        );
+        assert_eq!(session.len(), 1);
+
+        // 2. 有 SchemeDict 但字典中不存在该字
+        handle_key(
+            &mut session,
+            &mut live_kb,
+            Some(&dict),
+            KeyEvent::new(KeyCode::Char('好'), KeyModifiers::NONE),
+            Duration::from_millis(1000),
+            now,
+        );
+        assert_eq!(session.len(), 2);
+    }
+
+    #[test]
+    fn live_keyboard_multi_key_ripple_decay_styles() {
+        let palette = theme_palette(ThemePreset::CatppuccinMocha);
+        let mut kb = LiveKeyboard::new();
+        let t0 = Instant::now();
+
+        // 模拟汉字上屏瞬间同时激活多个字根键 (如 'v', 'b', 'g')
+        kb.press_keys(["v", "b", "g"], t0);
+
+        // 0-100ms 强高亮
+        for k in &["v", "b", "g"] {
+            let style = kb.get_key_style(k, &palette, t0 + Duration::from_millis(40));
+            assert_eq!(style.bg, Some(palette.accent));
+            assert_eq!(style.fg, Some(palette.bg));
+            assert!(style.add_modifier.contains(Modifier::BOLD));
+        }
+
+        // 100-250ms 衰减次高亮
+        for k in &["v", "b", "g"] {
+            let style = kb.get_key_style(k, &palette, t0 + Duration::from_millis(180));
+            assert_eq!(style.fg, Some(palette.accent));
+            assert_eq!(style.bg, None);
+            assert!(style.add_modifier.contains(Modifier::BOLD));
+        }
+
+        // >250ms 恢复常态
+        for k in &["v", "b", "g"] {
+            let style = kb.get_key_style(k, &palette, t0 + Duration::from_millis(300));
+            assert_eq!(style.fg, Some(palette.muted));
+            assert_eq!(style.bg, None);
+        }
     }
 }
