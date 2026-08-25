@@ -273,8 +273,6 @@ pub struct Settings {
     pub reference_ratio: u8,
     /// 粗体开关。
     pub bold: bool,
-    /// 字体设置开关（尽力而为的 OSC 尝试）。
-    pub font: bool,
     /// 实时键盘显示模式。
     pub keyboard_mode: KeyboardMode,
     /// 本地码表与指法方案名称或文件路径（用于反查与实时键盘指法映射）。
@@ -312,7 +310,6 @@ impl Default for Settings {
             theme: ThemePreset::CatppuccinMocha,
             reference_ratio: 62,
             bold: false,
-            font: false,
             keyboard_mode: KeyboardMode::Off,
             scheme: String::new(),
             input_method: String::new(),
@@ -364,11 +361,10 @@ impl SettingsStore {
             std::fs::create_dir_all(parent)?;
         }
         let mut content = format!(
-            "theme={}\nreference_ratio={}\nbold={}\nfont={}\nkeyboard_mode={}\nscheme={}\ninput_method={}\n",
+            "theme={}\nreference_ratio={}\nbold={}\nkeyboard_mode={}\nscheme={}\ninput_method={}\n",
             settings.theme.as_str(),
             settings.reference_ratio,
             settings.bold,
-            settings.font,
             settings.keyboard_mode.as_str(),
             settings.scheme,
             settings.input_method,
@@ -407,7 +403,7 @@ impl SettingsStore {
                     }
                 }
                 "bold" => settings.bold = value == "true",
-                "font" => settings.font = value == "true",
+                "font" => {} // 忽略已移除的 font 设置
                 "keyboard_mode" => {
                     if let Some(mode) = KeyboardMode::parse(value) {
                         settings.keyboard_mode = mode;
@@ -543,7 +539,6 @@ mod tests {
         assert_eq!(s.theme, ThemePreset::CatppuccinMocha);
         assert_eq!(s.reference_ratio, 62);
         assert!(!s.bold);
-        assert!(!s.font);
         assert_eq!(s.input_method, "");
     }
 
@@ -577,12 +572,11 @@ mod tests {
     fn store_roundtrip() {
         let store = SettingsStore::new(temp_path("roundtrip"));
         let mut scheme_dict_paths = HashMap::new();
-        scheme_dict_paths.insert("麓鸣并击".to_string(), "/path/to/luming.txt".to_string());
+        scheme_dict_paths.insert("麓鸣·空明·并击".to_string(), "/path/to/luming.txt".to_string());
         let s = Settings {
             theme: ThemePreset::Dracula,
             reference_ratio: 70,
             bold: true,
-            font: false,
             keyboard_mode: KeyboardMode::Staggered,
             scheme: "yoyo-pure".to_string(),
             input_method: "虎码".to_string(),
@@ -643,7 +637,6 @@ mod tests {
         assert_eq!(s.theme, ThemePreset::Gruvbox);
         assert_eq!(s.reference_ratio, 62);
         assert!(!s.bold);
-        assert!(s.font);
         assert_eq!(s.input_method, ""); // 缺省时为空串
         let _ = std::fs::remove_file(store.path());
     }

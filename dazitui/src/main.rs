@@ -7,11 +7,11 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use dazitui_core::ThemePreset;
 use dazitui_core::{
     ApiClient, ApiError, AuthSession, BUILTIN_SETS, CharStatus, CompetitionType, DbTask, DbWorker,
-    ErrorRecordItem, ErrorType, FONT_SIZE_PT, KeyboardMode, KeypressRecordItem, LoadError,
+    ErrorRecordItem, ErrorType, KeyboardMode, KeypressRecordItem, LoadError,
     LoadOptions, Rgb, SchemeDict, Session, SessionRecord, Settings, SettingsStore, Stats, StatsDb,
     Text, TextSource, Theme, TokenStore, env_credentials, format_time, is_auth_failure,
     load_builtin_text, load_builtin_text_shuffled, load_text_from_clipboard, load_text_from_file,
-    load_text_from_string, lttb_downsample, osc_font_size_sequence, osc52_clipboard,
+    load_text_from_string, lttb_downsample, osc52_clipboard,
     save_text_to_file,
 };
 use ratatui::Frame;
@@ -193,12 +193,11 @@ enum AppState {
 const FOCUS_THEME: usize = 0;
 const FOCUS_RATIO: usize = 1;
 const FOCUS_BOLD: usize = 2;
-const FOCUS_FONT: usize = 3;
-const FOCUS_KEYBOARD: usize = 4;
-const FOCUS_SCHEME: usize = 5;
-const FOCUS_INPUT_METHOD: usize = 6;
+const FOCUS_KEYBOARD: usize = 3;
+const FOCUS_SCHEME: usize = 4;
+const FOCUS_INPUT_METHOD: usize = 5;
 /// 设置视图焦点项总数。
-const SETTINGS_FOCUS_COUNT: usize = 7;
+const SETTINGS_FOCUS_COUNT: usize = 6;
 
 /// 反查方案预设列表（顺序即轮转顺序）。
 /// 最后一项「自定义」表示用户自行输入任意方案名或文件路径。
@@ -217,7 +216,7 @@ const SCHEME_PRESETS: &[&str] = &[
     "全拼",
     "空明码并击",
     "拼读并击",
-    "麓鸣并击",
+    "麓鸣·空明·并击",
     "虎码并击",
     "自定义", // 末项：打开自定义弹窗
 ];
@@ -271,7 +270,7 @@ const INPUT_METHOD_PRESETS: &[&str] = &[
     "全拼",
     "空明码并击",
     "拼读并击",
-    "麓鸣并击",
+    "麓鸣·空明·并击",
     "虎码并击",
     "自定义", // 末项：打开自定义弹窗
 ];
@@ -601,7 +600,7 @@ struct App {
     settings: Settings,
     /// 设置持久化存储。
     settings_store: SettingsStore,
-    /// 设置视图当前焦点项（FOCUS_THEME/FOCUS_RATIO/FOCUS_BOLD/FOCUS_FONT/FOCUS_KEYBOARD/FOCUS_INPUT_METHOD）。
+    /// 设置视图当前焦点项（FOCUS_THEME/FOCUS_RATIO/FOCUS_BOLD/FOCUS_KEYBOARD/FOCUS_SCHEME/FOCUS_INPUT_METHOD）。
     settings_focus: usize,
     /// 内置赛文浏览中的乱序开关（`true` = 载入时打乱顺序）。
     builtin_shuffle: bool,
@@ -863,12 +862,6 @@ impl App {
     /// 切换粗体开关并即时持久化。
     fn toggle_bold(&mut self) {
         self.settings.bold = !self.settings.bold;
-        let _ = self.settings_store.save(&self.settings);
-    }
-
-    /// 切换字体开关并即时持久化（OSC 序列由事件层在开启时输出）。
-    fn toggle_font(&mut self) {
-        self.settings.font = !self.settings.font;
         let _ = self.settings_store.save(&self.settings);
     }
 
@@ -1326,10 +1319,6 @@ fn main() {
 
 fn run_tui(app: App) -> io::Result<()> {
     let mut terminal = ratatui::init();
-    // 启动时若字体开关已开启，输出 OSC 字体尝试序列（尽力而为）。
-    if app.settings.font {
-        emit_font_osc();
-    }
     // bracketed paste：中文输入法（fcitx/ibus）上屏以 paste 事件到达，必须启用
     // 键盘增强协议（Kitty keyboard protocol）：支持终端准确发送 Ctrl+Enter 修饰键
     let _ = crossterm::execute!(
@@ -1554,12 +1543,6 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                                 }
                                 FOCUS_RATIO => app.adjust_ratio(if forward { 5 } else { -5 }),
                                 FOCUS_BOLD => app.toggle_bold(),
-                                FOCUS_FONT => {
-                                    app.toggle_font();
-                                    if app.settings.font {
-                                        emit_font_osc();
-                                    }
-                                }
                                 FOCUS_KEYBOARD => {
                                     if forward {
                                         app.next_keyboard_mode();
@@ -2169,13 +2152,6 @@ fn api_error_text(err: &ApiError) -> String {
 fn write_clipboard(text: &str) {
     use crossterm::style::Print;
     let seq = osc52_clipboard(text);
-    let _ = crossterm::execute!(std::io::stdout(), Print(seq));
-}
-
-/// 输出 kitty 兼容的 OSC 字体设置序列（尽力而为，不支持/失败静默忽略）。
-fn emit_font_osc() {
-    use crossterm::style::Print;
-    let seq = osc_font_size_sequence(FONT_SIZE_PT);
     let _ = crossterm::execute!(std::io::stdout(), Print(seq));
 }
 
@@ -3950,7 +3926,7 @@ fn render_error_ranking_tab(
     );
 }
 
-/// 设置视图：焦点行 + 左右调整（主题/占比/粗体/字体）。
+/// 设置视图：焦点行 + 左右调整（主题/占比/粗体/实时键盘/反查方案/上传名称）。
 fn render_settings(frame: &mut Frame, app: &App) {
     let palette = app.palette();
     let focus = app.settings_focus;
@@ -3972,12 +3948,6 @@ fn render_settings(frame: &mut Frame, app: &App) {
         "粗体",
         on_off(app.settings.bold),
         focus == FOCUS_BOLD,
-        &palette,
-    ));
-    lines.push(settings_row(
-        "字体",
-        on_off(app.settings.font),
-        focus == FOCUS_FONT,
         &palette,
     ));
     lines.push(settings_row(
@@ -5564,11 +5534,11 @@ mod tests {
 
     #[test]
     fn move_focus_wraps_around() {
-        // SETTINGS_FOCUS_COUNT = 7（主题/占比/粗体/字体/实时键盘/反查方案/上传名称）
-        assert_eq!(move_focus(0, -1), 6); // 第 0 项向前 → 末项（6）
-        assert_eq!(move_focus(6, 1), 0); // 末项向后 → 第 0 项
+        // SETTINGS_FOCUS_COUNT = 6（主题/占比/粗体/实时键盘/反查方案/上传名称）
+        assert_eq!(move_focus(0, -1), 5); // 第 0 项向前 → 末项（5）
+        assert_eq!(move_focus(5, 1), 0); // 末项向后 → 第 0 项
         assert_eq!(move_focus(0, 1), 1);
-        assert_eq!(move_focus(5, 1), 6);
+        assert_eq!(move_focus(4, 1), 5);
         assert_eq!(move_focus(2, -1), 1);
     }
 
@@ -5785,17 +5755,13 @@ mod tests {
     }
 
     #[test]
-    fn toggle_bold_and_font_persist() {
+    fn toggle_bold_persist() {
         let mut app = test_app(file_text("你好"));
         assert!(!app.settings.bold);
-        assert!(!app.settings.font);
         app.toggle_bold();
-        app.toggle_font();
         assert!(app.settings.bold);
-        assert!(app.settings.font);
         let loaded = app.settings_store.load();
         assert!(loaded.bold);
-        assert!(loaded.font);
     }
 
     #[test]
@@ -7516,7 +7482,6 @@ mod tests {
         assert!(clean.contains("主题:"));
         assert!(clean.contains("对照区占比:"));
         assert!(clean.contains("粗体:"));
-        assert!(clean.contains("字体:"));
         assert!(clean.contains("反查方案:"));
         assert!(clean.contains("上传名称:"));
     }
