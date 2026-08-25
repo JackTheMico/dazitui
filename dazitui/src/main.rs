@@ -1719,6 +1719,22 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                 if matches!(app.state, AppState::Typing) {
                     app.touch_typing();
                     let elapsed = app.current_elapsed();
+                    let now = Instant::now();
+                    for c in committed.chars() {
+                        let s = c.to_string();
+                        if c == ' ' {
+                            app.live_keyboard.press_key("Space", now);
+                        } else if c.is_ascii() {
+                            app.live_keyboard.press_char(c, now);
+                        } else if let Some(ref dict) = app.scheme_dict {
+                            if let Some(code) = dict.get_primary_code(&s) {
+                                let keys = dict.decompose_code(code);
+                                for k in &keys {
+                                    app.live_keyboard.press_key(k, now);
+                                }
+                            }
+                        }
+                    }
                     app.session.type_text_at(&committed, elapsed);
                     if app.session.is_complete() {
                         finish_and_maybe_upload(&mut app, terminal)?;
@@ -2057,7 +2073,7 @@ fn handle_key(
                 live_kb.press_char(c, now);
             } else if let Some(dict) = scheme_dict {
                 if let Some(code) = dict.get_primary_code(&s) {
-                    let keys = SchemeDict::decompose_code_to_keys(code);
+                    let keys = dict.decompose_code(code);
                     for k in &keys {
                         live_kb.press_key(k, now);
                     }
@@ -8043,5 +8059,55 @@ mod tests {
             assert_eq!(style.fg, Some(palette.muted));
             assert_eq!(style.bg, None);
         }
+    }
+
+    #[test]
+    fn handle_key_chord_algebra_activates_all_physical_keys_simultaneously() {
+        let mut dict = SchemeDict::default();
+        dict.add_entry("到", "_.");
+        dict.add_entry("是", "wCs");
+
+        let rules = vec![
+            "xform|xv|\\.|".to_string(),
+            "xform|cf|C|".to_string(),
+        ];
+        dict.set_chord_algebra(dazitui_core::ChordAlgebra::from_rules(&rules));
+
+        let mut session = Session::new("到是");
+        let mut live_kb = LiveKeyboard::new();
+        let now = Instant::now();
+
+        // 键入 "到" (反查为 "_." -> 由 ChordAlgebra 逆向展开为 "x" 和 "v")
+        handle_key(
+            &mut session,
+            &mut live_kb,
+            Some(&dict),
+            KeyEvent::new(KeyCode::Char('到'), KeyModifiers::NONE),
+            Duration::from_millis(100),
+            now,
+        );
+
+        assert!(live_kb.active_keys.contains_key("x"));
+        assert!(live_kb.active_keys.contains_key("v"));
+        assert_eq!(live_kb.active_keys.get("x"), Some(&now));
+        assert_eq!(live_kb.active_keys.get("v"), Some(&now));
+
+        // 键入 "是" (反查为 "wCs" -> 由 ChordAlgebra 逆向展开为 "w", "c", "f", "s")
+        let t2 = now + Duration::from_millis(500);
+        handle_key(
+            &mut session,
+            &mut live_kb,
+            Some(&dict),
+            KeyEvent::new(KeyCode::Char('是'), KeyModifiers::NONE),
+            Duration::from_millis(600),
+            t2,
+        );
+
+        assert!(live_kb.active_keys.contains_key("w"));
+        assert!(live_kb.active_keys.contains_key("c"));
+        assert!(live_kb.active_keys.contains_key("f"));
+        assert!(live_kb.active_keys.contains_key("s"));
+        assert_eq!(live_kb.active_keys.get("c"), Some(&t2));
+        assert_eq!(live_kb.active_keys.get("f"), Some(&t2));
     }
 }
