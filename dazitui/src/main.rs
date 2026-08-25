@@ -3341,6 +3341,7 @@ fn render_heatmap_tab(
 ) {
     let db = StatsDb::with_default_path().ok();
     let mut scheme_dict_loaded = false;
+    let mut loaded_scheme_name = String::new();
     let mut dict_path_display = String::new();
 
     let key_counts = match source {
@@ -3354,6 +3355,7 @@ fn render_heatmap_tab(
             if let Some(path) = SchemeDict::resolve_scheme_path(scheme_name, custom_paths) {
                 if let Ok(dict) = SchemeDict::load_from_file(&path) {
                     scheme_dict_loaded = true;
+                    loaded_scheme_name = dict.name().unwrap_or(scheme_name).to_string();
                     dict_path_display = path.display().to_string();
                     let sessions = db
                         .as_ref()
@@ -3398,7 +3400,7 @@ fn render_heatmap_tab(
     let source_badge = source.label();
     let scheme_status_str = if source == HeatmapSource::SchemeProjected {
         if scheme_dict_loaded {
-            format!("已加载码表: {dict_path_display}")
+            format!("已加载方案 [{loaded_scheme_name}]: {dict_path_display}")
         } else if app.settings.scheme.is_empty() {
             "未配置反查方案（按 Ctrl-E 设置）".to_string()
         } else {

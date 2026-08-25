@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 /// 方案反查与码表映射管理器。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SchemeDict {
+    /// 方案展示名称（如从 .schema.yaml 中的 schema.name 提取）
+    name: Option<String>,
     /// 词/单字 -> 编码列表（可能有重码，保留首选编码）
     word_to_codes: HashMap<String, Vec<String>>,
     /// 并击代数指法规则逆向引擎（若方案提供了 .schema.yaml 中的 chord_composer.algebra）
@@ -27,6 +29,25 @@ impl std::str::FromStr for SchemeDict {
 }
 
 impl SchemeDict {
+    /// 获取方案显示名称。
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    /// 设置方案显示名称。
+    pub fn set_name(&mut self, name: impl Into<String>) {
+        self.name = Some(name.into());
+    }
+
+    /// 从指定 .schema.yaml 文件中提取方案名称 (schema.name)。
+    pub fn extract_schema_name(path: &Path) -> Option<String> {
+        let content = std::fs::read_to_string(path).ok()?;
+        let doc = parse_rime_yaml(&content);
+        doc.get("schema/name")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    }
+
     /// 从字符串内容解析码表（支持纯文本与 Rime .dict.yaml 格式）。
     pub fn parse(content: &str) -> Self {
         let mut dict = Self::default();
@@ -104,14 +125,14 @@ impl SchemeDict {
     /// 从文件加载码表与指法方案。
     ///
     /// 智能识别文件类型与同名伴随文件：
-    /// - 若输入为 `.schema.yaml`：解析其 `chord_composer.algebra`，并查找同目录下关联词典加载词条。
-    /// - 若输入为 `.dict.yaml` 或 `.txt`：加载词条，并尝试加载同目录下同名 `.schema.yaml` 提取指法映射。
+    /// - 若输入为 `.schema.yaml`：解析其 `chord_composer.algebra`，提取 `schema.name`，并查找同目录下关联词典加载词条。
+    /// - 若输入为 `.dict.yaml` 或 `.txt`：加载词条，并尝试加载同目录下同名 `.schema.yaml` 提取指法映射与方案名。
     pub fn load_from_file(path: &Path) -> io::Result<Self> {
         let file_name = path.file_name().and_then(|f| f.to_str()).unwrap_or("");
         let parent_dir = path.parent().unwrap_or(Path::new("."));
 
         if file_name.ends_with(".schema.yaml") {
-            // 1. 从 schema 解析指法规则
+            // 1. 从 schema 解析指法规则与方案名
             let mut resolver = RimeSchemaResolver::new();
             let rules = resolver.resolve_chord_algebra(path);
             let algebra = if !rules.is_empty() {
@@ -119,13 +140,24 @@ impl SchemeDict {
             } else {
                 None
             };
+            let schema_name = Self::extract_schema_name(path);
 
-            // 2. 查找伴随词典
+            // 2. 查找伴随词典（优先检查 translator/dictionary，其次使用文件名词干）
+            let schema_doc = resolver.load_doc(path).ok().cloned();
+            let dict_name = schema_doc.as_ref().and_then(|doc| {
+                doc.get("translator/dictionary")
+                    .or_else(|| doc.get("__patch/translator/dictionary"))
+                    .and_then(|v| v.as_str())
+            });
+
             let schema_stem = file_name.strip_suffix(".schema.yaml").unwrap_or(file_name);
-            let candidate_dicts = [
-                parent_dir.join(format!("{schema_stem}.dict.yaml")),
-                parent_dir.join(format!("{schema_stem}.txt")),
-            ];
+            let mut candidate_dicts = Vec::new();
+            if let Some(custom_dict) = dict_name {
+                candidate_dicts.push(parent_dir.join(format!("{custom_dict}.dict.yaml")));
+                candidate_dicts.push(parent_dir.join(format!("{custom_dict}.txt")));
+            }
+            candidate_dicts.push(parent_dir.join(format!("{schema_stem}.dict.yaml")));
+            candidate_dicts.push(parent_dir.join(format!("{schema_stem}.txt")));
 
             let mut dict = if let Some(dict_path) = candidate_dicts.into_iter().find(|p| p.exists()) {
                 let content = std::fs::read_to_string(dict_path)?;
@@ -136,6 +168,9 @@ impl SchemeDict {
 
             if let Some(alg) = algebra {
                 dict.set_chord_algebra(alg);
+            }
+            if let Some(name) = schema_name {
+                dict.set_name(name);
             }
             return Ok(dict);
         }
@@ -166,12 +201,21 @@ impl SchemeDict {
             if !rules.is_empty() {
                 dict.set_chord_algebra(ChordAlgebra::from_rules(&rules));
             }
+            if let Some(name) = Self::extract_schema_name(&schema_candidate) {
+                dict.set_name(name);
+            }
         }
 
         Ok(dict)
     }
 
     /// 查找系统预设或自定义配置的方案码表文件路径。
+    ///
+    /// 搜索优先级：
+    /// 1. 显式自定义映射表 `custom_mappings`
+    /// 2. 绝对路径或相对路径直接存在性检测
+    /// 3. 打字推默认方案目录 `~/.config/dazitui/schemes/`
+    /// 4. 常见 Rime 用户配置目录 (Fcitx5 / Fcitx / IBus / Squirrel / Rime)
     pub fn resolve_scheme_path(
         scheme: &str,
         custom_mappings: &HashMap<String, String>,
@@ -194,7 +238,9 @@ impl SchemeDict {
             return Some(direct_path);
         }
 
-        // 3. 默认配置目录 ~/.config/dazitui/schemes/
+        // 3. 构建搜索目录列表
+        let mut search_dirs = Vec::new();
+
         let config_home = std::env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| {
@@ -203,16 +249,43 @@ impl SchemeDict {
                     .unwrap_or_else(|| PathBuf::from("."));
                 home.join(".config")
             });
-        let schemes_dir = config_home.join("dazitui").join("schemes");
+        let data_home = std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                let home = std::env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("."));
+                home.join(".local").join("share")
+            });
+        let home_dir = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
 
-        let candidates = [
-            schemes_dir.join(format!("{scheme}.schema.yaml")),
-            schemes_dir.join(format!("{scheme}.dict.yaml")),
-            schemes_dir.join(format!("{scheme}.txt")),
-            schemes_dir.join(scheme),
-        ];
+        // dazitui 自带目录
+        search_dirs.push(config_home.join("dazitui").join("schemes"));
+        // fcitx5 rime
+        search_dirs.push(data_home.join("fcitx5").join("rime"));
+        // fcitx rime
+        search_dirs.push(config_home.join("fcitx").join("rime"));
+        // ibus rime
+        search_dirs.push(config_home.join("ibus").join("rime"));
+        // macOS Squirrel
+        search_dirs.push(home_dir.join("Library").join("Rime"));
+        // 传统 .rime
+        search_dirs.push(home_dir.join(".rime"));
 
-        candidates.into_iter().find(|c| c.exists())
+        for dir in search_dirs {
+            let candidates = [
+                dir.join(format!("{scheme}.schema.yaml")),
+                dir.join(format!("{scheme}.dict.yaml")),
+                dir.join(format!("{scheme}.txt")),
+                dir.join(scheme),
+            ];
+
+            if let Some(found) = candidates.into_iter().find(|c| c.exists()) {
+                return Some(found);
+            }
+        }
+
+        None
     }
 
     /// 添加一条词条编码。
@@ -955,6 +1028,7 @@ algebra:
             assert_eq!(algebra.decompose_code("_."), vec!["x", "z"]);
             assert_eq!(algebra.decompose_code("wCs"), vec!["w", "c", "x", "s"]);
             assert!(dict.entry_count() > 1000);
+            assert_eq!(dict.name(), Some("麓鸣·纯形·六脉"));
             assert_eq!(dict.get_primary_code("到"), Some("_."));
         }
 
@@ -968,5 +1042,26 @@ algebra:
             assert_eq!(algebra.decompose_code("_."), vec!["v", "x"]);
             assert_eq!(algebra.decompose_code("wCs"), vec!["w", "c", "f", "s"]);
         }
+    }
+
+    #[test]
+    fn test_schema_name_extraction_and_resolution() {
+        let temp_dir = std::env::temp_dir().join("dazitui_test_scheme");
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let schema_file = temp_dir.join("demo.schema.yaml");
+        let yaml_content = "schema:\n  name: \"演示方案·六脉\"\n  schema_id: demo\n\nchord_composer:\n  algebra:\n    - xform|xv|.|";
+        std::fs::write(&schema_file, yaml_content).unwrap();
+
+        assert_eq!(SchemeDict::extract_schema_name(&schema_file), Some("演示方案·六脉".to_string()));
+
+        // 直接路径解析
+        let mut custom = HashMap::new();
+        let resolved = SchemeDict::resolve_scheme_path(schema_file.to_str().unwrap(), &custom);
+        assert_eq!(resolved, Some(schema_file.clone()));
+
+        // 自定义别名映射解析
+        custom.insert("my_demo".to_string(), schema_file.to_str().unwrap().to_string());
+        let resolved_alias = SchemeDict::resolve_scheme_path("my_demo", &custom);
+        assert_eq!(resolved_alias, Some(schema_file));
     }
 }
