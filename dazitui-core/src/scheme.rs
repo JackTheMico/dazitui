@@ -557,24 +557,36 @@ impl YamlValue {
     }
 
     pub fn get(&self, path: &str) -> Option<&YamlValue> {
-        let parts: Vec<&str> = path.split(['/', '.']).filter(|s| !s.is_empty()).collect();
-        let mut current = self;
-        for part in parts {
-            match current {
-                YamlValue::Mapping(m) => {
-                    let mut found = None;
-                    for (k, v) in m {
-                        if k == part {
-                            found = Some(v);
-                            break;
+        let trimmed_path = path.trim_matches(['/', '.']);
+        if trimmed_path.is_empty() {
+            return Some(self);
+        }
+
+        match self {
+            YamlValue::Mapping(map) => {
+                // 1. 直接匹配全路径（处理含斜杠的展平 key，例如 "translator/dictionary"）
+                for (k, v) in map {
+                    if k == trimmed_path {
+                        return Some(v);
+                    }
+                }
+
+                // 2. 尝试逐级分段匹配（例如 "__patch" -> "translator/dictionary" 或 "schema" -> "name"）
+                for (k, v) in map {
+                    if trimmed_path.starts_with(k) {
+                        let rest = &trimmed_path[k.len()..];
+                        if rest.starts_with('/') || rest.starts_with('.') {
+                            let rest_trimmed = rest.trim_start_matches(['/', '.']);
+                            if let Some(found) = v.get(rest_trimmed) {
+                                return Some(found);
+                            }
                         }
                     }
-                    current = found?;
                 }
-                _ => return None,
+                None
             }
+            _ => None,
         }
-        Some(current)
     }
 }
 
@@ -1063,5 +1075,28 @@ algebra:
         custom.insert("my_demo".to_string(), schema_file.to_str().unwrap().to_string());
         let resolved_alias = SchemeDict::resolve_scheme_path("my_demo", &custom);
         assert_eq!(resolved_alias, Some(schema_file));
+    }
+
+    #[test]
+    fn test_patch_flattened_keys_and_companion_dict_lookup() {
+        let yaml = "__patch:\n  translator/dictionary: my-dict\n";
+        let doc = parse_rime_yaml(yaml);
+        assert_eq!(
+            doc.get("__patch/translator/dictionary").and_then(|v| v.as_str()),
+            Some("my-dict")
+        );
+    }
+
+    #[test]
+    fn test_user_config_dir_live_diagnostic() {
+        let custom = HashMap::new();
+        if let Some(path) = SchemeDict::resolve_scheme_path("yoyo-pure-km", &custom) {
+            let dict = SchemeDict::load_from_file(&path).unwrap();
+            assert_eq!(dict.name(), Some("麓鸣·纯形·空明"));
+            assert!(dict.entry_count() > 1000);
+            assert!(dict.chord_algebra().is_some());
+            assert_eq!(dict.get_primary_code("到"), Some("_."));
+            assert_eq!(dict.decompose_code("_."), vec!["v", "x"]);
+        }
     }
 }
