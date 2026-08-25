@@ -194,6 +194,76 @@ impl Theme {
     }
 }
 
+/// 实时键盘显示模式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KeyboardMode {
+    /// 关闭（默认）。
+    #[default]
+    Off,
+    /// 标准斜列（ANSI 60%）。
+    Staggered,
+    /// 直列矩阵（Planck 4x12）。
+    Ortholinear,
+}
+
+impl KeyboardMode {
+    /// 全部模式，按设置视图展示顺序排列。
+    pub const ALL: [KeyboardMode; 3] = [
+        KeyboardMode::Off,
+        KeyboardMode::Staggered,
+        KeyboardMode::Ortholinear,
+    ];
+
+    /// 模式显示名（用于设置视图）。
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Off => "关闭",
+            Self::Staggered => "标准斜列 (ANSI 60%)",
+            Self::Ortholinear => "直列矩阵 (Planck 4x12)",
+        }
+    }
+
+    /// 序列化标识（用于 settings 文件）。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Staggered => "staggered",
+            Self::Ortholinear => "ortholinear",
+        }
+    }
+
+    /// 从字符串解析（忽略大小写与首尾空白）；未知值返回 `None`。
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "off" | "none" | "false" | "0" | "disabled" => Some(Self::Off),
+            "staggered" | "standard" | "ansi" => Some(Self::Staggered),
+            "ortholinear" | "ortho" | "matrix" | "planck" => Some(Self::Ortholinear),
+            _ => None,
+        }
+    }
+
+    /// 在全部预设中的下标。
+    fn index(self) -> usize {
+        Self::ALL.iter().position(|p| *p == self).unwrap_or(0)
+    }
+
+    /// 下一个模式（循环）。
+    pub fn next(self) -> Self {
+        Self::ALL[(self.index() + 1) % Self::ALL.len()]
+    }
+
+    /// 上一个模式（循环）。
+    pub fn prev(self) -> Self {
+        let len = Self::ALL.len();
+        Self::ALL[(self.index() + len - 1) % len]
+    }
+
+    /// 是否开启显示。
+    pub fn is_enabled(&self) -> bool {
+        !matches!(self, Self::Off)
+    }
+}
+
 /// 应用外观设置。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
@@ -205,6 +275,8 @@ pub struct Settings {
     pub bold: bool,
     /// 字体设置开关（尽力而为的 OSC 尝试）。
     pub font: bool,
+    /// 实时键盘显示模式。
+    pub keyboard_mode: KeyboardMode,
     /// 输入法名称（上传与分享携带）；空串表示不配置（显示「无」）。
     /// 最多 20 字符（遵守 52dazi 协议限制）。
     pub input_method: String,
@@ -239,6 +311,7 @@ impl Default for Settings {
             reference_ratio: 62,
             bold: false,
             font: false,
+            keyboard_mode: KeyboardMode::Off,
             input_method: String::new(),
             scheme_dict_paths: HashMap::new(),
         }
@@ -288,11 +361,12 @@ impl SettingsStore {
             std::fs::create_dir_all(parent)?;
         }
         let mut content = format!(
-            "theme={}\nreference_ratio={}\nbold={}\nfont={}\ninput_method={}\n",
+            "theme={}\nreference_ratio={}\nbold={}\nfont={}\nkeyboard_mode={}\ninput_method={}\n",
             settings.theme.as_str(),
             settings.reference_ratio,
             settings.bold,
             settings.font,
+            settings.keyboard_mode.as_str(),
             settings.input_method,
         );
         for (scheme, path) in &settings.scheme_dict_paths {
@@ -329,6 +403,11 @@ impl SettingsStore {
                 }
                 "bold" => settings.bold = value == "true",
                 "font" => settings.font = value == "true",
+                "keyboard_mode" => {
+                    if let Some(mode) = KeyboardMode::parse(value) {
+                        settings.keyboard_mode = mode;
+                    }
+                }
                 "input_method" => {
                     settings.input_method = Settings::clamp_input_method(value);
                 }
@@ -491,6 +570,7 @@ mod tests {
             reference_ratio: 70,
             bold: true,
             font: false,
+            keyboard_mode: KeyboardMode::Staggered,
             input_method: "虎码".to_string(),
             scheme_dict_paths,
         };
@@ -572,6 +652,69 @@ mod tests {
         store.save(&s).unwrap();
         let loaded = store.load();
         assert_eq!(loaded.input_method, "空明码并击");
+        let _ = std::fs::remove_file(store.path());
+    }
+
+    #[test]
+    fn keyboard_mode_enum_properties() {
+        assert_eq!(KeyboardMode::default(), KeyboardMode::Off);
+        assert!(!KeyboardMode::Off.is_enabled());
+        assert!(KeyboardMode::Staggered.is_enabled());
+        assert!(KeyboardMode::Ortholinear.is_enabled());
+
+        assert_eq!(KeyboardMode::Off.name(), "关闭");
+        assert_eq!(KeyboardMode::Staggered.name(), "标准斜列 (ANSI 60%)");
+        assert_eq!(KeyboardMode::Ortholinear.name(), "直列矩阵 (Planck 4x12)");
+
+        assert_eq!(KeyboardMode::Off.as_str(), "off");
+        assert_eq!(KeyboardMode::Staggered.as_str(), "staggered");
+        assert_eq!(KeyboardMode::Ortholinear.as_str(), "ortholinear");
+
+        assert_eq!(KeyboardMode::Off.next(), KeyboardMode::Staggered);
+        assert_eq!(KeyboardMode::Staggered.next(), KeyboardMode::Ortholinear);
+        assert_eq!(KeyboardMode::Ortholinear.next(), KeyboardMode::Off);
+
+        assert_eq!(KeyboardMode::Off.prev(), KeyboardMode::Ortholinear);
+        assert_eq!(KeyboardMode::Ortholinear.prev(), KeyboardMode::Staggered);
+        assert_eq!(KeyboardMode::Staggered.prev(), KeyboardMode::Off);
+
+        assert_eq!(KeyboardMode::parse("off"), Some(KeyboardMode::Off));
+        assert_eq!(KeyboardMode::parse("none"), Some(KeyboardMode::Off));
+        assert_eq!(KeyboardMode::parse("false"), Some(KeyboardMode::Off));
+        assert_eq!(KeyboardMode::parse("staggered"), Some(KeyboardMode::Staggered));
+        assert_eq!(KeyboardMode::parse("standard"), Some(KeyboardMode::Staggered));
+        assert_eq!(KeyboardMode::parse("ansi"), Some(KeyboardMode::Staggered));
+        assert_eq!(KeyboardMode::parse("ortholinear"), Some(KeyboardMode::Ortholinear));
+        assert_eq!(KeyboardMode::parse("planck"), Some(KeyboardMode::Ortholinear));
+        assert_eq!(KeyboardMode::parse("invalid"), None);
+    }
+
+    #[test]
+    fn store_keyboard_mode_roundtrip() {
+        let store = SettingsStore::new(temp_path("kb_roundtrip"));
+        let s = Settings {
+            keyboard_mode: KeyboardMode::Staggered,
+            ..Default::default()
+        };
+        store.save(&s).unwrap();
+        let loaded = store.load();
+        assert_eq!(loaded.keyboard_mode, KeyboardMode::Staggered);
+
+        let s2 = Settings {
+            keyboard_mode: KeyboardMode::Ortholinear,
+            ..Default::default()
+        };
+        store.save(&s2).unwrap();
+        let loaded2 = store.load();
+        assert_eq!(loaded2.keyboard_mode, KeyboardMode::Ortholinear);
+        let _ = std::fs::remove_file(store.path());
+    }
+
+    #[test]
+    fn store_keyboard_mode_missing_defaults_to_off() {
+        let store = SettingsStore::new(temp_path("kb_missing"));
+        std::fs::write(store.path(), "theme=default\nreference_ratio=60\n").unwrap();
+        assert_eq!(store.load().keyboard_mode, KeyboardMode::Off);
         let _ = std::fs::remove_file(store.path());
     }
 

@@ -7,10 +7,10 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use dazitui_core::ThemePreset;
 use dazitui_core::{
     ApiClient, ApiError, AuthSession, BUILTIN_SETS, CharStatus, CompetitionType, DbTask, DbWorker,
-    ErrorRecordItem, ErrorType, FONT_SIZE_PT, KeypressRecordItem, LoadError, LoadOptions, Rgb,
-    SchemeDict, Session, SessionRecord, Settings, SettingsStore, Stats, StatsDb, Text, TextSource,
-    Theme, TokenStore, env_credentials, format_time, is_auth_failure, load_builtin_text,
-    load_builtin_text_shuffled, load_text_from_clipboard, load_text_from_file,
+    ErrorRecordItem, ErrorType, FONT_SIZE_PT, KeyboardMode, KeypressRecordItem, LoadError,
+    LoadOptions, Rgb, SchemeDict, Session, SessionRecord, Settings, SettingsStore, Stats, StatsDb,
+    Text, TextSource, Theme, TokenStore, env_credentials, format_time, is_auth_failure,
+    load_builtin_text, load_builtin_text_shuffled, load_text_from_clipboard, load_text_from_file,
     load_text_from_string, lttb_downsample, osc_font_size_sequence, osc52_clipboard,
     save_text_to_file,
 };
@@ -194,9 +194,10 @@ const FOCUS_THEME: usize = 0;
 const FOCUS_RATIO: usize = 1;
 const FOCUS_BOLD: usize = 2;
 const FOCUS_FONT: usize = 3;
-const FOCUS_INPUT_METHOD: usize = 4;
+const FOCUS_KEYBOARD: usize = 4;
+const FOCUS_INPUT_METHOD: usize = 5;
 /// 设置视图焦点项总数。
-const SETTINGS_FOCUS_COUNT: usize = 5;
+const SETTINGS_FOCUS_COUNT: usize = 6;
 
 /// 输入法预设列表（顺序即轮转顺序）。
 /// 最后一项「自定义」表示用户自行输入任意名称。
@@ -664,6 +665,18 @@ impl App {
     /// 切换字体开关并即时持久化（OSC 序列由事件层在开启时输出）。
     fn toggle_font(&mut self) {
         self.settings.font = !self.settings.font;
+        let _ = self.settings_store.save(&self.settings);
+    }
+
+    /// 切换到下一实时键盘模式并即时持久化。
+    fn next_keyboard_mode(&mut self) {
+        self.settings.keyboard_mode = self.settings.keyboard_mode.next();
+        let _ = self.settings_store.save(&self.settings);
+    }
+
+    /// 切换到上一实时键盘模式并即时持久化。
+    fn prev_keyboard_mode(&mut self) {
+        self.settings.keyboard_mode = self.settings.keyboard_mode.prev();
         let _ = self.settings_store.save(&self.settings);
     }
 
@@ -1324,6 +1337,13 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                                     app.toggle_font();
                                     if app.settings.font {
                                         emit_font_osc();
+                                    }
+                                }
+                                FOCUS_KEYBOARD => {
+                                    if forward {
+                                        app.next_keyboard_mode();
+                                    } else {
+                                        app.prev_keyboard_mode();
                                     }
                                 }
                                 FOCUS_INPUT_METHOD => {
@@ -3642,6 +3662,12 @@ fn render_settings(frame: &mut Frame, app: &App) {
         &palette,
     ));
     lines.push(settings_row(
+        "实时键盘",
+        app.settings.keyboard_mode.name(),
+        focus == FOCUS_KEYBOARD,
+        &palette,
+    ));
+    lines.push(settings_row(
         "输入法",
         input_method_display(&app.settings.input_method),
         focus == FOCUS_INPUT_METHOD,
@@ -3656,7 +3682,7 @@ fn render_settings(frame: &mut Frame, app: &App) {
     lines.push(Line::from(""));
     lines.push(hint_bar_line(" ↑↓ 选择 | ←→ 调整 | Esc 返回 ", &palette));
 
-    let area = centered_rect(frame.area(), 60, 16);
+    let area = centered_rect(frame.area(), 60, 17);
     frame.render_widget(Clear, area);
     let settings_title = Line::from(vec![Span::styled(
         " 设置 ",
@@ -5000,10 +5026,11 @@ mod tests {
 
     #[test]
     fn move_focus_wraps_around() {
-        // SETTINGS_FOCUS_COUNT = 5（主题/占比/粗体/字体/输入法）
-        assert_eq!(move_focus(0, -1), 4); // 第 0 项向前 → 末项（4）
-        assert_eq!(move_focus(4, 1), 0); // 末项向后 → 第 0 项
+        // SETTINGS_FOCUS_COUNT = 6（主题/占比/粗体/字体/实时键盘/输入法）
+        assert_eq!(move_focus(0, -1), 5); // 第 0 项向前 → 末项（5）
+        assert_eq!(move_focus(5, 1), 0); // 末项向后 → 第 0 项
         assert_eq!(move_focus(0, 1), 1);
+        assert_eq!(move_focus(4, 1), 5);
         assert_eq!(move_focus(2, -1), 1);
     }
 
@@ -5040,6 +5067,37 @@ mod tests {
         let last = INPUT_METHOD_CUSTOM;
         let result = cycle_input_method_next(last);
         assert_eq!(result, "");
+    }
+
+    #[test]
+    fn app_keyboard_mode_cycling_and_persistence() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("dazitui-test-app-kb-{stamp}"));
+        let store = SettingsStore::new(temp_dir.join("settings"));
+        let mut app = App::new(load_builtin_text(BUILTIN_SETS[0]));
+        app.settings_store = store.clone();
+
+        assert_eq!(app.settings.keyboard_mode, KeyboardMode::Off);
+        app.next_keyboard_mode();
+        assert_eq!(app.settings.keyboard_mode, KeyboardMode::Staggered);
+        assert_eq!(store.load().keyboard_mode, KeyboardMode::Staggered);
+
+        app.next_keyboard_mode();
+        assert_eq!(app.settings.keyboard_mode, KeyboardMode::Ortholinear);
+        assert_eq!(store.load().keyboard_mode, KeyboardMode::Ortholinear);
+
+        app.next_keyboard_mode();
+        assert_eq!(app.settings.keyboard_mode, KeyboardMode::Off);
+        assert_eq!(store.load().keyboard_mode, KeyboardMode::Off);
+
+        app.prev_keyboard_mode();
+        assert_eq!(app.settings.keyboard_mode, KeyboardMode::Ortholinear);
+        assert_eq!(store.load().keyboard_mode, KeyboardMode::Ortholinear);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[test]
