@@ -145,6 +145,34 @@ impl SessionRecord {
             total_strokes,
         }
     }
+
+    /// 从练习结算生成的 `Stats` 构造练习记录。
+    pub fn from_stats(
+        stats: &crate::session::Stats,
+        elapsed: std::time::Duration,
+        text_title: impl Into<String>,
+        input_scheme: impl Into<String>,
+    ) -> Self {
+        let accuracy = if stats.typed_chars == 0 {
+            1.0
+        } else {
+            stats.correct_chars as f64 / stats.typed_chars as f64
+        };
+        Self::new_with_strokes(
+            elapsed.as_secs_f64(),
+            stats.wpm,
+            accuracy,
+            stats.correct_chars as u32,
+            stats.wrong_chars as u32,
+            stats.edits,
+            stats.typed_chars as u32,
+            text_title,
+            input_scheme,
+            stats.kps,
+            stats.key_length,
+            stats.total_strokes,
+        )
+    }
 }
 
 /// 错字/错词记录项。

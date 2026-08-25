@@ -1022,24 +1022,11 @@ impl App {
 
         // 异步持久化有效练习流水到 SQLite 数据库
         if let Some(worker) = &self.db_worker {
-            let accuracy = if stats.typed_chars == 0 {
-                1.0
-            } else {
-                stats.correct_chars as f64 / stats.typed_chars as f64
-            };
-            let session_record = SessionRecord::new_with_strokes(
-                elapsed.as_secs_f64(),
-                stats.wpm,
-                accuracy,
-                stats.correct_chars as u32,
-                stats.wrong_chars as u32,
-                stats.edits,
-                stats.typed_chars as u32,
+            let session_record = SessionRecord::from_stats(
+                &stats,
+                elapsed,
                 &self.text.title,
                 &self.settings.input_method,
-                stats.kps,
-                stats.key_length,
-                stats.total_strokes,
             );
             let session_id = session_record.id.clone();
             let word_index = self.text.build_word_index();
@@ -3217,28 +3204,40 @@ fn render_wpm_trend_tab(
             Span::styled(" 累计跟打用时: ", Style::default().fg(palette.muted)),
             Span::styled(duration_str, Style::default().bold().fg(palette.fg)),
             Span::raw("    "),
-            Span::styled(" 累计输入字符: ", Style::default().fg(palette.muted)),
+            Span::styled(" 累计输入: ", Style::default().fg(palette.muted)),
             Span::styled(
                 format!("{} 字", summary.total_typed_chars),
                 Style::default().bold().fg(palette.success),
             ),
+            Span::raw("    "),
+            Span::styled(" 累计击数: ", Style::default().fg(palette.muted)),
+            Span::styled(
+                format!("{} 击", summary.total_strokes),
+                Style::default().bold().fg(palette.accent),
+            ),
         ]),
         Line::from(vec![
-            Span::styled(" 历史最高速度: ", Style::default().fg(palette.muted)),
+            Span::styled(" 历史最高: ", Style::default().fg(palette.muted)),
             Span::styled(
                 format!("{:.1} WPM", summary.best_wpm),
                 Style::default().bold().fg(palette.accent),
             ),
             Span::raw("    "),
-            Span::styled(" 历史平均速度: ", Style::default().fg(palette.muted)),
+            Span::styled(" 历史均速: ", Style::default().fg(palette.muted)),
             Span::styled(
                 format!("{:.1} WPM", summary.avg_wpm),
                 Style::default().bold().fg(palette.fg),
             ),
             Span::raw("    "),
-            Span::styled(" 近10场均速: ", Style::default().fg(palette.muted)),
+            Span::styled(" 平均击速: ", Style::default().fg(palette.muted)),
             Span::styled(
-                format!("{:.1} WPM", summary.recent_10_avg_wpm),
+                format!("{:.2} KPS", summary.avg_kps),
+                Style::default().bold().fg(palette.accent),
+            ),
+            Span::raw("    "),
+            Span::styled(" 平均码长: ", Style::default().fg(palette.muted)),
+            Span::styled(
+                format!("{:.2}", summary.avg_key_length),
                 Style::default().bold().fg(palette.success),
             ),
             Span::raw("    "),
@@ -7708,6 +7707,16 @@ mod tests {
         assert_eq!(top_chars.len(), 1);
         assert_eq!(top_chars[0].target_char, '世');
         assert_eq!(top_chars[0].error_count, 1);
+
+        // 校验击键、码长与总击数的持久化
+        assert!(sessions[0].kps > 0.0);
+        assert!(sessions[0].key_length > 0.0);
+        assert_eq!(sessions[0].total_strokes, 6);
+
+        let summary = db.get_global_summary().unwrap();
+        assert!(summary.avg_kps > 0.0);
+        assert!(summary.avg_key_length > 0.0);
+        assert_eq!(summary.total_strokes, 6);
     }
 
     #[test]
@@ -7801,6 +7810,8 @@ mod tests {
         assert!(found_tab3, "Tab 3 should be rendered");
         assert!(found_overview, "Overview summary card should be rendered");
         assert!(found_chart_title, "Chart title should be rendered");
+        assert!(clean.contains("平均击速"), "Overview should contain '平均击速'");
+        assert!(clean.contains("平均码长"), "Overview should contain '平均码长'");
     }
 
     #[test]
