@@ -195,9 +195,66 @@ const FOCUS_RATIO: usize = 1;
 const FOCUS_BOLD: usize = 2;
 const FOCUS_FONT: usize = 3;
 const FOCUS_KEYBOARD: usize = 4;
-const FOCUS_INPUT_METHOD: usize = 5;
+const FOCUS_SCHEME: usize = 5;
+const FOCUS_INPUT_METHOD: usize = 6;
 /// 设置视图焦点项总数。
-const SETTINGS_FOCUS_COUNT: usize = 6;
+const SETTINGS_FOCUS_COUNT: usize = 7;
+
+/// 反查方案预设列表（顺序即轮转顺序）。
+/// 最后一项「自定义」表示用户自行输入任意方案名或文件路径。
+const SCHEME_PRESETS: &[&str] = &[
+    "", // 无（空串）
+    "yoyo-pure",
+    "yoyo-pure-km",
+    "虎码",
+    "五笔86",
+    "五笔98",
+    "小鹤音形",
+    "仓颉",
+    "郑码",
+    "宇浩",
+    "双拼",
+    "全拼",
+    "空明码并击",
+    "拼读并击",
+    "麓鸣并击",
+    "虎码并击",
+    "自定义", // 末项：打开自定义弹窗
+];
+
+/// 预设中「自定义」项的标签。
+const SCHEME_CUSTOM: &str = "自定义";
+
+/// 当前方案在预设列表中是否精确匹配某个预设（排除自定义）。
+fn scheme_preset_index(s: &str) -> usize {
+    SCHEME_PRESETS
+        .iter()
+        .position(|&p| p == s && p != SCHEME_CUSTOM)
+        .unwrap_or(SCHEME_PRESETS.len() - 1)
+}
+
+/// 反查方案设置项的显示标签。
+fn scheme_display(s: &str) -> &str {
+    if s.is_empty() { "无" } else { s }
+}
+
+/// 向前轮转方案预设（← 键）。
+fn cycle_scheme_prev(current: &str) -> String {
+    let idx = scheme_preset_index(current);
+    let prev = if idx == 0 {
+        SCHEME_PRESETS.len() - 1
+    } else {
+        idx - 1
+    };
+    SCHEME_PRESETS[prev].to_string()
+}
+
+/// 向后轮转方案预设（→ 键）。
+fn cycle_scheme_next(current: &str) -> String {
+    let idx = scheme_preset_index(current);
+    let next = (idx + 1) % SCHEME_PRESETS.len();
+    SCHEME_PRESETS[next].to_string()
+}
 
 /// 输入法预设列表（顺序即轮转顺序）。
 /// 最后一项「自定义」表示用户自行输入任意名称。
@@ -552,8 +609,8 @@ struct App {
     /// 乱序开时存乱序版预览（避免每帧重新随机导致闪烁），关时存顺序版预览。
     /// 在 `open_builtin_browser` 与 Up/Down/s 按键时重新生成。
     builtin_preview: Option<(String, String)>,
-    /// 自定义输入法名称弹窗（`None` = 未打开）。
-    input_method_modal: Option<InputMethodModal>,
+    /// 自定义设置文本弹窗（`None` = 未打开）。
+    text_setting_modal: Option<TextSettingModal>,
     /// 自由发文编辑弹窗（`None` = 未打开）。
     free_input_modal: Option<FreeInputModal>,
     /// 实时虚拟键盘状态。
@@ -585,35 +642,58 @@ enum LoginAction {
     Cancel,
 }
 
-/// 自定义输入法模态框按键动作。
+/// 文本设置弹窗目标字段。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextSettingTarget {
+    Scheme,
+    InputMethod,
+}
+
+/// 文本设置模态框按键动作。
 #[derive(Debug, PartialEq, Eq)]
-enum InputMethodModalAction {
+enum TextSettingModalAction {
     None,
-    Save(String),
+    Save(TextSettingTarget, String),
     Cancel,
 }
 
-/// 自定义输入法名称弹窗状态。
-#[derive(Debug, Default)]
-struct InputMethodModal {
+/// 自定义设置文本弹窗状态（用于反查方案路径与输入法名称）。
+#[derive(Debug)]
+struct TextSettingModal {
+    target: TextSettingTarget,
     /// 当前正在编辑的文本。
     input: String,
 }
 
-impl InputMethodModal {
+impl TextSettingModal {
     /// 新建弹窗，预填当前自定义值（若为「无」或预设，则置空）。
-    fn new(current: &str) -> Self {
-        let prefill = if INPUT_METHOD_PRESETS.contains(&current) {
+    fn new(target: TextSettingTarget, current: &str) -> Self {
+        let is_preset = match target {
+            TextSettingTarget::Scheme => SCHEME_PRESETS.contains(&current),
+            TextSettingTarget::InputMethod => INPUT_METHOD_PRESETS.contains(&current),
+        };
+        let prefill = if is_preset {
             String::new()
         } else {
             current.to_string()
         };
-        Self { input: prefill }
+        Self {
+            target,
+            input: prefill,
+        }
     }
 
-    /// 追加字符（自动截断到 20 字符）。
+    /// 最大允许输入字符数。
+    fn max_chars(&self) -> usize {
+        match self.target {
+            TextSettingTarget::Scheme => 128,
+            TextSettingTarget::InputMethod => Settings::INPUT_METHOD_MAX_CHARS,
+        }
+    }
+
+    /// 追加字符。
     fn push_char(&mut self, c: char) {
-        if self.input.chars().count() < Settings::INPUT_METHOD_MAX_CHARS {
+        if self.input.chars().count() < self.max_chars() {
             self.input.push(c);
         }
     }
@@ -624,8 +704,12 @@ impl InputMethodModal {
         chars.next_back();
         self.input = chars.as_str().to_string();
     }
+
     fn commit(&self) -> String {
-        Settings::clamp_input_method(&self.input)
+        match self.target {
+            TextSettingTarget::Scheme => self.input.trim().to_string(),
+            TextSettingTarget::InputMethod => Settings::clamp_input_method(&self.input),
+        }
     }
 }
 
@@ -694,7 +778,7 @@ impl App {
             settings_focus: FOCUS_THEME,
             builtin_shuffle: false,
             builtin_preview: None,
-            input_method_modal: None,
+            text_setting_modal: None,
             free_input_modal: None,
             live_keyboard: LiveKeyboard::new(),
             scheme_dict: None,
@@ -704,9 +788,9 @@ impl App {
         app
     }
 
-    /// 根据当前设置中的输入法名称与自定义码表路径重新加载方案码表。
+    /// 根据当前设置中的反查方案名称或路径与自定义码表路径重新加载方案码表。
     pub fn reload_scheme_dict(&mut self) {
-        let scheme_name = &self.settings.input_method;
+        let scheme_name = &self.settings.scheme;
         let custom_paths = &self.settings.scheme_dict_paths;
         if let Some(path) = SchemeDict::resolve_scheme_path(scheme_name, custom_paths) {
             self.scheme_dict = SchemeDict::load_from_file(&path).ok();
@@ -1287,20 +1371,28 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                     }
                     continue;
                 }
-                // 自定义输入法弹窗打开时优先处理其按键。
-                if let Some(modal) = app.input_method_modal.as_mut() {
-                    let action = input_method_modal_input(modal, key);
+                // 自定义设置文本弹窗（方案/输入法）打开时优先处理其按键。
+                if let Some(modal) = app.text_setting_modal.as_mut() {
+                    let action = text_setting_modal_input(modal, key);
                     match action {
-                        InputMethodModalAction::Cancel => {
-                            app.input_method_modal = None;
+                        TextSettingModalAction::Cancel => {
+                            app.text_setting_modal = None;
                         }
-                        InputMethodModalAction::Save(value) => {
-                            app.input_method_modal = None;
-                            app.settings.input_method = value;
-                            let _ = app.settings_store.save(&app.settings);
-                            app.reload_scheme_dict();
+                        TextSettingModalAction::Save(target, value) => {
+                            app.text_setting_modal = None;
+                            match target {
+                                TextSettingTarget::Scheme => {
+                                    app.settings.scheme = value;
+                                    let _ = app.settings_store.save(&app.settings);
+                                    app.reload_scheme_dict();
+                                }
+                                TextSettingTarget::InputMethod => {
+                                    app.settings.input_method = value;
+                                    let _ = app.settings_store.save(&app.settings);
+                                }
+                            }
                         }
-                        InputMethodModalAction::None => {}
+                        TextSettingModalAction::None => {}
                     }
                     continue;
                 }
@@ -1475,6 +1567,16 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                                         app.prev_keyboard_mode();
                                     }
                                 }
+                                FOCUS_SCHEME => {
+                                    let next = if forward {
+                                        cycle_scheme_next(&app.settings.scheme)
+                                    } else {
+                                        cycle_scheme_prev(&app.settings.scheme)
+                                    };
+                                    app.settings.scheme = next;
+                                    let _ = app.settings_store.save(&app.settings);
+                                    app.reload_scheme_dict();
+                                }
                                 FOCUS_INPUT_METHOD => {
                                     let next = if forward {
                                         cycle_input_method_next(&app.settings.input_method)
@@ -1483,18 +1585,23 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                                     };
                                     app.settings.input_method = next;
                                     let _ = app.settings_store.save(&app.settings);
-                                    app.reload_scheme_dict();
                                 }
                                 _ => {}
                             }
                         }
                         KeyCode::Enter => {
-                            if app.settings_focus == FOCUS_INPUT_METHOD
+                            if app.settings_focus == FOCUS_SCHEME
+                                && scheme_preset_index(&app.settings.scheme)
+                                    == SCHEME_PRESETS.len() - 1
+                            {
+                                app.text_setting_modal =
+                                    Some(TextSettingModal::new(TextSettingTarget::Scheme, &app.settings.scheme));
+                            } else if app.settings_focus == FOCUS_INPUT_METHOD
                                 && input_method_preset_index(&app.settings.input_method)
                                     == INPUT_METHOD_PRESETS.len() - 1
                             {
-                                app.input_method_modal =
-                                    Some(InputMethodModal::new(&app.settings.input_method));
+                                app.text_setting_modal =
+                                    Some(TextSettingModal::new(TextSettingTarget::InputMethod, &app.settings.input_method));
                             }
                         }
                         KeyCode::Esc => app.state = AppState::Typing,
@@ -1603,7 +1710,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                     }
                     continue;
                 }
-                if let Some(modal) = app.input_method_modal.as_mut() {
+                if let Some(modal) = app.text_setting_modal.as_mut() {
                     for c in committed.chars() {
                         modal.push_char(c);
                     }
@@ -2147,20 +2254,20 @@ fn login_input(form: &mut LoginForm, key: KeyEvent) -> LoginAction {
     }
 }
 
-/// 处理自定义输入法模态框按键，返回动作。
-fn input_method_modal_input(modal: &mut InputMethodModal, key: KeyEvent) -> InputMethodModalAction {
+/// 处理自定义设置模态框按键，返回动作。
+fn text_setting_modal_input(modal: &mut TextSettingModal, key: KeyEvent) -> TextSettingModalAction {
     match key.code {
-        KeyCode::Esc => InputMethodModalAction::Cancel,
-        KeyCode::Enter => InputMethodModalAction::Save(modal.commit()),
+        KeyCode::Esc => TextSettingModalAction::Cancel,
+        KeyCode::Enter => TextSettingModalAction::Save(modal.target, modal.commit()),
         KeyCode::Backspace => {
             modal.pop_char();
-            InputMethodModalAction::None
+            TextSettingModalAction::None
         }
         KeyCode::Char(c) => {
             modal.push_char(c);
-            InputMethodModalAction::None
+            TextSettingModalAction::None
         }
-        _ => InputMethodModalAction::None,
+        _ => TextSettingModalAction::None,
     }
 }
 
@@ -2356,8 +2463,8 @@ fn ui(frame: &mut Frame, app: &App) {
     if let Some(form) = &app.login_form {
         render_login_modal(frame, form, &palette, app.theme());
     }
-    if let Some(modal) = &app.input_method_modal {
-        render_input_method_modal(frame, modal, &palette, app.theme());
+    if let Some(modal) = &app.text_setting_modal {
+        render_text_setting_modal(frame, modal, &palette, app.theme());
     }
     if let Some(modal) = &app.free_input_modal {
         render_free_input_modal(frame, modal, &palette, app.theme());
@@ -2407,28 +2514,40 @@ fn render_login_modal(frame: &mut Frame, form: &LoginForm, palette: &ThemePalett
     );
 }
 
-/// 自定义输入法名称弹窗：居中弹层，单行文本输入。
-fn render_input_method_modal(
+/// 自定义设置文本弹窗（方案路径 / 输入法名称）：居中弹层，单行文本输入。
+fn render_text_setting_modal(
     frame: &mut Frame,
-    modal: &InputMethodModal,
+    modal: &TextSettingModal,
     palette: &ThemePalette,
     _theme: Theme,
 ) {
-    let area = centered_rect(frame.area(), 50, 7);
+    let (title, hint_line) = match modal.target {
+        TextSettingTarget::Scheme => (
+            " 自定义反查方案/路径 ",
+            Line::from(" 支持方案名或 .schema.yaml / .dict.yaml 文件绝对路径").fg(palette.muted),
+        ),
+        TextSettingTarget::InputMethod => {
+            let remaining = Settings::INPUT_METHOD_MAX_CHARS.saturating_sub(modal.input.chars().count());
+            (
+                " 自定义上传输入法名称 ",
+                Line::from(format!(" 还可输入 {remaining} 字（52dazi 上报展示）")).fg(palette.fg),
+            )
+        }
+    };
+    let area = centered_rect(frame.area(), 54, 7);
     frame.render_widget(Clear, area);
-    let remaining = Settings::INPUT_METHOD_MAX_CHARS - modal.input.chars().count();
     let lines = vec![
-        Line::from(" 自定义输入法 ").bold().fg(palette.fg),
+        Line::from(title).bold().fg(palette.fg),
         Line::from(""),
         Line::from(format!(" ▸ {}", modal.input))
             .fg(palette.accent)
             .bold(),
         Line::from(""),
-        Line::from(format!(" 还可输入 {remaining} 字")).fg(palette.fg),
+        hint_line,
         hint_bar_line(" Enter 保存 | Esc 取消 ", palette),
     ];
     let block = themed_block(palette, true)
-        .title(" 自定义输入法 ")
+        .title(title)
         .style(Style::default().bg(palette.bg).fg(palette.fg));
     frame.render_widget(
         Paragraph::new(lines)
@@ -3231,7 +3350,7 @@ fn render_heatmap_tab(
             .unwrap_or_default(),
         HeatmapSource::SchemeProjected => {
             let custom_paths = &app.settings.scheme_dict_paths;
-            let scheme_name = &app.settings.input_method;
+            let scheme_name = &app.settings.scheme;
             if let Some(path) = SchemeDict::resolve_scheme_path(scheme_name, custom_paths) {
                 if let Ok(dict) = SchemeDict::load_from_file(&path) {
                     scheme_dict_loaded = true;
@@ -3280,12 +3399,12 @@ fn render_heatmap_tab(
     let scheme_status_str = if source == HeatmapSource::SchemeProjected {
         if scheme_dict_loaded {
             format!("已加载码表: {dict_path_display}")
-        } else if app.settings.input_method.is_empty() {
-            "未配置输入法方案（按 Ctrl-E 设置）".to_string()
+        } else if app.settings.scheme.is_empty() {
+            "未配置反查方案（按 Ctrl-E 设置）".to_string()
         } else {
             format!(
                 "未找到方案 [{}] 码表文件 (可放至 ~/.config/dazitui/schemes/)，当前回退物理击键",
-                app.settings.input_method
+                app.settings.scheme
             )
         }
     } else {
@@ -3850,7 +3969,13 @@ fn render_settings(frame: &mut Frame, app: &App) {
         &palette,
     ));
     lines.push(settings_row(
-        "输入法",
+        "反查方案",
+        scheme_display(&app.settings.scheme),
+        focus == FOCUS_SCHEME,
+        &palette,
+    ));
+    lines.push(settings_row(
+        "上传名称",
         input_method_display(&app.settings.input_method),
         focus == FOCUS_INPUT_METHOD,
         &palette,
@@ -3864,7 +3989,7 @@ fn render_settings(frame: &mut Frame, app: &App) {
     lines.push(Line::from(""));
     lines.push(hint_bar_line(" ↑↓ 选择 | ←→ 调整 | Esc 返回 ", &palette));
 
-    let area = centered_rect(frame.area(), 60, 17);
+    let area = centered_rect(frame.area(), 60, 18);
     frame.render_widget(Clear, area);
     let settings_title = Line::from(vec![Span::styled(
         " 设置 ",
@@ -5421,11 +5546,11 @@ mod tests {
 
     #[test]
     fn move_focus_wraps_around() {
-        // SETTINGS_FOCUS_COUNT = 6（主题/占比/粗体/字体/实时键盘/输入法）
-        assert_eq!(move_focus(0, -1), 5); // 第 0 项向前 → 末项（5）
-        assert_eq!(move_focus(5, 1), 0); // 末项向后 → 第 0 项
+        // SETTINGS_FOCUS_COUNT = 7（主题/占比/粗体/字体/实时键盘/反查方案/上传名称）
+        assert_eq!(move_focus(0, -1), 6); // 第 0 项向前 → 末项（6）
+        assert_eq!(move_focus(6, 1), 0); // 末项向后 → 第 0 项
         assert_eq!(move_focus(0, 1), 1);
-        assert_eq!(move_focus(4, 1), 5);
+        assert_eq!(move_focus(5, 1), 6);
         assert_eq!(move_focus(2, -1), 1);
     }
 
@@ -5522,26 +5647,48 @@ mod tests {
     }
 
     #[test]
-    fn input_method_modal_new_prefills_custom_and_clears_preset() {
-        assert_eq!(InputMethodModal::new("").input, "");
-        assert_eq!(InputMethodModal::new("虎码").input, "");
-        assert_eq!(InputMethodModal::new("自定义").input, "");
-        assert_eq!(InputMethodModal::new("我的自定义码").input, "我的自定义码");
+    fn scheme_display_and_cycling_tests() {
+        assert_eq!(scheme_display(""), "无");
+        assert_eq!(scheme_display("yoyo-pure"), "yoyo-pure");
+
+        assert_eq!(cycle_scheme_prev(""), SCHEME_CUSTOM);
+        assert_eq!(cycle_scheme_next(""), "yoyo-pure");
+        assert_eq!(cycle_scheme_prev("yoyo-pure"), "");
+        assert_eq!(cycle_scheme_next("自定义"), "");
+        assert_eq!(cycle_scheme_next("my_custom_scheme"), "");
     }
 
     #[test]
-    fn input_method_modal_push_char_clamps_to_20_chars() {
-        let mut modal = InputMethodModal::default();
+    fn text_setting_modal_new_prefills_custom_and_clears_preset() {
+        assert_eq!(TextSettingModal::new(TextSettingTarget::InputMethod, "").input, "");
+        assert_eq!(TextSettingModal::new(TextSettingTarget::InputMethod, "虎码").input, "");
+        assert_eq!(TextSettingModal::new(TextSettingTarget::InputMethod, "自定义").input, "");
+        assert_eq!(TextSettingModal::new(TextSettingTarget::InputMethod, "我的自定义码").input, "我的自定义码");
+
+        assert_eq!(TextSettingModal::new(TextSettingTarget::Scheme, "").input, "");
+        assert_eq!(TextSettingModal::new(TextSettingTarget::Scheme, "yoyo-pure").input, "");
+        assert_eq!(TextSettingModal::new(TextSettingTarget::Scheme, "/path/to/custom.schema.yaml").input, "/path/to/custom.schema.yaml");
+    }
+
+    #[test]
+    fn text_setting_modal_push_char_clamps() {
+        let mut modal = TextSettingModal::new(TextSettingTarget::InputMethod, "");
         for _ in 0..25 {
             modal.push_char('字');
         }
         assert_eq!(modal.input.chars().count(), 20);
         assert_eq!(modal.input, "字".repeat(20));
+
+        let mut scheme_modal = TextSettingModal::new(TextSettingTarget::Scheme, "");
+        for _ in 0..50 {
+            scheme_modal.push_char('a');
+        }
+        assert_eq!(scheme_modal.input.chars().count(), 50);
     }
 
     #[test]
-    fn input_method_modal_pop_char_removes_last_unicode_char() {
-        let mut modal = InputMethodModal::new("虎码输入");
+    fn text_setting_modal_pop_char_removes_last_unicode_char() {
+        let mut modal = TextSettingModal::new(TextSettingTarget::InputMethod, "虎码输入");
         modal.pop_char();
         assert_eq!(modal.input, "虎码输");
         modal.pop_char();
@@ -5553,8 +5700,8 @@ mod tests {
     }
 
     #[test]
-    fn input_method_modal_commit_trims_and_returns_empty_for_blanks() {
-        let mut modal = InputMethodModal::default();
+    fn text_setting_modal_commit_trims_and_returns_empty_for_blanks() {
+        let mut modal = TextSettingModal::new(TextSettingTarget::InputMethod, "");
         assert_eq!(modal.commit(), "");
         modal.input = "   ".into();
         assert_eq!(modal.commit(), "");
@@ -5563,48 +5710,48 @@ mod tests {
     }
 
     #[test]
-    fn input_method_modal_input_actions() {
-        let mut modal = InputMethodModal::default();
+    fn text_setting_modal_input_actions() {
+        let mut modal = TextSettingModal::new(TextSettingTarget::InputMethod, "");
         // 输入字符
         assert_eq!(
-            input_method_modal_input(
+            text_setting_modal_input(
                 &mut modal,
                 KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)
             ),
-            InputMethodModalAction::None
+            TextSettingModalAction::None
         );
         assert_eq!(
-            input_method_modal_input(
+            text_setting_modal_input(
                 &mut modal,
                 KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE)
             ),
-            InputMethodModalAction::None
+            TextSettingModalAction::None
         );
         assert_eq!(modal.input, "ab");
 
         // 退格
         assert_eq!(
-            input_method_modal_input(
+            text_setting_modal_input(
                 &mut modal,
                 KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)
             ),
-            InputMethodModalAction::None
+            TextSettingModalAction::None
         );
         assert_eq!(modal.input, "a");
 
         // 回车保存
         assert_eq!(
-            input_method_modal_input(
+            text_setting_modal_input(
                 &mut modal,
                 KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
             ),
-            InputMethodModalAction::Save("a".into())
+            TextSettingModalAction::Save(TextSettingTarget::InputMethod, "a".into())
         );
 
         // Esc 取消
         assert_eq!(
-            input_method_modal_input(&mut modal, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
-            InputMethodModalAction::Cancel
+            text_setting_modal_input(&mut modal, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            TextSettingModalAction::Cancel
         );
     }
 
@@ -7352,7 +7499,8 @@ mod tests {
         assert!(clean.contains("对照区占比:"));
         assert!(clean.contains("粗体:"));
         assert!(clean.contains("字体:"));
-        assert!(clean.contains("输入法:"));
+        assert!(clean.contains("反查方案:"));
+        assert!(clean.contains("上传名称:"));
     }
 
     #[test]

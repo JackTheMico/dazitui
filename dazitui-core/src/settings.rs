@@ -277,6 +277,8 @@ pub struct Settings {
     pub font: bool,
     /// 实时键盘显示模式。
     pub keyboard_mode: KeyboardMode,
+    /// 本地码表与指法方案名称或文件路径（用于反查与实时键盘指法映射）。
+    pub scheme: String,
     /// 输入法名称（上传与分享携带）；空串表示不配置（显示「无」）。
     /// 最多 20 字符（遵守 52dazi 协议限制）。
     pub input_method: String,
@@ -312,6 +314,7 @@ impl Default for Settings {
             bold: false,
             font: false,
             keyboard_mode: KeyboardMode::Off,
+            scheme: String::new(),
             input_method: String::new(),
             scheme_dict_paths: HashMap::new(),
         }
@@ -361,12 +364,13 @@ impl SettingsStore {
             std::fs::create_dir_all(parent)?;
         }
         let mut content = format!(
-            "theme={}\nreference_ratio={}\nbold={}\nfont={}\nkeyboard_mode={}\ninput_method={}\n",
+            "theme={}\nreference_ratio={}\nbold={}\nfont={}\nkeyboard_mode={}\nscheme={}\ninput_method={}\n",
             settings.theme.as_str(),
             settings.reference_ratio,
             settings.bold,
             settings.font,
             settings.keyboard_mode.as_str(),
+            settings.scheme,
             settings.input_method,
         );
         for (scheme, path) in &settings.scheme_dict_paths {
@@ -381,6 +385,7 @@ impl SettingsStore {
         let Ok(raw) = std::fs::read_to_string(&self.path) else {
             return settings;
         };
+        let mut has_scheme_line = false;
         for line in raw.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -408,6 +413,10 @@ impl SettingsStore {
                         settings.keyboard_mode = mode;
                     }
                 }
+                "scheme" => {
+                    has_scheme_line = true;
+                    settings.scheme = value.to_string();
+                }
                 "input_method" => {
                     settings.input_method = Settings::clamp_input_method(value);
                 }
@@ -422,6 +431,10 @@ impl SettingsStore {
                     }
                 }
             }
+        }
+        // 向后兼容迁移：如果旧配置文件只包含 input_method，而没有 scheme 行，则 scheme 继承 input_method
+        if !has_scheme_line && !settings.input_method.is_empty() {
+            settings.scheme = settings.input_method.clone();
         }
         settings
     }
@@ -571,11 +584,43 @@ mod tests {
             bold: true,
             font: false,
             keyboard_mode: KeyboardMode::Staggered,
+            scheme: "yoyo-pure".to_string(),
             input_method: "虎码".to_string(),
             scheme_dict_paths,
         };
         store.save(&s).unwrap();
         assert_eq!(store.load(), s);
+        let _ = std::fs::remove_file(store.path());
+    }
+
+    #[test]
+    fn store_migration_from_legacy_input_method_only() {
+        // 旧版本只有 input_method=虎码，无 scheme 行；读取后 scheme 自动继承 "虎码"
+        let store = SettingsStore::new(temp_path("legacy_migration"));
+        std::fs::write(
+            store.path(),
+            "theme=default\nreference_ratio=62\ninput_method=虎码\n",
+        )
+        .unwrap();
+        let loaded = store.load();
+        assert_eq!(loaded.input_method, "虎码");
+        assert_eq!(loaded.scheme, "虎码");
+        let _ = std::fs::remove_file(store.path());
+    }
+
+    #[test]
+    fn store_scheme_and_input_method_independent() {
+        // scheme 是文件路径，input_method 是展示名称，两者完全独立
+        let store = SettingsStore::new(temp_path("independent"));
+        let s = Settings {
+            scheme: "/home/user/schemes/yoyo-pure.schema.yaml".to_string(),
+            input_method: "麓鸣·纯形·六脉".to_string(),
+            ..Default::default()
+        };
+        store.save(&s).unwrap();
+        let loaded = store.load();
+        assert_eq!(loaded.scheme, "/home/user/schemes/yoyo-pure.schema.yaml");
+        assert_eq!(loaded.input_method, "麓鸣·纯形·六脉");
         let _ = std::fs::remove_file(store.path());
     }
 
