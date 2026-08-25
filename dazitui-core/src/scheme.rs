@@ -312,11 +312,13 @@ impl SchemeDict {
     /// - 过滤手区修饰符（'_', '+', '-', '\'', '/'）与空白符；
     /// - 每个独立逻辑码元（无论单键还是并击码元，如 '.' 对应 xv，'W' 对应 vw，'Q' 对应 esf）严格计为 1 击。
     pub fn calculate_code_strokes(code: &str) -> u32 {
-        let count = code
+        if code.is_empty() {
+            return 0;
+        }
+        code
             .chars()
             .filter(|&c| c != '_' && c != '+' && c != '-' && c != '\'' && c != '/' && !c.is_whitespace())
-            .count() as u32;
-        count.max(1)
+            .count() as u32
     }
 
     /// 解析指定文本对应的物理击数与展开的按键列表。
@@ -324,8 +326,11 @@ impl SchemeDict {
     /// - 若在方案码表中命中词条：通过编码码元计算真实击数（并击算 1 击），并展开物理按键；
     /// - 若未命中（ASCII、标点或无方案）：按字符数计算击数（每个字符 1 击）。
     pub fn resolve_strokes_and_keys(&self, text: &str) -> (u32, Vec<String>) {
+        if text.is_empty() {
+            return (0, Vec::new());
+        }
         if let Some(code) = self.get_primary_code(text) {
-            let strokes = Self::calculate_code_strokes(code);
+            let strokes = Self::calculate_code_strokes(code).max(1);
             let keys = self.decompose_code(code);
             (strokes, keys)
         } else {
@@ -1129,7 +1134,7 @@ algebra:
         assert_eq!(SchemeDict::calculate_code_strokes("wCs"), 3);
         assert_eq!(SchemeDict::calculate_code_strokes("ggll"), 4);
         assert_eq!(SchemeDict::calculate_code_strokes("+e"), 1);
-        assert_eq!(SchemeDict::calculate_code_strokes(""), 1);
+        assert_eq!(SchemeDict::calculate_code_strokes(""), 0);
 
         let mut dict = SchemeDict::default();
         dict.add_entry("到", "_.");

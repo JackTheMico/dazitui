@@ -107,6 +107,11 @@ pub fn build_upload_payload(
     } else {
         stats.correct_chars as f64 / stats.typed_chars as f64 * 100.0
     };
+    let strokes = if stats.total_strokes > 0 {
+        stats.total_strokes
+    } else {
+        total_keys
+    };
     serde_json::json!({
         "textTitle": text.title,
         "speed": upload.speed,
@@ -116,7 +121,7 @@ pub fn build_upload_payload(
         "typingTime": format_time(elapsed),
         "huiGai": stats.edits,
         "huiChe": 0,
-        "jianShu": total_keys,
+        "jianShu": strokes,
         "jianZhun": format!("{:.2}%", accuracy_pct),
         "accuracy": accuracy_pct,
         "repeatNum": 0,
@@ -328,6 +333,7 @@ mod tests {
     fn build_upload_payload_backspace_from_key_frequency() {
         let mut stats = sample_stats();
         stats.key_frequency.push(("Backspace".to_string(), 7));
+        stats.total_strokes += 7;
         let up = UploadStats {
             speed: 1.0,
             keystrokes: 1.0,

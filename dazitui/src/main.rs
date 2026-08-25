@@ -2394,26 +2394,28 @@ fn ui(frame: &mut Frame, app: &App) {
         if !app.session.is_empty() {
             let elapsed = app.current_elapsed();
             let metrics = app.session.realtime_metrics(elapsed);
+            let (rolling_wpm_str, rolling_kps_str) = if app.paused {
+                (" (0) ".to_string(), " (0.0) ".to_string())
+            } else {
+                (
+                    format!(" ({:.0}) ", metrics.rolling_wpm),
+                    format!(" ({:.1}) ", metrics.rolling_kps),
+                )
+            };
             let mut spans = vec![
                 Span::styled(" WPM ", Style::default().fg(palette.muted)),
                 Span::styled(
                     format!("{:.1}", metrics.cumulative_wpm),
                     Style::default().fg(palette.accent).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(
-                    format!(" ({:.0}) ", metrics.rolling_wpm),
-                    Style::default().fg(palette.fg),
-                ),
+                Span::styled(rolling_wpm_str, Style::default().fg(palette.fg)),
                 Span::styled("· ", Style::default().fg(palette.muted)),
                 Span::styled("击键 ", Style::default().fg(palette.muted)),
                 Span::styled(
                     format!("{:.1}", metrics.cumulative_kps),
                     Style::default().fg(palette.accent).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(
-                    format!(" ({:.1}) ", metrics.rolling_kps),
-                    Style::default().fg(palette.fg),
-                ),
+                Span::styled(rolling_kps_str, Style::default().fg(palette.fg)),
             ];
             if app.paused {
                 spans.push(Span::styled("[暂停] ", Style::default().fg(palette.warning)));
@@ -8185,8 +8187,49 @@ mod tests {
             .collect();
         assert!(clean_typing.contains("WPM"));
         assert!(clean_typing.contains("击键"));
+
+        // 3. 暂停态（按 Tab / 调用 pause()）：显示 [暂停] 徽标且即时瞬时值锁定为 (0)
+        app.pause();
+        let mut term_paused = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        term_paused.draw(|f| ui(f, &app)).unwrap();
+        let buffer3 = term_paused.backend().buffer();
+        let paused_content = (0..buffer3.area.height)
+            .map(|y| {
+                (0..buffer3.area.width)
+                    .map(|x| buffer3[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let clean_paused: String = paused_content
+            .chars()
+            .filter(|c| *c != ' ' && *c != '─')
+            .collect();
+        assert!(clean_paused.contains("[暂停]"));
+        assert!(clean_paused.contains("(0)"));
+
+        // 4. 恢复打字（调用 resume()）：徽标消失，指标正常续接
+        app.resume();
+        let mut term_resumed = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        term_resumed.draw(|f| ui(f, &app)).unwrap();
+        let buffer4 = term_resumed.backend().buffer();
+        let resumed_content = (0..buffer4.area.height)
+            .map(|y| {
+                (0..buffer4.area.width)
+                    .map(|x| buffer4[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let clean_resumed: String = resumed_content
+            .chars()
+            .filter(|c| *c != ' ' && *c != '─')
+            .collect();
+        assert!(!clean_resumed.contains("[暂停]"));
+        assert!(clean_resumed.contains("WPM"));
     }
 }
+
 
 
 
