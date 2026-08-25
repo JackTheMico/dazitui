@@ -5472,8 +5472,14 @@ mod tests {
             .as_nanos();
         let temp_dir = std::env::temp_dir().join(format!("dazitui-test-app-kb-{stamp}"));
         let store = SettingsStore::new(temp_dir.join("settings"));
-        let mut app = App::new(load_builtin_text(BUILTIN_SETS[0]));
-        app.settings_store = store.clone();
+        let token_store = temp_token_store();
+        let mut app = App::new_with(
+            load_builtin_text(BUILTIN_SETS[0]),
+            token_store.clone(),
+            ApiClient::with_base_url_and_store("http://127.0.0.1:1", Some(token_store)),
+            store.clone(),
+            None,
+        );
 
         assert_eq!(app.settings.keyboard_mode, KeyboardMode::Off);
         app.next_keyboard_mode();
