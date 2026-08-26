@@ -11,7 +11,7 @@ use dazitui_core::{
     LoadOptions, Rgb, SchemeDict, Session, SessionRecord, Settings, SettingsStore, Stats, StatsDb,
     Text, TextSource, Theme, TokenStore, env_credentials, format_time, is_auth_failure,
     load_builtin_text, load_builtin_text_shuffled, load_text_from_clipboard, load_text_from_file,
-    load_text_from_string, lttb_downsample, osc52_clipboard,
+    load_text_from_string, lttb_downsample, osc52_clipboard, prewarm_segmenter,
     save_text_to_file,
 };
 use ratatui::Frame;
@@ -737,6 +737,10 @@ impl TextSettingModal {
 
 impl App {
     fn new(text: Text) -> Self {
+        std::thread::Builder::new()
+            .name("dazitui-prewarm".into())
+            .spawn(prewarm_segmenter)
+            .ok();
         Self::new_with(
             text,
             TokenStore::with_default_path(),
@@ -1426,6 +1430,10 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                     app.open_login();
                     continue;
                 }
+                let mut key = key;
+                if !matches!(app.state, AppState::Typing) || app.session.is_empty() || app.paused {
+                    normalize_key(&mut key);
+                }
                 match app.state {
                     AppState::Typing => {
                         if !app.session.is_empty() && !app.paused {
@@ -1933,6 +1941,16 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                     }
                     continue;
                 }
+                if matches!(app.state, AppState::Finished { .. }) {
+                    for c in committed.chars() {
+                        let norm_c = normalize_char(c);
+                        let key = KeyEvent::new(KeyCode::Char(norm_c), KeyModifiers::NONE);
+                        if handle_finished_key(&mut app, key) {
+                            break;
+                        }
+                    }
+                    continue;
+                }
                 if matches!(app.state, AppState::Typing) {
                     app.touch_typing();
                     let elapsed = app.current_elapsed();
@@ -2394,6 +2412,23 @@ fn handle_finished_key(app: &mut App, key: KeyEvent) -> bool {
             true
         }
         _ => false,
+    }
+}
+
+/// 将全角 ASCII 字符（U+FF01~U+FF5E）转换为标准半角 ASCII 字符，防止在输入法处于全角模式时快捷键失效。
+fn normalize_char(c: char) -> char {
+    let u = c as u32;
+    if (0xFF01..=0xFF5E).contains(&u) {
+        char::from_u32(u - 0xFEE0).unwrap_or(c)
+    } else {
+        c
+    }
+}
+
+/// 规范化按键事件中的字符代码。
+fn normalize_key(key: &mut KeyEvent) {
+    if let KeyCode::Char(c) = key.code {
+        key.code = KeyCode::Char(normalize_char(c));
     }
 }
 
@@ -9656,6 +9691,51 @@ mod tests {
         assert_eq!(app.session.len(), 1);
         assert!(!app.session.is_empty());
         assert_eq!(app.session.display(), vec![('q', CharStatus::Correct)]);
+    }
+
+    #[test]
+    fn fullwidth_char_normalization_and_finished_key_handling() {
+        assert_eq!(normalize_char('ｓ'), 's');
+        assert_eq!(normalize_char('ｆ'), 'f');
+        assert_eq!(normalize_char('ｂ'), 'b');
+        assert_eq!(normalize_char('ｉ'), 'i');
+        assert_eq!(normalize_char('１'), '1');
+        assert_eq!(normalize_char('s'), 's');
+
+        let mut app = test_app(file_text("测试"));
+        app.state = AppState::Finished {
+            stats: app.session.finish(Duration::from_secs(5)),
+            upload: UploadState::NotApplicable,
+            elapsed: Duration::from_secs(5),
+        };
+
+        // 测试全角 'ｓ' 触发进入统计视图
+        let mut key_s = KeyEvent::new(KeyCode::Char('ｓ'), KeyModifiers::NONE);
+        normalize_key(&mut key_s);
+        assert!(handle_finished_key(&mut app, key_s));
+        assert!(matches!(app.state, AppState::Stats(_)));
+
+        // 返回成绩视图后测试全角 'ｆ' 触发进入文件浏览
+        app.state = AppState::Finished {
+            stats: app.session.finish(Duration::from_secs(5)),
+            upload: UploadState::NotApplicable,
+            elapsed: Duration::from_secs(5),
+        };
+        let mut key_f = KeyEvent::new(KeyCode::Char('ｆ'), KeyModifiers::NONE);
+        normalize_key(&mut key_f);
+        assert!(handle_finished_key(&mut app, key_f));
+        assert!(matches!(app.state, AppState::Browsing));
+
+        // 返回成绩视图后测试全角 'ｉ' 触发进入自由发文
+        app.state = AppState::Finished {
+            stats: app.session.finish(Duration::from_secs(5)),
+            upload: UploadState::NotApplicable,
+            elapsed: Duration::from_secs(5),
+        };
+        let mut key_i = KeyEvent::new(KeyCode::Char('ｉ'), KeyModifiers::NONE);
+        normalize_key(&mut key_i);
+        assert!(handle_finished_key(&mut app, key_i));
+        assert!(app.free_input_modal.is_some());
     }
 
     #[test]

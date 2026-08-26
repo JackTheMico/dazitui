@@ -16,7 +16,7 @@ pub use db::{
 };
 pub use lttb::lttb_downsample;
 pub use scheme::{ChordAlgebra, RimeSchemaResolver, SchemeDict, YamlValue, parse_rime_yaml};
-pub use segmenter::{WordIndex, WordToken};
+pub use segmenter::{WordIndex, WordToken, prewarm_segmenter};
 pub use session::{CharStatus, ErrorPoint, ErrorType, GROUP_SIZE, Session, Stats, TypeResult};
 pub use settings::{
     FONT_SIZE_PT, HeatmapLayout, KeyboardMode, Rgb, Settings, SettingsStore, Theme, ThemePreset,

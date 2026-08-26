@@ -3,10 +3,16 @@
 //! 在载文时对赛文建立每个字符位置到词汇词条的映射 (CharIndex -> WordToken)。
 //! 支持内置词组赛文原生词边界与通用/在线文章 Jieba 分词索引。
 
+use std::collections::HashMap;
 use std::sync::LazyLock;
 use jieba_rs::Jieba;
 
 static JIEBA: LazyLock<Jieba> = LazyLock::new(Jieba::new);
+
+/// 异步/后台预热 Jieba 分词器，避免在主事件循环中首次分词时发生冷启动阻塞。
+pub fn prewarm_segmenter() {
+    let _ = LazyLock::force(&JIEBA);
+}
 
 /// 赛文中单词/词组的切分单元。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,6 +30,8 @@ pub struct WordToken {
 pub struct WordIndex {
     /// 每个字符下标对应的词单元 (长度等于文本字符总数)
     char_to_token: Vec<Option<WordToken>>,
+    /// 字符到包含该字符的词汇的高速哈希映射 ($O(1)$ 查找)
+    char_lookup: HashMap<char, String>,
 }
 
 impl WordIndex {
@@ -35,6 +43,7 @@ impl WordIndex {
         let chars: Vec<char> = text.chars().collect();
         let total_chars = chars.len();
         let mut char_to_token: Vec<Option<WordToken>> = vec![None; total_chars];
+        let mut char_lookup = HashMap::new();
 
         if is_builtin_words {
             let mut word_start = None;
@@ -43,12 +52,15 @@ impl WordIndex {
                     if let Some(start) = word_start {
                         let word: String = chars[start..idx].iter().collect();
                         let token = WordToken {
-                            word,
+                            word: word.clone(),
                             start_char_idx: start,
                             end_char_idx: idx,
                         };
                         for slot in &mut char_to_token[start..idx] {
                             *slot = Some(token.clone());
+                        }
+                        for c in word.chars() {
+                            char_lookup.entry(c).or_insert_with(|| word.clone());
                         }
                         word_start = None;
                     }
@@ -59,12 +71,15 @@ impl WordIndex {
             if let Some(start) = word_start {
                 let word: String = chars[start..total_chars].iter().collect();
                 let token = WordToken {
-                    word,
+                    word: word.clone(),
                     start_char_idx: start,
                     end_char_idx: total_chars,
                 };
                 for slot in &mut char_to_token[start..total_chars] {
                     *slot = Some(token.clone());
+                }
+                for c in word.chars() {
+                    char_lookup.entry(c).or_insert_with(|| word.clone());
                 }
             }
         } else {
@@ -85,11 +100,17 @@ impl WordIndex {
                             *slot = Some(token.clone());
                         }
                     }
+                    for c in word.chars() {
+                        char_lookup.entry(c).or_insert_with(|| word.to_string());
+                    }
                 }
             }
         }
 
-        Self { char_to_token }
+        Self {
+            char_to_token,
+            char_lookup,
+        }
     }
 
     /// 根据发生错误时的字符下标，获取所归因的错词（若无归属词则返回 None）。
@@ -102,12 +123,7 @@ impl WordIndex {
 
     /// 尝试根据包含的字符查找所属词汇（作为回退启发式）。
     pub fn find_word_containing_char(&self, ch: char) -> Option<&str> {
-        for token in self.char_to_token.iter().flatten() {
-            if token.word.contains(ch) {
-                return Some(&token.word);
-            }
-        }
-        None
+        self.char_lookup.get(&ch).map(|s| s.as_str())
     }
 }
 
@@ -144,5 +160,14 @@ mod tests {
         assert_eq!(word_at_14, Some("历史"));
         let word_at_15 = index.get_word_at(15); // "伟业"
         assert_eq!(word_at_15, Some("伟业"));
+
+        assert_eq!(index.find_word_containing_char('业'), Some("伟业"));
+        assert_eq!(index.find_word_containing_char('历'), Some("历史"));
+        assert_eq!(index.find_word_containing_char('z'), None);
+    }
+
+    #[test]
+    fn test_prewarm_segmenter() {
+        prewarm_segmenter();
     }
 }
