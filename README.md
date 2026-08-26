@@ -1,15 +1,61 @@
 # ⌨️ dazitui (打字推)
 
 <p align="center">
-  <strong>🐧 专为 Linux 终端打造的现代化沉浸式中文跟打练习工具 (TUI)</strong>
+  <strong>现代化沉浸式跨平台中文跟打练习工具 (TUI)</strong><br />
+  <sub>专为终端打造 · 毫秒级启动 · 原生中文上屏比对 · Rime 并击指法投射 · 52dazi 在线竞技</sub>
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Language-Rust-orange.svg" alt="Rust" />
+  <a href="https://github.com/JackTheMico/dazitui/releases/latest"><img src="https://img.shields.io/github/v/release/JackTheMico/dazitui?color=orange&label=Release" alt="Release" /></a>
+  <img src="https://img.shields.io/badge/Language-Rust_2024-orange.svg" alt="Rust" />
   <img src="https://img.shields.io/badge/TUI-Ratatui-blue.svg" alt="Ratatui" />
   <img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License" />
-  <img src="https://img.shields.io/badge/Platform-Linux-lightgrey.svg" alt="Linux" />
+  <img src="https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey.svg" alt="Platform" />
 </p>
+
+---
+
+## ⬇️ 快速下载与安装 (Download & Installation)
+
+`dazitui` 提供免安装的单文件预编译可执行文件，开箱即用：
+
+### 📦 预编译二进制下载 (GitHub Releases)
+
+前往 [**GitHub Releases 最新版本**](https://github.com/JackTheMico/dazitui/releases/latest) 下载对应系统架构的归档包：
+
+| 操作系统 | 架构 / 平台 | 预编译包下载 | 说明 |
+| :--- | :--- | :--- | :--- |
+| 🐧 **Linux** | x86_64 (glibc) | [dazitui-v1.0.0-x86_64-unknown-linux-gnu.tar.gz](https://github.com/JackTheMico/dazitui/releases/latest) | 推荐 Ubuntu / Debian / Fedora / Arch |
+| 🐧 **Linux** | x86_64 (musl 静态编译) | [dazitui-v1.0.0-x86_64-unknown-linux-musl.tar.gz](https://github.com/JackTheMico/dazitui/releases/latest) | 零动态库依赖，全发行版及 Alpine 通用 |
+| 🐧 **Linux** | ARM64 / aarch64 | [dazitui-v1.0.0-aarch64-unknown-linux-gnu.tar.gz](https://github.com/JackTheMico/dazitui/releases/latest) | 树莓派 / ARM 架构 Linux 设备 |
+| 🍎 **macOS** | Apple Silicon (M1/M2/M3/M4) | [dazitui-v1.0.0-aarch64-apple-darwin.tar.gz](https://github.com/JackTheMico/dazitui/releases/latest) | 原生 ARM64 极致性能 |
+| 🍎 **macOS** | Intel x86_64 | [dazitui-v1.0.0-x86_64-apple-darwin.tar.gz](https://github.com/JackTheMico/dazitui/releases/latest) | 兼容 Intel 处理器 Mac |
+| 🪟 **Windows** | x86_64 (MSVC) | [dazitui-v1.0.0-x86_64-pc-windows-msvc.zip](https://github.com/JackTheMico/dazitui/releases/latest) | 解压即用 `dazitui.exe`（推荐 Windows Terminal） |
+
+### ⚡ Linux & macOS 一键快速下载运行
+
+```bash
+# 自动检测架构并下载最新发布版本
+curl -fsSL https://raw.githubusercontent.com/JackTheMico/dazitui/main/install.sh | bash
+# 或手动解压后移动至 PATH 目录：
+tar -xzf dazitui-*-linux-gnu.tar.gz
+sudo mv dazitui /usr/local/bin/
+```
+
+### 🦀 源码编译安装 (Cargo)
+
+如果你已配置好 Rust 编译环境（Rust 1.85+，Edition 2024）：
+
+```bash
+# 通过 crates.io 或 git 直接安装
+cargo install --git https://github.com/JackTheMico/dazitui.git dazitui
+
+# 或从源码仓库构建
+git clone https://github.com/JackTheMico/dazitui.git
+cd dazitui
+cargo build --release --bin dazitui
+./target/release/dazitui
+```
 
 ---
 
@@ -122,6 +168,7 @@ dazitui --version
 | `3` | 键神杯 | 载入 52dazi.cn 键神杯在线赛文 |
 | `s` | 数据统计 | 打开全局历史统计视图（WPM 趋势 / 热力图 / 错字榜） |
 | `o` | 外观设置 | 打开设置视图（主题、比例、键盘模式、输入法等） |
+| `d` | 赞赏支持 | 打开赞赏与支持页面（展示微信与支付宝二维码及寄语） |
 | `l` | 登录账号 | 打开 52dazi.cn 账号登录弹窗 |
 
 ### 📊 成绩视图（跟打完成后）

@@ -3,5 +3,10 @@ resolver = "2"
 members = ["dazitui-core", "dazitui"]
 
 [workspace.package]
+version = "1.0.0"
 edition = "2024"
 license = "MIT"
+authors = ["JackTheMico"]
+repository = "https://github.com/JackTheMico/dazitui"
+homepage = "https://github.com/JackTheMico/dazitui"
+description = "专为终端打造的现代化沉浸式中文跟打练习工具 (TUI)"

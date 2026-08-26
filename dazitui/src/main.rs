@@ -1339,6 +1339,24 @@ impl App {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if let Some(arg) = args.get(1) {
+        if arg == "--version" || arg == "-V" || arg == "-v" {
+            println!("dazitui {}", env!("CARGO_PKG_VERSION"));
+            return;
+        }
+        if arg == "--help" || arg == "-h" {
+            println!(
+                "dazitui {} - 终端现代化沉浸式中文跟打练习工具 (TUI)\n\n\
+                用法:\n  \
+                dazitui [文件路径]       载入指定本地文本文件开始跟打\n  \
+                dazitui                 默认启动并载入精选单字前五百\n  \
+                dazitui --version, -V   查看当前版本号\n  \
+                dazitui --help, -h      查看帮助信息\n",
+                env!("CARGO_PKG_VERSION")
+            );
+            return;
+        }
+    }
     // 无参数：默认载入首套内置赛文（常用单字前五百）。
     let Some(path) = args.get(1) else {
         let text = load_builtin_text(BUILTIN_SETS[0]);

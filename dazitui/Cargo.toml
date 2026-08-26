@@ -1,11 +1,15 @@
 [package]
 name = "dazitui"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description.workspace = true
 
 [dependencies]
 crossterm = "0.29.0"
-dazitui-core = { version = "0.1.0", path = "../dazitui-core", features = ["online"] }
+dazitui-core = { version = "1.0.0", path = "../dazitui-core", features = ["online"] }
 image = "0.25.10"
 ratatui = "0.30.2"
 ratatui-image = "11.0.6"
