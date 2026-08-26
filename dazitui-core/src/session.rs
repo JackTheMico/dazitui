@@ -88,6 +88,8 @@ pub struct Stats {
     pub wrong_total: u32,
     /// 已上屏字符数。
     pub typed_chars: usize,
+    /// 打词字符数（通过多字词组提交输入的字符总数，用于 52dazi 打词率统计）。
+    pub phrase_chars: usize,
     /// 按键频率（按键 → 次数，按次数降序）。
     pub key_frequency: Vec<(String, u32)>,
     /// 回改明细：被删除的字符（按删除顺序）。
@@ -104,6 +106,44 @@ pub struct Stats {
 /// 组内可自由打/退；组边界处设门槛——当前组全对才放行进下一组。
 pub const GROUP_SIZE: usize = 10;
 
+/// 判断字符是否为 ASCII 或常用中文全角标点符号。
+fn is_punctuation(c: char) -> bool {
+    c.is_ascii_punctuation()
+        || matches!(
+            c,
+            '，' | '。'
+                | '！'
+                | '？'
+                | '；'
+                | '：'
+                | '“'
+                | '”'
+                | '‘'
+                | '’'
+                | '（'
+                | '）'
+                | '【'
+                | '】'
+                | '《'
+                | '》'
+                | '、'
+                | '…'
+                | '—'
+                | '～'
+                | '·'
+                | '「'
+                | '」'
+                | '『'
+                | '』'
+                | '〔'
+                | '〕'
+                | '〈'
+                | '〉'
+                | '﹏'
+                | '＿'
+        )
+}
+
 /// 跟打会话状态机。
 ///
 /// 持有原文与当前已上屏的输入，通过 LCS 对齐逐字比对。
@@ -119,6 +159,7 @@ pub struct Session {
     input: Vec<char>,
     edits: u32,
     total_strokes: u32,
+    phrase_chars: usize,
     key_counts: HashMap<String, u32>,
     edit_details: Vec<char>,
     completed_groups: usize,
@@ -165,6 +206,7 @@ impl Session {
             input: Vec::new(),
             edits: 0,
             total_strokes: 0,
+            phrase_chars: 0,
             key_counts: HashMap::new(),
             edit_details: Vec::new(),
             completed_groups: 0,
@@ -207,6 +249,21 @@ impl Session {
         } else {
             chars.len()
         };
+
+        if accept_len > 0 {
+            let accepted_slice = &chars[..accept_len];
+            let mut word_len = accepted_slice.len();
+            if word_len > 1 {
+                if let Some(&last_char) = accepted_slice.last() {
+                    if is_punctuation(last_char) {
+                        word_len -= 1;
+                    }
+                }
+                if word_len > 1 {
+                    self.phrase_chars += word_len;
+                }
+            }
+        }
 
         self.input.extend(chars[..accept_len].iter().copied());
 
@@ -469,6 +526,7 @@ impl Session {
             edits: self.edits,
             wrong_total: (wrong as u32) + self.edits,
             typed_chars: self.input.len(),
+            phrase_chars: self.phrase_chars,
             key_frequency,
             edit_details: self.edit_details.clone(),
             speed_samples,
@@ -1017,5 +1075,25 @@ mod tests {
         assert_eq!(m2.cumulative_wpm, 120.0); // 4 字 / 2s * 60 = 120
         assert_eq!(m2.cumulative_kps, 2.0);   // 4 击 / 2s = 2.0
     }
+
+    #[test]
+    fn session_tracks_phrase_chars_on_word_commits() {
+        let mut session = Session::new("我们一起打字推练习。");
+        // 词组「我们」（2字）
+        session.type_text("我们");
+        // 单字「一」
+        session.type_text("一");
+        // 单字「起」
+        session.type_text("起");
+        // 词组「打字推」（3字）
+        session.type_text("打字推");
+        // 词组带标点「练习。」（2字中文 + 1标点，去除末尾标点后为 2 字词）
+        session.type_text("练习。");
+
+        let stats = session.finish(Duration::from_secs(5));
+        // 打词字符总数 = 2(我们) + 0(一) + 0(起) + 3(打字推) + 2(练习) = 7
+        assert_eq!(stats.phrase_chars, 7);
+    }
 }
+
 

@@ -6,6 +6,8 @@ edition = "2024"
 [dependencies]
 crossterm = "0.29.0"
 dazitui-core = { version = "0.1.0", path = "../dazitui-core", features = ["online"] }
+image = "0.25.10"
 ratatui = "0.30.2"
+ratatui-image = "11.0.6"
 ratatui-themes = "0.3.0"
 unicode-width = "0.2.0"

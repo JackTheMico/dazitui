@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -5,6 +6,9 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use dazitui_core::ThemePreset;
+use ratatui_image::picker::Picker;
+use ratatui_image::protocol::StatefulProtocol;
+use ratatui_image::StatefulImage;
 use dazitui_core::{
     ApiClient, ApiError, AuthSession, BUILTIN_SETS, CharStatus, CompetitionType, DbTask, DbWorker,
     ErrorRecordItem, ErrorType, HeatmapLayout, KeyboardMode, KeypressRecordItem, LoadError,
@@ -191,6 +195,16 @@ pub fn theme_palette(preset: ThemePreset) -> ThemePalette {
     name.palette()
 }
 
+/// 赞赏与支持二维码图片字节数据（编译期嵌入）。
+static WECHAT_IMG_BYTES: &[u8] = include_bytes!("../../assets/sponsor/wechat.png");
+static ALIPAY_IMG_BYTES: &[u8] = include_bytes!("../../assets/sponsor/alipay.jpg");
+
+/// 赞赏与支持视图渲染协议缓存。
+struct SponsorViewState {
+    wechat: StatefulProtocol,
+    alipay: StatefulProtocol,
+}
+
 /// 跟打应用状态。
 #[allow(clippy::large_enum_variant)]
 enum AppState {
@@ -210,6 +224,8 @@ enum AppState {
     Settings,
     /// 统计视图：速度趋势图、键位热力图与错字排行榜。
     Stats(StatsViewState),
+    /// 赞赏与支持视图：展示微信与支付宝二维码。
+    Sponsor,
 }
 
 /// 设置视图焦点项下标。
@@ -344,6 +360,7 @@ enum SidebarMenuItem {
     OnlineJianshen,
     Stats,
     Settings,
+    Sponsor,
     Login,
 }
 
@@ -357,6 +374,7 @@ const SIDEBAR_MENU_ITEMS: &[SidebarMenuItem] = &[
     SidebarMenuItem::OnlineJianshen,
     SidebarMenuItem::Stats,
     SidebarMenuItem::Settings,
+    SidebarMenuItem::Sponsor,
     SidebarMenuItem::Login,
 ];
 
@@ -641,6 +659,8 @@ struct App {
     scheme_dict: Option<SchemeDict>,
     /// 后台数据库异步写入 Worker。
     db_worker: Option<DbWorker>,
+    /// 赞赏与支持视图图片协议缓存。
+    sponsor_state: RefCell<Option<SponsorViewState>>,
 }
 
 /// 登录模态框输入状态。
@@ -809,6 +829,7 @@ impl App {
             live_keyboard: LiveKeyboard::new(),
             scheme_dict: None,
             db_worker,
+            sponsor_state: RefCell::new(None),
         };
         app.reload_scheme_dict();
         app
@@ -979,6 +1000,11 @@ impl App {
                 });
             }
         }
+    }
+
+    /// 打开赞赏与支持视图。
+    fn open_sponsor(&mut self) {
+        self.state = AppState::Sponsor;
     }
 
     /// 提交登录：调用网关，成功后持久化 token。
@@ -1573,6 +1599,10 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                             app.state = AppState::Settings;
                             continue;
                         }
+                        if is_open_sponsor(key) {
+                            app.open_sponsor();
+                            continue;
+                        }
                         if restart_allowed(key, app.text.is_online()) {
                             app.restart();
                             continue;
@@ -1982,6 +2012,14 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                             _ => {}
                         }
                     }
+                    AppState::Sponsor => match key.code {
+                        KeyCode::Esc
+                        | KeyCode::Char('q')
+                        | KeyCode::Char('Q')
+                        | KeyCode::Char('d')
+                        | KeyCode::Char('D') => app.state = AppState::Typing,
+                        _ => {}
+                    },
                 }
             }
             Event::Paste(committed) => {
@@ -2085,6 +2123,7 @@ fn activate_sidebar_menu_item<B: ratatui::backend::Backend>(
             app.state = AppState::Stats(StatsViewState::new(app.settings.heatmap_layout));
         }
         SidebarMenuItem::Settings => app.state = AppState::Settings,
+        SidebarMenuItem::Sponsor => app.open_sponsor(),
         SidebarMenuItem::Login => app.open_login(),
     }
     Ok(())
@@ -2355,6 +2394,11 @@ fn is_load_clipboard(key: KeyEvent) -> bool {
 /// 打开统计视图快捷键：s / S（Stats）。
 fn is_open_stats(key: KeyEvent) -> bool {
     key.modifiers.is_empty() && (key.code == KeyCode::Char('s') || key.code == KeyCode::Char('S'))
+}
+
+/// 打开赞赏&支持视图快捷键：d / D（Donate / 赞赏）。
+fn is_open_sponsor(key: KeyEvent) -> bool {
+    key.modifiers.is_empty() && (key.code == KeyCode::Char('d') || key.code == KeyCode::Char('D'))
 }
 
 /// 处理跟打文本上屏（支持单字符与多字词组，如输入法整词上屏 "怎么"）：
@@ -2746,6 +2790,10 @@ fn ui(frame: &mut Frame, app: &App) {
     }
     if let AppState::Stats(stats_state) = &app.state {
         render_stats_view(frame, app, stats_state);
+        return;
+    }
+    if matches!(app.state, AppState::Sponsor) {
+        render_sponsor_view(frame, app);
         return;
     }
     let palette = app.palette();
@@ -3359,6 +3407,7 @@ fn render_sidebar(
                 SidebarMenuItem::OnlineJianshen => ("3", "键神杯", false, false),
                 SidebarMenuItem::Stats => ("s", "数据统计", false, false),
                 SidebarMenuItem::Settings => ("o", "设置", false, false),
+                SidebarMenuItem::Sponsor => ("d", "赞赏支持", false, false),
                 SidebarMenuItem::Login => {
                     if app.logged_in {
                         ("u", "已登录 52dazi", true, false)
@@ -3601,6 +3650,125 @@ fn render_builtin_preview(frame: &mut Frame, app: &App, area: ratatui::layout::R
             .wrap(Wrap { trim: false }),
         area,
     );
+}
+
+/// 赞赏与支持全局视图：展示极客幽默寄语与微信、支付宝赞赏二维码。
+fn render_sponsor_view(frame: &mut Frame, app: &App) {
+    let palette = app.palette();
+    let total_area = frame.area();
+
+    // 渲染全屏底色
+    frame.render_widget(
+        Block::default().style(Style::default().bg(palette.bg).fg(palette.fg)),
+        total_area,
+    );
+
+    // 垂直切分：顶部寄语标题 (高度 6) + 中间左右双二维码卡片 (Min 0) + 底部提示栏 (高度 3)
+    let [header_area, body_area, hint_area] = Layout::vertical([
+        Constraint::Length(6),
+        Constraint::Min(0),
+        Constraint::Length(3),
+    ])
+    .areas(total_area);
+
+    // 1. 顶部寄语 Banner
+    let header_block = themed_block(&palette, true).title(Line::from(vec![
+        Span::styled(
+            " 💖 赞赏 & 支持开源开发 (Support & Sponsor) ",
+            Style::default()
+                .fg(palette.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    let slogan_lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                "“键盘敲烂，码长砍半！给作者投喂一杯咖啡 ☕，继续用纯粹的 Rust 打造更好用的终端跟打神器 🦀。”",
+                Style::default().fg(palette.fg).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "打字推坚持开源、纯粹、无广告。感谢每一位在指尖追求极致手速与韵律的跟打者！",
+                Style::default().fg(palette.muted),
+            ),
+        ]),
+    ];
+    let header_paragraph = Paragraph::new(slogan_lines)
+        .block(header_block)
+        .alignment(ratatui::layout::Alignment::Center);
+    frame.render_widget(header_paragraph, header_area);
+
+    // 2. 中部二维码双卡片（左右水平分栏）
+    let [left_card_area, right_card_area] = Layout::horizontal([
+        Constraint::Percentage(50),
+        Constraint::Percentage(50),
+    ])
+    .areas(body_area);
+
+    // 左侧：微信支付
+    let wechat_title = Line::from(vec![
+        Span::styled(
+            " 微信支付 (WeChat Pay) ",
+            Style::default()
+                .fg(palette.success)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]);
+    let wechat_block = themed_block(&palette, false)
+        .title(wechat_title)
+        .border_style(Style::default().fg(palette.success));
+    let inner_wechat = wechat_block.inner(left_card_area);
+    frame.render_widget(wechat_block, left_card_area);
+
+    // 右侧：支付宝
+    let alipay_title = Line::from(vec![
+        Span::styled(
+            " 支付宝 (Alipay) ",
+            Style::default()
+                .fg(palette.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]);
+    let alipay_block = themed_block(&palette, false)
+        .title(alipay_title)
+        .border_style(Style::default().fg(palette.accent));
+    let inner_alipay = alipay_block.inner(right_card_area);
+    frame.render_widget(alipay_block, right_card_area);
+
+    // 延迟初始化图片渲染协议并绘制
+    let mut sponsor_lock = app.sponsor_state.borrow_mut();
+    if sponsor_lock.is_none() {
+        let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
+        let wechat_img = image::load_from_memory(WECHAT_IMG_BYTES).expect("load wechat.png");
+        let alipay_img = image::load_from_memory(ALIPAY_IMG_BYTES).expect("load alipay.jpg");
+        *sponsor_lock = Some(SponsorViewState {
+            wechat: picker.new_resize_protocol(wechat_img),
+            alipay: picker.new_resize_protocol(alipay_img),
+        });
+    }
+
+    if let Some(state) = sponsor_lock.as_mut() {
+        frame.render_stateful_widget(StatefulImage::default(), inner_wechat, &mut state.wechat);
+        frame.render_stateful_widget(StatefulImage::default(), inner_alipay, &mut state.alipay);
+    }
+
+    // 3. 底部提示栏
+    let hint_spans = vec![
+        Span::raw("  "),
+        Span::styled(
+            " [Esc / q / d] ",
+            Style::default()
+                .fg(palette.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("返回跟打主页    "),
+        Span::styled("✨ 感谢您的每一份认可与支持！", Style::default().fg(palette.muted)),
+    ];
+    let hint_block = themed_block(&palette, false);
+    let hint_paragraph = Paragraph::new(Line::from(hint_spans)).block(hint_block);
+    frame.render_widget(hint_paragraph, hint_area);
 }
 
 /// 统计数据中心全局视图：顶部三级 Tab 导航与内容区。
@@ -10060,7 +10228,69 @@ mod tests {
         assert!(clean.contains("KPS(击/秒)"));
         assert!(clean.contains("切换指标(WPM/KPS)"));
     }
+
+    #[test]
+    fn test_is_open_sponsor_shortcut() {
+        let key_d = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE);
+        let key_upper_d = KeyEvent::new(KeyCode::Char('D'), KeyModifiers::NONE);
+        let key_ctrl_d = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
+        let key_o = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE);
+
+        assert!(is_open_sponsor(key_d));
+        assert!(is_open_sponsor(key_upper_d));
+        assert!(!is_open_sponsor(key_ctrl_d));
+        assert!(!is_open_sponsor(key_o));
+    }
+
+    #[test]
+    fn test_open_sponsor_and_render_sponsor_view() {
+        let mut app = test_app(file_text("测试文本"));
+        assert!(matches!(app.state, AppState::Typing));
+
+        // 模拟通过 open_sponsor 进入赞赏页面
+        app.open_sponsor();
+        assert!(matches!(app.state, AppState::Sponsor));
+
+        let backend = ratatui::backend::TestBackend::new(120, 35);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| ui(f, &app)).unwrap();
+
+        let buffer = terminal.backend().buffer().clone();
+        let full_text: String = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect();
+        let clean = full_text.replace(' ', "");
+
+        // 校验标题与幽默寄语文案
+        assert!(clean.contains("赞赏&支持开源开发"));
+        assert!(clean.contains("键盘敲烂，码长砍半！给作者投喂一杯咖啡"));
+        assert!(clean.contains("微信支付(WeChatPay)"));
+        assert!(clean.contains("支付宝(Alipay)"));
+        assert!(clean.contains("[Esc/q/d]返回跟打主页"));
+    }
+
+    #[test]
+    fn test_sidebar_sponsor_menu_item_activation() {
+        let mut app = test_app(file_text("测试文本"));
+        let sponsor_idx = SIDEBAR_MENU_ITEMS
+            .iter()
+            .position(|&item| item == SidebarMenuItem::Sponsor)
+            .expect("SidebarMenuItem::Sponsor should exist");
+        app.sidebar_selected = sponsor_idx;
+
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        activate_sidebar_menu_item(&mut app, &mut terminal).unwrap();
+
+        assert!(matches!(app.state, AppState::Sponsor));
+    }
 }
+
 
 
 

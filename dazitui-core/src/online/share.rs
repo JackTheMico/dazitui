@@ -100,24 +100,33 @@ pub fn build_upload_payload(
         .iter()
         .find(|(k, _)| k == "Backspace")
         .map(|(_, n)| *n)
-        .unwrap_or(0);
-    // 击准率 = 正确字数 / 已上屏字数 * 100（与前端 accuracy 同口径）。无上屏时记 0。
-    let accuracy_pct = if stats.typed_chars == 0 {
-        0.0
-    } else {
-        stats.correct_chars as f64 / stats.typed_chars as f64 * 100.0
-    };
+        .unwrap_or(stats.edits);
     let strokes = if stats.total_strokes > 0 {
         stats.total_strokes
     } else {
         total_keys
+    };
+    // 52dazi 官方键准（击键准确率）公式：(总击数 - 退格数 - 回改次数 * 码长) / 总击数 * 100%
+    let wasted_keys = backspace as f64 + (stats.edits as f64) * upload.key_length;
+    let accuracy_pct = if stats.typed_chars == 0 || strokes == 0 {
+        0.0
+    } else {
+        let valid_keys = (strokes as f64 - wasted_keys).max(0.0);
+        ((valid_keys / strokes as f64) * 100.0).clamp(0.0, 100.0)
+    };
+    // 52dazi 官方打词率公式：打词字符数 / 赛文总字数 * 100%
+    let total_chars = text.content.chars().count();
+    let da_ci_pct = if total_chars == 0 {
+        0.0
+    } else {
+        (stats.phrase_chars as f64 / total_chars as f64 * 100.0).clamp(0.0, 100.0)
     };
     serde_json::json!({
         "textTitle": text.title,
         "speed": upload.speed,
         "keystrokes": upload.keystrokes,
         "maChang": upload.key_length,
-        "wordNum": text.content.chars().count(),
+        "wordNum": total_chars,
         "typingTime": format_time(elapsed),
         "huiGai": stats.edits,
         "huiChe": 0,
@@ -125,7 +134,7 @@ pub fn build_upload_payload(
         "jianZhun": format!("{:.2}%", accuracy_pct),
         "accuracy": accuracy_pct,
         "repeatNum": 0,
-        "daCi": "0%",
+        "daCi": format!("{:.2}%", da_ci_pct),
         "wrongNum": stats.wrong_total,
         "inputMethod": input_method,
         "backspace": backspace,
@@ -159,6 +168,7 @@ mod tests {
             edits: 1,
             wrong_total: 3,
             typed_chars: 40,
+            phrase_chars: 0,
             key_frequency: vec![("a".to_string(), 100), ("b".to_string(), 40)],
             edit_details: vec![],
             speed_samples: vec![],
@@ -260,10 +270,57 @@ mod tests {
         assert_eq!(v["huiGai"], 1); // sample_stats edits=1
         assert_eq!(v["jianShu"], 140); // 100 + 40
         assert_eq!(v["wrongNum"], 3); // sample_stats wrong_total=3
-        assert_eq!(v["accuracy"], 100.0);
-        assert_eq!(v["jianZhun"], "100.00%");
+        // 52dazi 官方键准：(140 - 1 - 1*2.8)/140 * 100 = 97.2857...%
+        assert!((v["accuracy"].as_f64().unwrap() - 97.2857).abs() < 1e-3);
+        assert_eq!(v["jianZhun"], "97.29%");
+        assert_eq!(v["daCi"], "0.00%");
         assert_eq!(v["challengeFlag"], 0);
         assert_eq!(v["isFirstSubmit"], 1);
+    }
+
+    #[test]
+    fn build_upload_payload_calculates_daci_from_phrase_chars() {
+        let mut stats = sample_stats();
+        stats.phrase_chars = 4; // 4个字全部通过打词输入
+        let up = UploadStats {
+            speed: 85.2,
+            keystrokes: 3.5,
+            key_length: 2.8,
+        };
+        let text = Text {
+            title: "极速杯".into(),
+            content: "你好世界".into(), // 4个字
+            source: TextSource::Online {
+                competition_type: CompetitionType::Jisu,
+            },
+            word_boundaries: None,
+            shuffled: false,
+        };
+        let v = build_upload_payload(&text, &stats, &up, Duration::from_secs(60), "");
+        assert_eq!(v["daCi"], "100.00%");
+    }
+
+    #[test]
+    fn build_upload_payload_perfect_accuracy_when_zero_edits() {
+        let mut stats = sample_stats();
+        stats.edits = 0;
+        let up = UploadStats {
+            speed: 85.2,
+            keystrokes: 3.5,
+            key_length: 2.8,
+        };
+        let text = Text {
+            title: "极速杯".into(),
+            content: "你好世界".into(),
+            source: TextSource::Online {
+                competition_type: CompetitionType::Jisu,
+            },
+            word_boundaries: None,
+            shuffled: false,
+        };
+        let v = build_upload_payload(&text, &stats, &up, Duration::from_secs(60), "");
+        assert_eq!(v["accuracy"], 100.0);
+        assert_eq!(v["jianZhun"], "100.00%");
     }
 
     #[test]
@@ -298,10 +355,10 @@ mod tests {
             jian_zhun.ends_with('%'),
             "jianZhun 应以 % 结尾: {jian_zhun}"
         );
-        // sample_stats: correct=40, typed=40 → 100%
-        assert_eq!(jian_zhun, "100.00%");
-        // daCi / keyMethod 为兜底的 "0%"
-        assert_eq!(v["daCi"], "0%");
+        // sample_stats: 1 edit with 2.8 key_length on 140 strokes -> 97.29%
+        assert_eq!(jian_zhun, "97.29%");
+        // daCi 为百分号字符串
+        assert_eq!(v["daCi"], "0.00%");
         assert_eq!(v["keyMethod"], "0%");
         // repeatNum / xuanChong 兜底 0
         assert_eq!(v["repeatNum"], 0);
