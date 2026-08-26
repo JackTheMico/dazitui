@@ -582,6 +582,53 @@ impl StatsDb {
         Ok(points)
     }
 
+    /// 查询带窗口滚动平均的 KPS（击速）时序数据：`Vec<(created_at, kps, rolling_kps)>`。
+    pub fn get_rolling_kps_history(
+        &self,
+        window_size: usize,
+    ) -> Result<Vec<(String, f64, f64)>, DbError> {
+        self.get_rolling_kps_history_with_limit(window_size, None)
+    }
+
+    /// 查询带窗口滚动平均的 KPS（击速）时序数据，可限制最近场次数。
+    pub fn get_rolling_kps_history_with_limit(
+        &self,
+        window_size: usize,
+        limit: Option<usize>,
+    ) -> Result<Vec<(String, f64, f64)>, DbError> {
+        let preceding = window_size.saturating_sub(1);
+        let base_sql = format!(
+            "SELECT created_at, kps,
+                    AVG(kps) OVER (
+                        ORDER BY created_at ASC
+                        ROWS BETWEEN {preceding} PRECEDING AND CURRENT ROW
+                    ) AS rolling_kps
+             FROM sessions
+             ORDER BY created_at ASC"
+        );
+
+        let sql = if let Some(n) = limit {
+            format!("SELECT * FROM ({base_sql}) ORDER BY created_at DESC LIMIT {n}")
+        } else {
+            base_sql
+        };
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, f64>(1)?,
+                row.get::<_, f64>(2)?,
+            ))
+        })?;
+
+        let mut points = Vec::new();
+        for p in rows {
+            points.push(p?);
+        }
+        Ok(points)
+    }
+
     /// 获取全局概览统计。
     pub fn get_global_summary(&self) -> Result<GlobalStatsSummary, DbError> {
         let mut summary = GlobalStatsSummary::default();
@@ -668,7 +715,7 @@ impl StatsDb {
         Ok(map)
     }
 
-    /// 查询高频错字 Top N。
+    /// 查询高频错字 Top N（已自动排除标点符号与特殊符号，仅统计汉字、字母与数字）。
     pub fn get_top_mistyped_chars(&self, limit: usize) -> Result<Vec<MistypedCharStat>, DbError> {
         let mut stmt = self.conn.prepare(
             "SELECT target_char, COUNT(*) as err_cnt,
@@ -678,40 +725,48 @@ impl StatsDb {
              FROM error_records e1
              WHERE target_char IS NOT NULL AND length(target_char) > 0
              GROUP BY target_char
-             ORDER BY err_cnt DESC
-             LIMIT ?1",
+             ORDER BY err_cnt DESC",
         )?;
 
-        let rows = stmt.query_map(params![limit as i64], |row| {
+        let rows = stmt.query_map([], |row| {
             let target_str: String = row.get(0)?;
             let err_cnt: i64 = row.get(1)?;
             let actual_str: Option<String> = row.get(2)?;
-            Ok(MistypedCharStat {
-                target_char: target_str.chars().next().unwrap_or('?'),
-                error_count: err_cnt as u32,
-                top_actual_char: actual_str.and_then(|s| s.chars().next()),
-            })
+            Ok((
+                target_str.chars().next().unwrap_or('?'),
+                err_cnt as u32,
+                actual_str.and_then(|s| s.chars().next()),
+            ))
         })?;
 
         let mut list = Vec::new();
         for item in rows {
-            list.push(item?);
+            let (target_char, error_count, top_actual_char) = item?;
+            if target_char.is_alphanumeric() {
+                list.push(MistypedCharStat {
+                    target_char,
+                    error_count,
+                    top_actual_char,
+                });
+                if list.len() >= limit {
+                    break;
+                }
+            }
         }
         Ok(list)
     }
 
-    /// 查询高频错词 Top N。
+    /// 查询高频错词 Top N（已自动排除纯标点符号组合）。
     pub fn get_top_mistyped_words(&self, limit: usize) -> Result<Vec<MistypedWordStat>, DbError> {
         let mut stmt = self.conn.prepare(
             "SELECT target_word, COUNT(*) as err_cnt, COUNT(DISTINCT session_id) as sess_cnt
              FROM error_records
              WHERE target_word IS NOT NULL AND length(target_word) >= 2
              GROUP BY target_word
-             ORDER BY err_cnt DESC
-             LIMIT ?1",
+             ORDER BY err_cnt DESC",
         )?;
 
-        let rows = stmt.query_map(params![limit as i64], |row| {
+        let rows = stmt.query_map([], |row| {
             Ok(MistypedWordStat {
                 target_word: row.get(0)?,
                 error_count: row.get::<_, i64>(1)? as u32,
@@ -721,9 +776,33 @@ impl StatsDb {
 
         let mut list = Vec::new();
         for item in rows {
-            list.push(item?);
+            let stat = item?;
+            if stat.target_word.chars().any(|c| c.is_alphanumeric()) {
+                list.push(stat);
+                if list.len() >= limit {
+                    break;
+                }
+            }
         }
         Ok(list)
+    }
+
+    /// 从数据库中物理删除指定错字的所有错误记录。
+    pub fn delete_mistyped_char(&mut self, target_char: char) -> Result<usize, DbError> {
+        let deleted = self.conn.execute(
+            "DELETE FROM error_records WHERE target_char = ?1",
+            params![target_char.to_string()],
+        )?;
+        Ok(deleted)
+    }
+
+    /// 从数据库中物理删除指定错词的所有错误记录。
+    pub fn delete_mistyped_word(&mut self, target_word: &str) -> Result<usize, DbError> {
+        let deleted = self.conn.execute(
+            "DELETE FROM error_records WHERE target_word = ?1",
+            params![target_word],
+        )?;
+        Ok(deleted)
     }
 }
 
@@ -1024,6 +1103,41 @@ mod tests {
     }
 
     #[test]
+    fn test_rolling_kps_calculation() {
+        let mut db = StatsDb::open_in_memory().unwrap();
+        for i in 1..=5 {
+            let mut s = SessionRecord::new_with_strokes(
+                60.0,
+                80.0,
+                0.99,
+                100,
+                0,
+                0,
+                100,
+                "test",
+                "全拼",
+                (i * 2) as f64,
+                1.5,
+                (i * 120) as u32,
+            );
+            s.created_at = format!("2026-08-24 10:00:0{i}");
+            db.insert_session_full(&s, &[], &[]).unwrap();
+        }
+
+        let history = db.get_rolling_kps_history(3).unwrap();
+        assert_eq!(history.len(), 5);
+        // 第 1 场: kps=2, rolling=2
+        assert_eq!(history[0].1, 2.0);
+        assert_eq!(history[0].2, 2.0);
+        // 第 2 场: kps=4, rolling=(2+4)/2=3
+        assert_eq!(history[1].1, 4.0);
+        assert_eq!(history[1].2, 3.0);
+        // 第 3 场: kps=6, rolling=(2+4+6)/3=4
+        assert_eq!(history[2].1, 6.0);
+        assert_eq!(history[2].2, 4.0);
+    }
+
+    #[test]
     fn test_db_worker_async_pipeline() {
         let (worker, shared_db) = DbWorker::start_in_memory().unwrap();
         let session = SessionRecord::new(
@@ -1052,5 +1166,64 @@ mod tests {
         let s = db.get_recent_sessions(1).unwrap();
         assert_eq!(s[0].text_title, "异步测试");
         assert_eq!(s[0].wpm, 92.0);
+    }
+
+    #[test]
+    fn test_delete_mistyped_char_and_word() {
+        let mut db = StatsDb::open_in_memory().unwrap();
+        let session = SessionRecord::new(60.0, 80.0, 0.95, 100, 5, 2, 105, "测试文章", "全拼");
+        let errors = vec![
+            ErrorRecordItem::new(&session.id, 1.0, 1, Some('你'), Some('好'), Some("你好".to_string()), "Mismatch"),
+            ErrorRecordItem::new(&session.id, 2.0, 2, Some('你'), Some('各'), Some("你好".to_string()), "Mismatch"),
+            ErrorRecordItem::new(&session.id, 3.0, 3, Some('他'), Some('它'), Some("他们".to_string()), "Mismatch"),
+        ];
+        db.insert_session_full(&session, &errors, &[]).unwrap();
+
+        // 初始高频错字与错词
+        let top_chars = db.get_top_mistyped_chars(10).unwrap();
+        assert_eq!(top_chars.len(), 2);
+        assert_eq!(top_chars[0].target_char, '你');
+        assert_eq!(top_chars[0].error_count, 2);
+
+        let top_words = db.get_top_mistyped_words(10).unwrap();
+        assert_eq!(top_words.len(), 2);
+
+        // 删除错字 '你'
+        let deleted_chars = db.delete_mistyped_char('你').unwrap();
+        assert_eq!(deleted_chars, 2);
+
+        let top_chars_after = db.get_top_mistyped_chars(10).unwrap();
+        assert_eq!(top_chars_after.len(), 1);
+        assert_eq!(top_chars_after[0].target_char, '他');
+
+        // 删除错词 "他们"
+        let deleted_words = db.delete_mistyped_word("他们").unwrap();
+        assert_eq!(deleted_words, 1);
+
+        let top_words_after = db.get_top_mistyped_words(10).unwrap();
+        assert_eq!(top_words_after.len(), 0);
+    }
+
+    #[test]
+    fn test_mistyped_punctuation_filtering() {
+        let mut db = StatsDb::open_in_memory().unwrap();
+        let session = SessionRecord::new(60.0, 80.0, 0.95, 100, 5, 2, 105, "测试文章", "全拼");
+        let errors = vec![
+            ErrorRecordItem::new(&session.id, 1.0, 1, Some('，'), Some('。'), Some("，".to_string()), "Mismatch"),
+            ErrorRecordItem::new(&session.id, 2.0, 2, Some('！'), Some('？'), Some("！".to_string()), "Mismatch"),
+            ErrorRecordItem::new(&session.id, 3.0, 3, Some(','), Some('.'), Some(",".to_string()), "Mismatch"),
+            ErrorRecordItem::new(&session.id, 4.0, 4, Some('字'), Some('子'), Some("汉字".to_string()), "Mismatch"),
+        ];
+        db.insert_session_full(&session, &errors, &[]).unwrap();
+
+        // 标点符号应被自动排除在错字排行榜外
+        let top_chars = db.get_top_mistyped_chars(10).unwrap();
+        assert_eq!(top_chars.len(), 1);
+        assert_eq!(top_chars[0].target_char, '字');
+
+        // 纯标点词应被排除在错词排行榜外
+        let top_words = db.get_top_mistyped_words(10).unwrap();
+        assert_eq!(top_words.len(), 1);
+        assert_eq!(top_words[0].target_word, "汉字");
     }
 }
