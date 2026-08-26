@@ -4190,7 +4190,7 @@ pub fn generate_live_keyboard_lines(
     let mut lines = Vec::new();
     match mode {
         KeyboardMode::Staggered => {
-            // ANSI 60% 五行斜列紧凑布局
+            // ANSI 60% 五行斜列紧凑布局（精简版：仅保留主键区、Bksp 与 Space）
             let rows: [&[(&str, &str)]; 5] = [
                 &[
                     ("`", "~ `"),
@@ -4209,7 +4209,6 @@ pub fn generate_live_keyboard_lines(
                     ("Backspace", "Bksp"),
                 ],
                 &[
-                    ("Tab", "Tab"),
                     ("q", "Q"),
                     ("w", "W"),
                     ("e", "E"),
@@ -4225,7 +4224,6 @@ pub fn generate_live_keyboard_lines(
                     ("\\", "\\"),
                 ],
                 &[
-                    ("Caps", "Caps"),
                     ("a", "A"),
                     ("s", "S"),
                     ("d", "D"),
@@ -4237,10 +4235,8 @@ pub fn generate_live_keyboard_lines(
                     ("l", "L"),
                     (";", ";"),
                     ("'", "'"),
-                    ("Enter", "Enter"),
                 ],
                 &[
-                    ("Shift", "Shift"),
                     ("z", "Z"),
                     ("x", "X"),
                     ("c", "C"),
@@ -4251,19 +4247,14 @@ pub fn generate_live_keyboard_lines(
                     (",", ","),
                     (".", "."),
                     ("/", "/"),
-                    ("Shift", "Shift"),
                 ],
                 &[
-                    ("Ctrl", "Ctrl"),
-                    ("Alt", "Alt"),
-                    ("Space", "Space (空格)"),
-                    ("Alt", "Alt"),
-                    ("Ctrl", "Ctrl"),
+                    ("Space", "Space"),
                 ],
             ];
 
-            let row_indents = ["", " ", "  ", "    ", "        "];
-            let max_layout_width = 60u16;
+            let row_indents = ["", "     ", "       ", "         ", "                 "];
+            let max_layout_width = 59u16;
             let center_pad = target_width.saturating_sub(max_layout_width) / 2;
             let pad_prefix = " ".repeat(center_pad as usize);
 
@@ -4274,11 +4265,12 @@ pub fn generate_live_keyboard_lines(
                     let is_homing = *k_lookup == "f" || *k_lookup == "j";
                     let is_modifier = matches!(
                         *k_lookup,
-                        "Tab"
+                        "Backspace"
+                            | "Bksp"
+                            | "Tab"
                             | "Caps"
                             | "Shift"
                             | "Enter"
-                            | "Backspace"
                             | "Ctrl"
                             | "Alt"
                             | "Esc"
@@ -4307,7 +4299,7 @@ pub fn generate_live_keyboard_lines(
                                 .bg(palette.accent)
                                 .add_modifier(Modifier::BOLD);
                             let badge = if *k_lookup == "Space" {
-                                format!("[ {:^14} ]", k_display)
+                                format!("[ {:^20} ]", k_display)
                             } else {
                                 format!("[{k_display}]")
                             };
@@ -4318,7 +4310,7 @@ pub fn generate_live_keyboard_lines(
                                 .fg(palette.accent)
                                 .add_modifier(Modifier::BOLD);
                             let badge = if *k_lookup == "Space" {
-                                format!("[ {:^14} ]", k_display)
+                                format!("[ {:^20} ]", k_display)
                             } else {
                                 format!("[{k_display}]")
                             };
@@ -4332,7 +4324,7 @@ pub fn generate_live_keyboard_lines(
                                 is_homing,
                                 is_modifier,
                                 palette,
-                                14,
+                                20,
                             );
                         }
                     } else {
@@ -4344,7 +4336,7 @@ pub fn generate_live_keyboard_lines(
                             is_homing,
                             is_modifier,
                             palette,
-                            14,
+                            20,
                         );
                     }
                 }
@@ -4352,10 +4344,9 @@ pub fn generate_live_keyboard_lines(
             }
         }
         KeyboardMode::Ortholinear => {
-            // Planck 4x12 直列网格紧凑布局
+            // Planck 4x12 直列网格紧凑布局（精简版：仅保留主键区、Bksp 与 Space）
             let rows: [&[(&str, &str)]; 4] = [
                 &[
-                    ("Tab", "Tab"),
                     ("q", "Q"),
                     ("w", "W"),
                     ("e", "E"),
@@ -4369,7 +4360,6 @@ pub fn generate_live_keyboard_lines(
                     ("Backspace", "Bksp"),
                 ],
                 &[
-                    ("Esc", "Esc"),
                     ("a", "A"),
                     ("s", "S"),
                     ("d", "D"),
@@ -4383,7 +4373,6 @@ pub fn generate_live_keyboard_lines(
                     ("'", "'"),
                 ],
                 &[
-                    ("Shift", "Shift"),
                     ("z", "Z"),
                     ("x", "X"),
                     ("c", "C"),
@@ -4394,23 +4383,14 @@ pub fn generate_live_keyboard_lines(
                     (",", ","),
                     (".", "."),
                     ("/", "/"),
-                    ("Enter", "Enter"),
                 ],
                 &[
-                    ("Ctrl", "Ctrl"),
-                    ("Alt", "Alt"),
-                    ("Lower", "Lower"),
-                    ("Space", "Space (空格)"),
-                    ("Raise", "Raise"),
-                    ("Left", "←"),
-                    ("Down", "↓"),
-                    ("Up", "↑"),
-                    ("Right", "→"),
+                    ("Space", "Space"),
                 ],
             ];
 
-            let row_indents = ["", "", "", ""];
-            let max_layout_width = 59u16;
+            let row_indents = ["", "", "", "           "];
+            let max_layout_width = 46u16;
             let center_pad = target_width.saturating_sub(max_layout_width) / 2;
             let pad_prefix = " ".repeat(center_pad as usize);
 
@@ -4421,11 +4401,12 @@ pub fn generate_live_keyboard_lines(
                     let is_homing = *k_lookup == "f" || *k_lookup == "j";
                     let is_modifier = matches!(
                         *k_lookup,
-                        "Tab"
+                        "Backspace"
+                            | "Bksp"
+                            | "Tab"
                             | "Caps"
                             | "Shift"
                             | "Enter"
-                            | "Backspace"
                             | "Ctrl"
                             | "Alt"
                             | "Esc"
@@ -4453,7 +4434,7 @@ pub fn generate_live_keyboard_lines(
                                 .bg(palette.accent)
                                 .add_modifier(Modifier::BOLD);
                             let badge = if *k_lookup == "Space" {
-                                format!("[ {:^12} ]", k_display)
+                                format!("[ {:^20} ]", k_display)
                             } else {
                                 format!("[{k_display}]")
                             };
@@ -4463,7 +4444,7 @@ pub fn generate_live_keyboard_lines(
                                 .fg(palette.accent)
                                 .add_modifier(Modifier::BOLD);
                             let badge = if *k_lookup == "Space" {
-                                format!("[ {:^12} ]", k_display)
+                                format!("[ {:^20} ]", k_display)
                             } else {
                                 format!("[{k_display}]")
                             };
@@ -4476,7 +4457,7 @@ pub fn generate_live_keyboard_lines(
                                 is_homing,
                                 is_modifier,
                                 palette,
-                                12,
+                                20,
                             );
                         }
                     } else {
@@ -4487,7 +4468,7 @@ pub fn generate_live_keyboard_lines(
                             is_homing,
                             is_modifier,
                             palette,
-                            12,
+                            20,
                         );
                     }
                 }
@@ -8292,11 +8273,23 @@ mod tests {
         let first_row_100 = lines_100[0].spans[0].content.as_ref();
         assert_eq!(first_row_100, " ".repeat(20));
 
-        // 验证各行阶梯缩进保持相对正确 (Row 1: +1 space, Row 2: +2 spaces, Row 3: +4 spaces, Row 4: +8 spaces)
+        // 验证各行阶梯缩进保持相对正确 (Row 1: +5 spaces, Row 2: +7 spaces, Row 3: +9 spaces, Row 4: +17 spaces)
         let row1_100 = lines_100[1].spans[0].content.as_ref();
-        assert_eq!(row1_100, format!("{} ", " ".repeat(20)));
+        assert_eq!(row1_100, format!("{}     ", " ".repeat(20)));
         let row2_100 = lines_100[2].spans[0].content.as_ref();
-        assert_eq!(row2_100, format!("{}  ", " ".repeat(20)));
+        assert_eq!(row2_100, format!("{}       ", " ".repeat(20)));
+        let row3_100 = lines_100[3].spans[0].content.as_ref();
+        assert_eq!(row3_100, format!("{}         ", " ".repeat(20)));
+        let row4_100 = lines_100[4].spans[0].content.as_ref();
+        assert_eq!(row4_100, format!("{}                 ", " ".repeat(20)));
+
+        // 4. 直列网格（Ortholinear）居中与缩进断言：最大宽度 46
+        let ortho_80 = generate_live_keyboard_lines(&kb, KeyboardMode::Ortholinear, &palette, now, 80);
+        // 居中填充 (80 - 46) / 2 = 17 空格
+        assert_eq!(ortho_80[0].spans[0].content.as_ref(), " ".repeat(17));
+        assert_eq!(ortho_80[1].spans[0].content.as_ref(), " ".repeat(17));
+        assert_eq!(ortho_80[2].spans[0].content.as_ref(), " ".repeat(17));
+        assert_eq!(ortho_80[3].spans[0].content.as_ref(), format!("{}           ", " ".repeat(17)));
     }
 
     #[test]
@@ -8308,14 +8301,55 @@ mod tests {
         // 1. 常态（未击键）：测试主题颜色分层与按键边框跟随主题强调色
         let lines = generate_live_keyboard_lines(&kb, KeyboardMode::Staggered, &palette, now, 80);
 
-        // Row 2 包含 Caps, A, S, D, F, G, H, J, K, L, ;, ', Enter
+        // 验证精简布局：除了 Bksp 和 Space，不含 Tab / Caps / Enter / Shift / Ctrl / Alt / Esc，且无中文“空格”
+        let full_text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert!(full_text.contains("[Bksp]"));
+        assert!(full_text.contains("Space"));
+        assert!(!full_text.contains("Tab"));
+        assert!(!full_text.contains("Caps"));
+        assert!(!full_text.contains("Enter"));
+        assert!(!full_text.contains("Shift"));
+        assert!(!full_text.contains("Ctrl"));
+        assert!(!full_text.contains("Alt"));
+        assert!(!full_text.contains("空格"));
+
+        // 直列网格（Ortholinear）也同样不含已删除的功能键
+        let ortho_lines = generate_live_keyboard_lines(&kb, KeyboardMode::Ortholinear, &palette, now, 80);
+        let ortho_text: String = ortho_lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert!(ortho_text.contains("[Bksp]"));
+        assert!(ortho_text.contains("Space"));
+        assert!(!ortho_text.contains("Tab"));
+        assert!(!ortho_text.contains("Esc"));
+        assert!(!ortho_text.contains("Enter"));
+        assert!(!ortho_text.contains("Shift"));
+        assert!(!ortho_text.contains("Lower"));
+        assert!(!ortho_text.contains("Raise"));
+        assert!(!ortho_text.contains("空格"));
+
+        // Row 0 Bksp 验证
+        let row0 = &lines[0];
+        let mut found_bksp = false;
+        for span in &row0.spans {
+            if span.content == "[Bksp]" {
+                assert_eq!(span.style.fg, Some(palette.muted));
+                found_bksp = true;
+            }
+        }
+        assert!(found_bksp);
+
+        // Row 2 包含 A, S, D, F, G, H, J, K, L, ;, '
         let row2 = &lines[2];
 
         // 验证定位键 F 与 J 在常态下被高亮为 accent + bold，字母键边框为 accent
         let mut found_f = false;
         let mut found_j = false;
         let mut found_a = false;
-        let mut found_caps = false;
         for (i, span) in row2.spans.iter().enumerate() {
             if span.content == "F" {
                 assert_eq!(span.style.fg, Some(palette.accent));
@@ -8338,19 +8372,15 @@ mod tests {
                 assert_eq!(row2.spans[i + 1].content, "]");
                 assert_eq!(row2.spans[i + 1].style.fg, Some(palette.accent));
                 found_a = true;
-            } else if span.content == "[Caps]" {
-                // 修饰键整体保持 muted 次要暗色
-                assert_eq!(span.style.fg, Some(palette.muted));
-                found_caps = true;
             }
         }
-        assert!(found_f && found_j && found_a && found_caps);
+        assert!(found_f && found_j && found_a);
 
-        // Row 4 空格键验证：左右括号为 accent，内部文字为 muted
+        // Row 4 空格键验证：左右括号为 accent，内部文字为 muted，且标签为纯英文 Space
         let row4 = &lines[4];
         let mut found_space_brackets = false;
         for (i, span) in row4.spans.iter().enumerate() {
-            if span.content.contains("Space (空格)") {
+            if span.content.contains("Space") && !span.content.contains("[") {
                 assert_eq!(span.style.fg, Some(palette.muted));
                 assert_eq!(row4.spans[i - 1].content, "[");
                 assert_eq!(row4.spans[i - 1].style.fg, Some(palette.accent));
@@ -8359,7 +8389,7 @@ mod tests {
                 found_space_brackets = true;
             }
         }
-        assert!(found_space_brackets, "空格键外侧括号应为主题强调色");
+        assert!(found_space_brackets, "空格键外侧括号应为主题强调色且文本为纯英文 Space");
 
         // 多主题预设联动验证：切换至 Dracula 主题，边框色彩随之变更
         let dracula_palette = theme_palette(ThemePreset::Dracula);
@@ -8413,7 +8443,8 @@ mod tests {
             })
             .collect();
         assert!(full_text.contains("[Bksp]"));
-        assert!(full_text.contains("[Space (空格)]") || full_text.contains("Space"));
+        assert!(full_text.contains("Space"));
+        assert!(!full_text.contains("空格"));
     }
 
     #[test]
