@@ -235,8 +235,9 @@ const FOCUS_BOLD: usize = 2;
 const FOCUS_KEYBOARD: usize = 3;
 const FOCUS_SCHEME: usize = 4;
 const FOCUS_INPUT_METHOD: usize = 5;
+const FOCUS_GROUP_SIZE: usize = 6;
 /// 设置视图焦点项总数。
-const SETTINGS_FOCUS_COUNT: usize = 6;
+const SETTINGS_FOCUS_COUNT: usize = 7;
 
 /// 反查方案预设列表（顺序即轮转顺序）。
 /// 最后一项「自定义」表示用户自行输入任意方案名或文件路径。
@@ -778,11 +779,16 @@ impl App {
         settings_store: SettingsStore,
         db_worker: Option<DbWorker>,
     ) -> Self {
+        let settings = settings_store.load();
         let session = {
             let wb = text.session_word_boundaries();
-            Session::new_gated_with_words(&text.content, text.source.is_builtin(), &wb)
+            Session::new_gated_with_words_and_size(
+                &text.content,
+                text.source.is_builtin(),
+                &wb,
+                settings.group_size as usize,
+            )
         };
-        let settings = settings_store.load();
         // 自动登录与会话恢复：若未登录且有环境变量则尝试自动登录。
         let login_notice = if !api.is_logged_in()
             && let Some((user, pass)) = env_credentials(|k| std::env::var(k).ok())
@@ -1047,8 +1053,12 @@ impl App {
             self.text = load_builtin_text_shuffled(set);
         }
         let wb = self.text.session_word_boundaries();
-        self.session =
-            Session::new_gated_with_words(&self.text.content, self.text.source.is_builtin(), &wb);
+        self.session = Session::new_gated_with_words_and_size(
+            &self.text.content,
+            self.text.source.is_builtin(),
+            &wb,
+            self.settings.group_size as usize,
+        );
         self.start = Instant::now();
         self.accumulated_elapsed = Duration::ZERO;
         self.active_start = None;
@@ -1197,13 +1207,14 @@ impl App {
     /// 乱序开时加载打乱版（每次调用随机不同），关时顺序版。
     /// 在 `open_builtin_browser`、Up/Down 选区变化、s 切换乱序时调用。
     fn refresh_builtin_preview(&mut self) {
+        let group_size = self.settings.group_size as usize;
         self.builtin_preview = Some(match BUILTIN_SETS.get(self.builtin_selection) {
             Some(&set) if self.builtin_shuffle => {
                 let text = load_builtin_text_shuffled(set);
                 let body = if set.is_words() {
                     let boundaries = text.word_boundaries.as_ref().unwrap();
                     let chars: Vec<char> = text.content.chars().collect();
-                    builtin_word_preview(boundaries, &chars)
+                    builtin_word_preview(boundaries, &chars, group_size)
                 } else {
                     builtin_char_preview(&text.content)
                 };
@@ -1215,12 +1226,28 @@ impl App {
                 let chars: Vec<char> = no_commas.chars().collect();
                 (
                     set.name().to_string(),
-                    builtin_word_preview(&boundaries, &chars),
+                    builtin_word_preview(&boundaries, &chars, group_size),
                 )
             }
             Some(&set) => (set.name().to_string(), builtin_char_preview(set.content())),
             None => ("预览".to_string(), "（无内置赛文）".to_string()),
         });
+    }
+
+    /// 循环切换内置赛文分组大小档位（5 -> 10 -> 15 -> 20 -> 25 -> 30 -> 50）并即时持久化。
+    fn cycle_group_size(&mut self) {
+        self.settings.group_size = Settings::next_group_size_preset(self.settings.group_size);
+        let _ = self.settings_store.save(&self.settings);
+        self.refresh_builtin_preview();
+        if self.text.source.is_builtin() && self.session.is_empty() {
+            let wb = self.text.session_word_boundaries();
+            self.session = Session::new_gated_with_words_and_size(
+                &self.text.content,
+                true,
+                &wb,
+                self.settings.group_size as usize,
+            );
+        }
     }
 
     /// 载入当前选中的内置赛文，进入新跟打。
@@ -1234,8 +1261,12 @@ impl App {
             load_builtin_text(set)
         };
         let wb = self.text.session_word_boundaries();
-        self.session =
-            Session::new_gated_with_words(&self.text.content, self.text.source.is_builtin(), &wb);
+        self.session = Session::new_gated_with_words_and_size(
+            &self.text.content,
+            self.text.source.is_builtin(),
+            &wb,
+            self.settings.group_size as usize,
+        );
         self.start = Instant::now();
         self.state = AppState::Typing;
     }
@@ -1717,13 +1748,16 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                                     (app.builtin_selection + 1).min(BUILTIN_SETS.len() - 1);
                                 app.refresh_builtin_preview();
                             }
-                            KeyCode::Char('g') | KeyCode::Home => {
+                            KeyCode::Home => {
                                 app.builtin_selection = 0;
                                 app.refresh_builtin_preview();
                             }
-                            KeyCode::Char('G') | KeyCode::End => {
+                            KeyCode::End => {
                                 app.builtin_selection = BUILTIN_SETS.len().saturating_sub(1);
                                 app.refresh_builtin_preview();
+                            }
+                            KeyCode::Char('g') | KeyCode::Char('G') => {
+                                app.cycle_group_size();
                             }
                             KeyCode::Enter | KeyCode::Char('l') => app.load_selected_builtin(),
                             KeyCode::Char('s') | KeyCode::Char('S') => {
@@ -1774,6 +1808,25 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                                     };
                                     app.settings.input_method = next;
                                     let _ = app.settings_store.save(&app.settings);
+                                }
+                                FOCUS_GROUP_SIZE => {
+                                    let curr = app.settings.group_size;
+                                    let next = if forward {
+                                        (curr + 1).min(Settings::GROUP_SIZE_MAX)
+                                    } else {
+                                        (curr.saturating_sub(1)).max(Settings::GROUP_SIZE_MIN)
+                                    };
+                                    app.settings.group_size = next;
+                                    let _ = app.settings_store.save(&app.settings);
+                                    if app.text.source.is_builtin() && app.session.is_empty() {
+                                        let wb = app.text.session_word_boundaries();
+                                        app.session = Session::new_gated_with_words_and_size(
+                                            &app.text.content,
+                                            true,
+                                            &wb,
+                                            app.settings.group_size as usize,
+                                        );
+                                    }
                                 }
                                 _ => {}
                             }
@@ -2970,14 +3023,27 @@ fn ui(frame: &mut Frame, app: &App) {
                     .add_modifier(Modifier::BOLD),
             ));
         }
-        typing_title_spans.push(Span::styled(
+        let is_words = matches!(app.text.source, TextSource::Builtin { set } if set.is_words());
+        let unit_label = if is_words { "词/组" } else { "字/组" };
+        let progress_str = if is_builtin {
+            let curr_group = (app.session.completed_groups() + 1).min(app.session.total_groups());
+            format!(
+                "— 第 {}/{} 组 ({}{}) · {}/{} 字符 ",
+                curr_group,
+                app.session.total_groups(),
+                app.session.group_size(),
+                unit_label,
+                app.session.len(),
+                app.text.content.chars().count()
+            )
+        } else {
             format!(
                 "— {}/{} 字符 ",
                 app.session.len(),
                 app.text.content.chars().count()
-            ),
-            Style::default().fg(palette.fg),
-        ));
+            )
+        };
+        typing_title_spans.push(Span::styled(progress_str, Style::default().fg(palette.fg)));
         let typing_title = Line::from(typing_title_spans);
 
         let type_inner_width = type_area.width.saturating_sub(2);
@@ -3588,9 +3654,9 @@ fn render_preview(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     );
 }
 
-/// 词组赛文预览：取前 `BUILTIN_ITEMS_PER_PAGE` 个词，词间加空格。
-fn builtin_word_preview(boundaries: &[(usize, usize)], chars: &[char]) -> String {
-    let preview_words = boundaries.len().min(BUILTIN_ITEMS_PER_PAGE);
+/// 词组赛文预览：取前 `group_size` 个词，词间加空格。
+fn builtin_word_preview(boundaries: &[(usize, usize)], chars: &[char], group_size: usize) -> String {
+    let preview_words = boundaries.len().min(group_size);
     let mut preview = String::new();
     for (i, &(ws, we)) in boundaries.iter().take(preview_words).enumerate() {
         if i > 0 {
@@ -3600,7 +3666,7 @@ fn builtin_word_preview(boundaries: &[(usize, usize)], chars: &[char]) -> String
             preview.push(*ch);
         }
     }
-    if boundaries.len() > BUILTIN_ITEMS_PER_PAGE {
+    if boundaries.len() > group_size {
         preview.push_str(" …");
     }
     preview
@@ -3625,21 +3691,23 @@ fn render_builtin_preview(frame: &mut Frame, app: &App, area: ratatui::layout::R
         .builtin_preview
         .clone()
         .unwrap_or_else(|| ("预览".to_string(), "（无内置赛文）".to_string()));
-    // 预览按每 10 字一页（单字）或整行（词组），与实际跟打展示一致。
+    let group_size = app.settings.group_size as usize;
+    let is_words = matches!(BUILTIN_SETS.get(app.builtin_selection), Some(set) if set.is_words());
+    let unit_label = if is_words { "词" } else { "字" };
+
     let mut lines: Vec<Line> = vec![
         Line::from(format!(" 内置赛文 — {title} "))
             .bold()
             .fg(palette.fg),
         Line::from(""),
     ];
-    let is_words = matches!(BUILTIN_SETS.get(app.builtin_selection), Some(set) if set.is_words());
     if is_words {
         lines.push(Line::from(body).fg(palette.fg));
     } else {
         for chunk in body
             .chars()
             .collect::<Vec<char>>()
-            .chunks(BUILTIN_ITEMS_PER_PAGE)
+            .chunks(group_size)
         {
             lines.push(Line::from(chunk.iter().collect::<String>()).fg(palette.fg));
         }
@@ -3651,7 +3719,7 @@ fn render_builtin_preview(frame: &mut Frame, app: &App, area: ratatui::layout::R
         "乱序"
     };
     lines.push(hint_bar_line(
-        &format!(" Enter 载入 | s {shuffle_label} | Esc 取消 "),
+        &format!(" Enter 载入 | s {shuffle_label} | g 分组({group_size}{unit_label}) | Esc 取消 "),
         &palette,
     ));
     let builtin_preview_title = Line::from(vec![
@@ -3662,6 +3730,10 @@ fn render_builtin_preview(frame: &mut Frame, app: &App, area: ratatui::layout::R
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(format!("— {title} "), Style::default().fg(palette.fg)),
+        Span::styled(
+            format!("[g] 分组: {group_size} {unit_label}/组 "),
+            Style::default().bold().fg(palette.accent),
+        ),
     ]);
     let block = themed_block(&palette, false)
         .title(builtin_preview_title)
@@ -4849,6 +4921,12 @@ fn render_settings(frame: &mut Frame, app: &App) {
         focus == FOCUS_INPUT_METHOD,
         &palette,
     ));
+    lines.push(settings_row(
+        "分组大小",
+        &format!("{} 字/词", app.settings.group_size),
+        focus == FOCUS_GROUP_SIZE,
+        &palette,
+    ));
 
     lines.push(Line::from(""));
     // 主题预览：用当前主题的对/错色渲染示意文字。
@@ -5751,15 +5829,12 @@ fn upload_lines(upload: &UploadState, theme: Theme) -> Vec<Line<'static>> {
     }
 }
 
-/// 内置赛文每页显示的单位数（单字赛文每页 10 字，词组赛文每页 10 个词）。
-const BUILTIN_ITEMS_PER_PAGE: usize = dazitui_core::GROUP_SIZE;
-
 /// 单字赛文当前页的起始字符索引：基于已全对完成的组数。
 fn builtin_page_start(session: &Session) -> usize {
-    session.completed_groups() * BUILTIN_ITEMS_PER_PAGE
+    session.completed_groups() * session.group_size()
 }
 
-/// 对照区：将当前页 10 个词的原文按跟打状态着色，词间插入空格 span（不可打）。
+/// 对照区：将当前页指定数量词的原文按跟打状态着色，词间插入空格 span（不可打）。
 fn build_word_spans(
     session: &Session,
     word_boundaries: &[(usize, usize)],
@@ -5795,7 +5870,7 @@ fn build_word_spans(
     spans
 }
 
-/// 跟打区：将当前页 10 个词的已打字符按对/错着色，词间插入空格 span。
+/// 跟打区：将当前页指定数量词的已打字符按对/错着色，词间插入空格 span。
 fn build_word_type_spans(
     display: &[(char, CharStatus)],
     word_boundaries: &[(usize, usize)],
@@ -5836,10 +5911,11 @@ fn build_word_type_spans(
 
 /// 将对照区的字符按跟打状态着色：已打对=correct、已打错=wrong、未打到=默认。
 ///
-/// 内置赛文只显示当前页：单字赛文每页 10 字、词组赛文每页 10 个词（词间加空格、去逗号）；
+/// 内置赛文只显示当前页：单字赛文每页 group_size 字、词组赛文每页 group_size 个词（词间加空格、去逗号）；
 /// 打完当前页自动翻页；其余来源显示全文（由终端宽度自动折行）。
 fn original_line(session: &Session, text: &Text, theme: Theme, bold: bool) -> TextLines<'static> {
     let source = text.source;
+    let group_size = session.group_size();
     if let TextSource::Builtin { set } = source {
         if set.is_words() {
             let owned_boundaries;
@@ -5851,7 +5927,7 @@ fn original_line(session: &Session, text: &Text, theme: Theme, bold: bool) -> Te
                 }
             };
             let page_start_word = builtin_page_start(session);
-            let page_end_word = (page_start_word + BUILTIN_ITEMS_PER_PAGE).min(boundaries.len());
+            let page_end_word = (page_start_word + group_size).min(boundaries.len());
             if page_start_word >= boundaries.len() {
                 return TextLines::default();
             }
@@ -5867,13 +5943,13 @@ fn original_line(session: &Session, text: &Text, theme: Theme, bold: bool) -> Te
             text_lines.push_line(Line::from(spans));
             return text_lines;
         }
-        // 单字赛文：每页 10 字
+        // 单字赛文：每页 group_size 字
         let start = builtin_page_start(session);
         let statuses: Vec<_> = session
             .original_status()
             .into_iter()
             .skip(start)
-            .take(BUILTIN_ITEMS_PER_PAGE)
+            .take(group_size)
             .collect();
         let spans: Vec<Span<'static>> = statuses
             .into_iter()
@@ -5886,7 +5962,7 @@ fn original_line(session: &Session, text: &Text, theme: Theme, bold: bool) -> Te
                 Span::styled(c.to_string(), style.add_modifier(bold_modifier(bold)))
             })
             .collect();
-        return group_spans(spans, source);
+        return group_spans(spans, source, group_size);
     }
     // 非内置赛文：全文单行
     let spans: Vec<Span<'static>> = session
@@ -5901,15 +5977,16 @@ fn original_line(session: &Session, text: &Text, theme: Theme, bold: bool) -> Te
             Span::styled(c.to_string(), style.add_modifier(bold_modifier(bold)))
         })
         .collect();
-    group_spans(spans, source)
+    group_spans(spans, source, group_size)
 }
 
 /// 将跟打区的字符按对/错渲染为 correct/wrong。
 ///
-/// 内置赛文只显示当前页：单字赛文每页 10 字、词组赛文每页 10 个词（词间加空格、去逗号）；
+/// 内置赛文只显示当前页：单字赛文每页 group_size 字、词组赛文每页 group_size 个词（词间加空格、去逗号）；
 /// 打完当前页自动翻页；其余来源显示全文（由终端宽度自动折行）。
 fn type_line(session: &Session, text: &Text, theme: Theme, bold: bool) -> TextLines<'static> {
     let source = text.source;
+    let group_size = session.group_size();
     if let TextSource::Builtin { set } = source {
         if set.is_words() {
             let owned_boundaries;
@@ -5927,7 +6004,7 @@ fn type_line(session: &Session, text: &Text, theme: Theme, bold: bool) -> TextLi
                 );
             }
             let page_start_word = builtin_page_start(session);
-            let page_end_word = (page_start_word + BUILTIN_ITEMS_PER_PAGE).min(boundaries.len());
+            let page_end_word = (page_start_word + group_size).min(boundaries.len());
             if page_start_word >= boundaries.len() {
                 return TextLines::default();
             }
@@ -5949,13 +6026,13 @@ fn type_line(session: &Session, text: &Text, theme: Theme, bold: bool) -> TextLi
             text_lines.push_line(Line::from(spans));
             return text_lines;
         }
-        // 单字赛文：每页 10 字
+        // 单字赛文：每页 group_size 字
         let start = builtin_page_start(session);
         let display: Vec<_> = session
             .display()
             .into_iter()
             .skip(start)
-            .take(BUILTIN_ITEMS_PER_PAGE)
+            .take(group_size)
             .collect();
         if display.is_empty() {
             return TextLines::from(
@@ -5972,7 +6049,7 @@ fn type_line(session: &Session, text: &Text, theme: Theme, bold: bool) -> TextLi
                 Span::styled(c.to_string(), style.add_modifier(bold_modifier(bold)))
             })
             .collect();
-        return group_spans(spans, source);
+        return group_spans(spans, source, group_size);
     }
     // 非内置赛文：全文单行
     let display = session.display();
@@ -5991,15 +6068,15 @@ fn type_line(session: &Session, text: &Text, theme: Theme, bold: bool) -> TextLi
             Span::styled(c.to_string(), style.add_modifier(bold_modifier(bold)))
         })
         .collect();
-    group_spans(spans, source)
+    group_spans(spans, source, group_size)
 }
 
-/// 把已着色的 span 序列按赛文来源组织成多行文本：单字内置赛文每页 10 字一行，其余为单行。
+/// 把已着色的 span 序列按赛文来源组织成多行文本：单字内置赛文每页 group_size 字一行，其余为单行。
 /// 词组赛文已在调用方按页组装，不走此函数。
-fn group_spans(spans: Vec<Span<'static>>, source: TextSource) -> TextLines<'static> {
+fn group_spans(spans: Vec<Span<'static>>, source: TextSource, group_size: usize) -> TextLines<'static> {
     let mut text = TextLines::default();
     if matches!(source, TextSource::Builtin { set } if !set.is_words()) {
-        for chunk in spans.chunks(BUILTIN_ITEMS_PER_PAGE) {
+        for chunk in spans.chunks(group_size) {
             text.push_line(Line::from(chunk.to_vec()));
         }
     } else {
@@ -6430,7 +6507,7 @@ mod tests {
         let session = Session::new_gated_with_words(&text.content, true, boundaries);
         let rendered = original_line(&session, &text, theme, false);
         assert_eq!(rendered.lines.len(), 1, "乱序词组对照区应只有一行");
-        let first_page_words = boundaries.len().min(BUILTIN_ITEMS_PER_PAGE);
+        let first_page_words = boundaries.len().min(session.group_size());
         let space_spans = rendered.lines[0]
             .spans
             .iter()
@@ -6677,11 +6754,11 @@ mod tests {
 
     #[test]
     fn move_focus_wraps_around() {
-        // SETTINGS_FOCUS_COUNT = 6（主题/占比/粗体/实时键盘/反查方案/上传名称）
-        assert_eq!(move_focus(0, -1), 5); // 第 0 项向前 → 末项（5）
-        assert_eq!(move_focus(5, 1), 0); // 末项向后 → 第 0 项
+        // SETTINGS_FOCUS_COUNT = 7（主题/占比/粗体/实时键盘/反查方案/上传名称/分组大小）
+        assert_eq!(move_focus(0, -1), 6); // 第 0 项向前 → 末项（6）
+        assert_eq!(move_focus(6, 1), 0); // 末项向后 → 第 0 项
         assert_eq!(move_focus(0, 1), 1);
-        assert_eq!(move_focus(4, 1), 5);
+        assert_eq!(move_focus(5, 1), 6);
         assert_eq!(move_focus(2, -1), 1);
     }
 
@@ -7314,7 +7391,7 @@ mod tests {
         let rendered = original_line(&session, &text, theme, false);
         assert_eq!(rendered.lines.len(), 1, "词组赛文应只有一行");
         // 第 1 页 10 个词，词间 9 个空格 span
-        let first_page_words = boundaries.len().min(BUILTIN_ITEMS_PER_PAGE);
+        let first_page_words = boundaries.len().min(session.group_size());
         let word_chars: usize = boundaries
             .iter()
             .take(first_page_words)
@@ -7361,7 +7438,7 @@ mod tests {
         // 打满第 1 组 10 个词的全部字符（全对）
         let first_page_char_count: usize = boundaries
             .iter()
-            .take(BUILTIN_ITEMS_PER_PAGE)
+            .take(session.group_size())
             .map(|(s, e)| e - s)
             .sum();
         let first_page_chars: String = no_commas.chars().take(first_page_char_count).collect();
@@ -7434,7 +7511,7 @@ mod tests {
         // 打满第 1 组 10 个词的全部字符（全对）
         let first_page_char_count: usize = boundaries
             .iter()
-            .take(BUILTIN_ITEMS_PER_PAGE)
+            .take(session.group_size())
             .map(|(s, e)| e - s)
             .sum();
         let first_page_chars: String = no_commas.chars().take(first_page_char_count).collect();
@@ -7451,7 +7528,7 @@ mod tests {
         };
         let rendered = original_line(&session, &word_text, theme, false);
         assert_eq!(rendered.lines.len(), 1, "第 2 组应只有一行");
-        let second_page_words = boundaries.len().min(BUILTIN_ITEMS_PER_PAGE);
+        let second_page_words = boundaries.len().min(session.group_size());
         let space_spans = rendered.lines[0]
             .spans
             .iter()
@@ -10312,6 +10389,96 @@ mod tests {
         activate_sidebar_menu_item(&mut app, &mut terminal).unwrap();
 
         assert!(matches!(app.state, AppState::Sponsor));
+    }
+
+    #[test]
+    fn test_group_size_customization_and_cycle() {
+        let dir = temp_dir("test_group_size_cycle");
+        fs::create_dir_all(&dir).unwrap();
+        let store = SettingsStore::new(dir.join("settings.json"));
+        let settings = store.load();
+        assert_eq!(settings.group_size, 10);
+
+        let mut app = App::new_with(
+            load_builtin_text(BUILTIN_SETS[0]),
+            TokenStore::new(dir.join("token.json")),
+            ApiClient::new(),
+            store,
+            None,
+        );
+
+        assert_eq!(app.settings.group_size, 10);
+        assert_eq!(app.session.group_size(), 10);
+
+        // g 键循环切换预设 (10 -> 15 -> 20 -> 25 -> 30 -> 50 -> 5 -> 10)
+        app.cycle_group_size();
+        assert_eq!(app.settings.group_size, 15);
+        assert_eq!(app.session.group_size(), 15);
+
+        app.cycle_group_size();
+        assert_eq!(app.settings.group_size, 20);
+        assert_eq!(app.session.group_size(), 20);
+
+        // 重启或重新载入赛文后依然保留分组
+        app.load_selected_builtin();
+        assert_eq!(app.session.group_size(), 20);
+        app.restart();
+        assert_eq!(app.session.group_size(), 20);
+    }
+
+    #[test]
+    fn test_settings_group_size_row_rendering_and_step_adjustment() {
+        let dir = temp_dir("test_settings_group_size");
+        fs::create_dir_all(&dir).unwrap();
+        let store = SettingsStore::new(dir.join("settings.json"));
+        let mut app = App::new_with(
+            load_builtin_text(BUILTIN_SETS[0]),
+            TokenStore::new(dir.join("token.json")),
+            ApiClient::new(),
+            store,
+            None,
+        );
+
+        app.state = AppState::Settings;
+        app.settings_focus = FOCUS_GROUP_SIZE;
+
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| ui(f, &app)).unwrap();
+
+        let buffer = terminal.backend().buffer().clone();
+        let full_text: String = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect();
+        let clean = full_text.replace(' ', "");
+        assert!(clean.contains("分组大小:10字/词"));
+    }
+
+    #[test]
+    fn test_builtin_pagination_with_custom_group_size() {
+        let theme = Theme::preset(ThemePreset::CatppuccinMocha);
+        let text = load_builtin_text(BUILTIN_SETS[0]); // 常用单字前五百
+        let wb = text.session_word_boundaries();
+
+        // 构造 group_size = 5 的会话
+        let mut session = Session::new_gated_with_words_and_size(&text.content, true, &wb, 5);
+        assert_eq!(session.group_size(), 5);
+
+        let rendered = original_line(&session, &text, theme, false);
+        assert_eq!(rendered.lines[0].spans.len(), 5, "分组为 5 时对照区首页只显示 5 字");
+
+        // 全对打完 5 个字翻页
+        let first_5: String = text.content.chars().take(5).collect();
+        session.type_text(&first_5);
+        assert_eq!(session.completed_groups(), 1);
+
+        let rendered_p2 = original_line(&session, &text, theme, false);
+        assert_eq!(rendered_p2.lines[0].spans.len(), 5, "翻页后第二页也是 5 字");
     }
 }
 

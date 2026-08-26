@@ -336,6 +336,8 @@ pub struct Settings {
     pub scheme_dict_paths: HashMap<String, String>,
     /// 键位热力图布局模式。
     pub heatmap_layout: HeatmapLayout,
+    /// 内置赛文每组大小（单字赛文字数 / 词组赛文词数）。
+    pub group_size: u8,
 }
 
 impl Settings {
@@ -345,6 +347,14 @@ impl Settings {
     pub const RATIO_MAX: u8 = 80;
     /// 输入法名称的最大长度（字符数，遵守 52dazi 协议限制）。
     pub const INPUT_METHOD_MAX_CHARS: usize = 20;
+    /// 分组大小的合法下限。
+    pub const GROUP_SIZE_MIN: u8 = 1;
+    /// 分组大小的合法上限。
+    pub const GROUP_SIZE_MAX: u8 = 50;
+    /// 默认分组大小。
+    pub const DEFAULT_GROUP_SIZE: u8 = 10;
+    /// 常用快捷预设档位列表。
+    pub const GROUP_SIZE_PRESETS: &'static [u8] = &[5, 10, 15, 20, 25, 30, 50];
 
     /// 校验并修正占比到合法范围。
     pub fn clamp_ratio(ratio: u8) -> u8 {
@@ -355,6 +365,21 @@ impl Settings {
     pub fn clamp_input_method(s: &str) -> String {
         let trimmed = s.trim();
         trimmed.chars().take(Self::INPUT_METHOD_MAX_CHARS).collect()
+    }
+
+    /// 校验并修正分组大小到合法范围。
+    pub fn clamp_group_size(size: u8) -> u8 {
+        size.clamp(Self::GROUP_SIZE_MIN, Self::GROUP_SIZE_MAX)
+    }
+
+    /// 循环获取下一个预设分组大小档位。
+    pub fn next_group_size_preset(current: u8) -> u8 {
+        for &preset in Self::GROUP_SIZE_PRESETS {
+            if preset > current {
+                return preset;
+            }
+        }
+        Self::GROUP_SIZE_PRESETS[0]
     }
 }
 
@@ -369,6 +394,7 @@ impl Default for Settings {
             input_method: String::new(),
             scheme_dict_paths: HashMap::new(),
             heatmap_layout: HeatmapLayout::Staggered,
+            group_size: Self::DEFAULT_GROUP_SIZE,
         }
     }
 }
@@ -416,7 +442,7 @@ impl SettingsStore {
             std::fs::create_dir_all(parent)?;
         }
         let mut content = format!(
-            "theme={}\nreference_ratio={}\nbold={}\nkeyboard_mode={}\nscheme={}\ninput_method={}\nheatmap_layout={}\n",
+            "theme={}\nreference_ratio={}\nbold={}\nkeyboard_mode={}\nscheme={}\ninput_method={}\nheatmap_layout={}\ngroup_size={}\n",
             settings.theme.as_str(),
             settings.reference_ratio,
             settings.bold,
@@ -424,6 +450,7 @@ impl SettingsStore {
             settings.scheme,
             settings.input_method,
             settings.heatmap_layout.as_str(),
+            settings.group_size,
         );
         for (scheme, path) in &settings.scheme_dict_paths {
             content.push_str(&format!("scheme_dict.{}={}\n", scheme, path));
@@ -475,6 +502,11 @@ impl SettingsStore {
                 "heatmap_layout" => {
                     if let Some(layout) = HeatmapLayout::parse(value) {
                         settings.heatmap_layout = layout;
+                    }
+                }
+                "group_size" => {
+                    if let Ok(size) = value.parse::<u8>() {
+                        settings.group_size = Settings::clamp_group_size(size);
                     }
                 }
                 _ => {
@@ -649,6 +681,7 @@ mod tests {
             keyboard_mode: KeyboardMode::Staggered,
             scheme: "yoyo-pure".to_string(),
             input_method: "虎码".to_string(),
+            group_size: 10,
             scheme_dict_paths,
             heatmap_layout: HeatmapLayout::Ortholinear,
         };
@@ -864,6 +897,41 @@ mod tests {
         store.save(&s2).unwrap();
         let loaded2 = store.load();
         assert_eq!(loaded2.heatmap_layout, HeatmapLayout::Staggered);
+        let _ = std::fs::remove_file(store.path());
+    }
+
+    #[test]
+    fn group_size_clamp_and_presets() {
+        assert_eq!(Settings::clamp_group_size(0), 1);
+        assert_eq!(Settings::clamp_group_size(1), 1);
+        assert_eq!(Settings::clamp_group_size(10), 10);
+        assert_eq!(Settings::clamp_group_size(50), 50);
+        assert_eq!(Settings::clamp_group_size(100), 50);
+
+        assert_eq!(Settings::next_group_size_preset(5), 10);
+        assert_eq!(Settings::next_group_size_preset(10), 15);
+        assert_eq!(Settings::next_group_size_preset(15), 20);
+        assert_eq!(Settings::next_group_size_preset(20), 25);
+        assert_eq!(Settings::next_group_size_preset(25), 30);
+        assert_eq!(Settings::next_group_size_preset(30), 50);
+        assert_eq!(Settings::next_group_size_preset(50), 5);
+        assert_eq!(Settings::next_group_size_preset(7), 10);
+    }
+
+    #[test]
+    fn store_group_size_roundtrip() {
+        let store = SettingsStore::new(temp_path("group_size_roundtrip"));
+        let s = Settings {
+            group_size: 25,
+            ..Default::default()
+        };
+        store.save(&s).unwrap();
+        let loaded = store.load();
+        assert_eq!(loaded.group_size, 25);
+
+        // 缺省时回退到默认值 10
+        std::fs::write(store.path(), "theme=default\n").unwrap();
+        assert_eq!(store.load().group_size, 10);
         let _ = std::fs::remove_file(store.path());
     }
 }

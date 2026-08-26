@@ -166,6 +166,7 @@ pub struct Session {
     group_gated: bool,
     group_bounds: Vec<(usize, usize)>,
     events: Vec<TypingEvent>,
+    group_size: usize,
 }
 
 impl Session {
@@ -174,24 +175,32 @@ impl Session {
         Self::new_gated(original, false)
     }
 
-    /// 以赛文原文初始化跟打会话，指定是否启用组边界门槛（内置赛文）。
+    /// 以赛文原文初始化跟打会话，指定是否启用组边界门槛（内置赛文，使用默认组大小 10）。
     pub fn new_gated(original: &str, group_gated: bool) -> Self {
         Self::new_gated_with_words(original, group_gated, &[])
     }
 
-    /// 以赛文原文初始化跟打会话，指定组边界门槛及词组边界。
-    ///
-    /// `word_boundaries` 为词组赛文每个词的 `(char_start, char_end)` 范围。
-    /// 非空时按词组确定组边界（每组 `GROUP_SIZE` 个词）；为空时回退到单字逻辑。
+    /// 以赛文原文初始化跟打会话，指定组边界门槛及词组边界（默认组大小 10）。
     pub fn new_gated_with_words(
         original: &str,
         group_gated: bool,
         word_boundaries: &[(usize, usize)],
     ) -> Self {
+        Self::new_gated_with_words_and_size(original, group_gated, word_boundaries, GROUP_SIZE)
+    }
+
+    /// 以赛文原文初始化跟打会话，指定组边界门槛、词组边界及自定义分组大小。
+    pub fn new_gated_with_words_and_size(
+        original: &str,
+        group_gated: bool,
+        word_boundaries: &[(usize, usize)],
+        group_size: usize,
+    ) -> Self {
+        let group_size = group_size.max(1);
         let group_bounds = if group_gated && !word_boundaries.is_empty() {
-            // 每 GROUP_SIZE 个词合并为一组的字符范围
+            // 每 group_size 个词合并为一组的字符范围
             word_boundaries
-                .chunks(GROUP_SIZE)
+                .chunks(group_size)
                 .map(|chunk| {
                     let start = chunk.first().map(|b| b.0).unwrap_or(0);
                     let end = chunk.last().map(|b| b.1).unwrap_or(0);
@@ -213,6 +222,7 @@ impl Session {
             group_gated,
             group_bounds,
             events: Vec::new(),
+            group_size,
         }
     }
 
@@ -589,14 +599,14 @@ impl Session {
     ///
     /// 组边界门槛（内置赛文）：所有组全部全对才算完成。
     /// 词组赛文：`completed_groups >= group_bounds.len()`。
-    /// 单字赛文：`completed_groups * GROUP_SIZE >= original.len()`。
+    /// 单字赛文：`completed_groups * group_size >= original.len()`。
     /// 非门槛模式：上屏长度 ≥ 原文长度即完成。
     pub fn is_complete(&self) -> bool {
         if self.group_gated {
             if !self.group_bounds.is_empty() {
                 self.completed_groups >= self.group_bounds.len()
             } else {
-                self.completed_groups * GROUP_SIZE >= self.original.len()
+                self.completed_groups * self.group_size >= self.original.len()
             }
         } else {
             self.input.len() >= self.original.len()
@@ -613,17 +623,33 @@ impl Session {
         self.completed_groups
     }
 
+    /// 当前会话的分组大小（字/词数）。
+    pub fn group_size(&self) -> usize {
+        self.group_size
+    }
+
+    /// 总组数。
+    pub fn total_groups(&self) -> usize {
+        if !self.group_bounds.is_empty() {
+            self.group_bounds.len()
+        } else if self.original.is_empty() {
+            0
+        } else {
+            (self.original.len() + self.group_size - 1) / self.group_size
+        }
+    }
+
     /// 当前组的字符范围 `[start, end)`（`end` 尾组截断到原文长度）。
     ///
-    /// 词组赛文（`group_bounds` 非空）：按词组边界确定，每组 `GROUP_SIZE` 个词。
-    /// 单字赛文（`group_bounds` 为空）：按字符索引，每组 `GROUP_SIZE` 字。
+    /// 词组赛文（`group_bounds` 非空）：按词组边界确定，每组 `group_size` 个词。
+    /// 单字赛文（`group_bounds` 为空）：按字符索引，每组 `group_size` 字。
     fn current_group_bounds(&self) -> (usize, usize) {
         if let Some(&(s, e)) = self.group_bounds.get(self.completed_groups) {
             let end = e.min(self.original.len());
             (s, end)
         } else {
-            let start = self.completed_groups * GROUP_SIZE;
-            let end = (start + GROUP_SIZE).min(self.original.len());
+            let start = self.completed_groups * self.group_size;
+            let end = (start + self.group_size).min(self.original.len());
             (start, end)
         }
     }
@@ -1109,6 +1135,54 @@ mod tests {
         // 2 字 / 0.5s * 60 = 240 WPM，而非 579,433 WPM
         assert_eq!(stats.wpm, 240.0);
         assert!(stats.wpm <= 2000.0);
+    }
+
+    #[test]
+    fn custom_group_size_single_chars() {
+        // 12 字赛文，每组 5 字
+        let mut session = Session::new_gated_with_words_and_size("一二三四五六七八九十一二", true, &[], 5);
+        assert_eq!(session.group_size(), 5);
+        assert_eq!(session.total_groups(), 3); // 5 + 5 + 2 = 3 组
+        assert_eq!(session.completed_groups(), 0);
+
+        // 输入 5 字全对
+        session.type_text("一二三四五");
+        assert_eq!(session.completed_groups(), 1);
+        assert!(!session.is_complete());
+
+        // 输入第 2 组 5 字
+        session.type_text("六七八九十");
+        assert_eq!(session.completed_groups(), 2);
+        assert!(!session.is_complete());
+
+        // 输入最后 2 字
+        session.type_text("一二");
+        assert_eq!(session.completed_groups(), 3);
+        assert!(session.is_complete());
+    }
+
+    #[test]
+    fn custom_group_size_words() {
+        // 6 个词，每组 3 词
+        let word_bounds = vec![(0, 2), (2, 4), (4, 6), (6, 8), (8, 10), (10, 12)];
+        let mut session = Session::new_gated_with_words_and_size(
+            "我们大家一起练习跟打输入",
+            true,
+            &word_bounds,
+            3,
+        );
+        assert_eq!(session.group_size(), 3);
+        assert_eq!(session.total_groups(), 2); // 6 词 / 3 = 2 组
+
+        // 输入前 3 词
+        session.type_text("我们大家一起");
+        assert_eq!(session.completed_groups(), 1);
+        assert!(!session.is_complete());
+
+        // 输入后 3 词
+        session.type_text("练习跟打输入");
+        assert_eq!(session.completed_groups(), 2);
+        assert!(session.is_complete());
     }
 }
 
