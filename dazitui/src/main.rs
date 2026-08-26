@@ -1388,16 +1388,89 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                 }
                 match app.state {
                     AppState::Typing => {
-                        if is_early_finish(key) {
-                            finish_and_maybe_upload(&mut app, terminal)?;
+                        if !app.session.is_empty() && !app.paused {
+                            // 跟打进行中：Esc 或 Tab 暂停切入 Normal 菜单态
+                            if key.code == KeyCode::Esc || key.code == KeyCode::Tab {
+                                app.pause();
+                                continue;
+                            }
+                            if matches!(key.code, KeyCode::Backspace | KeyCode::Char(_)) {
+                                app.touch_typing();
+                                let elapsed = app.current_elapsed();
+                                handle_key(
+                                    &mut app.session,
+                                    &mut app.live_keyboard,
+                                    app.scheme_dict.as_ref(),
+                                    key,
+                                    elapsed,
+                                    Instant::now(),
+                                );
+                                if app.session.is_complete() {
+                                    finish_and_maybe_upload(&mut app, terminal)?;
+                                }
+                            }
                             continue;
                         }
+
+                        // 就绪态 (app.session.is_empty()) 或 暂停态 (app.paused) —— Normal 命令态
+                        if key.code == KeyCode::Tab {
+                            if app.paused {
+                                app.resume();
+                            } else {
+                                app.sidebar_visible = !app.sidebar_visible;
+                            }
+                            continue;
+                        }
+
+                        if app.paused {
+                            if key.code == KeyCode::Esc || key.code == KeyCode::Char('i') || key.code == KeyCode::Char('I') {
+                                app.resume();
+                                continue;
+                            }
+                            if is_early_finish(key) {
+                                finish_and_maybe_upload(&mut app, terminal)?;
+                                continue;
+                            }
+                        }
+
+                        // Vim jk 上下移动功能栏菜单
+                        if key.code == KeyCode::Up || key.code == KeyCode::Char('k') || key.code == KeyCode::Char('K') {
+                            app.sidebar_selected = if app.sidebar_selected == 0 {
+                                SIDEBAR_MENU_ITEMS.len() - 1
+                            } else {
+                                app.sidebar_selected - 1
+                            };
+                            continue;
+                        }
+                        if key.code == KeyCode::Down || key.code == KeyCode::Char('j') || key.code == KeyCode::Char('J') {
+                            app.sidebar_selected =
+                                (app.sidebar_selected + 1) % SIDEBAR_MENU_ITEMS.len();
+                            continue;
+                        }
+                        if key.code == KeyCode::Enter || key.code == KeyCode::Char('l') {
+                            activate_sidebar_menu_item(&mut app, terminal)?;
+                            continue;
+                        }
+
+                        // 助记快捷键直达
                         if is_open_browser(key) {
                             app.open_browser();
                             continue;
                         }
                         if is_open_builtin_browser(key) {
                             app.open_builtin_browser();
+                            continue;
+                        }
+                        if is_open_free_input(key) {
+                            app.open_free_input();
+                            continue;
+                        }
+                        if is_load_clipboard(key) {
+                            app.load_from_clipboard();
+                            continue;
+                        }
+                        if is_open_stats(key) {
+                            app.state = AppState::Stats(StatsViewState::new(app.settings.heatmap_layout));
                             continue;
                         }
                         if is_open_settings(key) {
@@ -1413,50 +1486,12 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                             continue;
                         }
 
-                        // Tab 键：打字中途暂停/恢复；就绪态收起/展开功能栏
-                        if key.code == KeyCode::Tab {
-                            if !app.session.is_empty() {
-                                if app.paused {
-                                    app.resume();
-                                } else {
-                                    app.pause();
-                                }
-                            } else {
-                                app.sidebar_visible = !app.sidebar_visible;
-                            }
-                            continue;
+                        if key.code == KeyCode::Char('q') || key.code == KeyCode::Char('Q') {
+                            return Ok(());
                         }
 
-                        // 就绪态或暂停态下，上下键在功能栏导航，Enter 激活菜单项
-                        let is_menu_navigating = app.session.is_empty() || app.paused;
-                        if is_menu_navigating {
-                            match key.code {
-                                KeyCode::Up => {
-                                    app.sidebar_selected = if app.sidebar_selected == 0 {
-                                        SIDEBAR_MENU_ITEMS.len() - 1
-                                    } else {
-                                        app.sidebar_selected - 1
-                                    };
-                                    continue;
-                                }
-                                KeyCode::Down => {
-                                    app.sidebar_selected =
-                                        (app.sidebar_selected + 1) % SIDEBAR_MENU_ITEMS.len();
-                                    continue;
-                                }
-                                KeyCode::Enter => {
-                                    activate_sidebar_menu_item(&mut app, terminal)?;
-                                    continue;
-                                }
-                                KeyCode::Esc if app.paused => {
-                                    app.resume();
-                                    continue;
-                                }
-                                _ => {}
-                            }
-                        }
-
-                        if matches!(key.code, KeyCode::Backspace | KeyCode::Char(_)) {
+                        // 就绪态下输入非命令字符（如中文输入法上屏或英文首字）-> 自动切入跟打态
+                        if app.session.is_empty() && matches!(key.code, KeyCode::Backspace | KeyCode::Char(_)) {
                             app.touch_typing();
                             let elapsed = app.current_elapsed();
                             handle_key(
@@ -1477,43 +1512,71 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                             continue;
                         }
                     }
-                    AppState::Browsing => match key.code {
-                        KeyCode::Up => {
-                            app.browse_selection = app.browse_selection.saturating_sub(1);
+                    AppState::Browsing => {
+                        if is_open_settings(key) {
+                            app.state = AppState::Settings;
+                            continue;
                         }
-                        KeyCode::Down => {
-                            if !app.browse_files.is_empty() {
-                                app.browse_selection =
-                                    (app.browse_selection + 1).min(app.browse_files.len() - 1);
+                        match key.code {
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                app.browse_selection = app.browse_selection.saturating_sub(1);
                             }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                if !app.browse_files.is_empty() {
+                                    app.browse_selection =
+                                        (app.browse_selection + 1).min(app.browse_files.len() - 1);
+                                }
+                            }
+                            KeyCode::Char('g') | KeyCode::Home => {
+                                app.browse_selection = 0;
+                            }
+                            KeyCode::Char('G') | KeyCode::End => {
+                                if !app.browse_files.is_empty() {
+                                    app.browse_selection = app.browse_files.len() - 1;
+                                }
+                            }
+                            KeyCode::Enter | KeyCode::Char('l') => app.load_selected(),
+                            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('h') => app.state = AppState::Typing,
+                            _ => {}
                         }
-                        KeyCode::Enter => app.load_selected(),
-                        KeyCode::Esc => app.state = AppState::Typing,
-                        _ => {}
-                    },
-                    AppState::BrowsingBuiltin => match key.code {
-                        KeyCode::Up => {
-                            app.builtin_selection = app.builtin_selection.saturating_sub(1);
-                            app.refresh_builtin_preview();
+                    }
+                    AppState::BrowsingBuiltin => {
+                        if is_open_settings(key) {
+                            app.state = AppState::Settings;
+                            continue;
                         }
-                        KeyCode::Down => {
-                            app.builtin_selection =
-                                (app.builtin_selection + 1).min(BUILTIN_SETS.len() - 1);
-                            app.refresh_builtin_preview();
+                        match key.code {
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                app.builtin_selection = app.builtin_selection.saturating_sub(1);
+                                app.refresh_builtin_preview();
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                app.builtin_selection =
+                                    (app.builtin_selection + 1).min(BUILTIN_SETS.len() - 1);
+                                app.refresh_builtin_preview();
+                            }
+                            KeyCode::Char('g') | KeyCode::Home => {
+                                app.builtin_selection = 0;
+                                app.refresh_builtin_preview();
+                            }
+                            KeyCode::Char('G') | KeyCode::End => {
+                                app.builtin_selection = BUILTIN_SETS.len().saturating_sub(1);
+                                app.refresh_builtin_preview();
+                            }
+                            KeyCode::Enter | KeyCode::Char('l') => app.load_selected_builtin(),
+                            KeyCode::Char('s') | KeyCode::Char('S') => {
+                                app.builtin_shuffle = !app.builtin_shuffle;
+                                app.refresh_builtin_preview();
+                            }
+                            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('h') => app.state = AppState::Typing,
+                            _ => {}
                         }
-                        KeyCode::Enter => app.load_selected_builtin(),
-                        KeyCode::Char('s') | KeyCode::Char('S') => {
-                            app.builtin_shuffle = !app.builtin_shuffle;
-                            app.refresh_builtin_preview();
-                        }
-                        KeyCode::Esc => app.state = AppState::Typing,
-                        _ => {}
-                    },
+                    }
                     AppState::Settings => match key.code {
-                        KeyCode::Up => app.settings_focus = move_focus(app.settings_focus, -1),
-                        KeyCode::Down => app.settings_focus = move_focus(app.settings_focus, 1),
-                        KeyCode::Left | KeyCode::Right => {
-                            let forward = key.code == KeyCode::Right;
+                        KeyCode::Up | KeyCode::Char('k') => app.settings_focus = move_focus(app.settings_focus, -1),
+                        KeyCode::Down | KeyCode::Char('j') => app.settings_focus = move_focus(app.settings_focus, 1),
+                        KeyCode::Left | KeyCode::Char('h') | KeyCode::Right | KeyCode::Char('l') => {
+                            let forward = key.code == KeyCode::Right || key.code == KeyCode::Char('l');
                             match app.settings_focus {
                                 FOCUS_THEME => {
                                     if forward {
@@ -1568,7 +1631,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                                     Some(TextSettingModal::new(TextSettingTarget::InputMethod, &app.settings.input_method));
                             }
                         }
-                        KeyCode::Esc => app.state = AppState::Typing,
+                        KeyCode::Esc | KeyCode::Char('q') => app.state = AppState::Typing,
                         _ => {}
                     },
                     AppState::Stats(ref mut stats_state) => {
@@ -1580,14 +1643,14 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                             KeyCode::Char('1') => stats_state.tab = StatsTab::WpmTrend,
                             KeyCode::Char('2') => stats_state.tab = StatsTab::Heatmap,
                             KeyCode::Char('3') => stats_state.tab = StatsTab::ErrorRanking,
-                            KeyCode::Tab | KeyCode::Right => {
+                            KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
                                 stats_state.tab = match stats_state.tab {
                                     StatsTab::WpmTrend => StatsTab::Heatmap,
                                     StatsTab::Heatmap => StatsTab::ErrorRanking,
                                     StatsTab::ErrorRanking => StatsTab::WpmTrend,
                                 };
                             }
-                            KeyCode::BackTab | KeyCode::Left => {
+                            KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
                                 stats_state.tab = match stats_state.tab {
                                     StatsTab::WpmTrend => StatsTab::ErrorRanking,
                                     StatsTab::Heatmap => StatsTab::WpmTrend,
@@ -1597,7 +1660,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                             KeyCode::Char('r') | KeyCode::Char('R') => {
                                 stats_state.wpm_range = stats_state.wpm_range.next();
                             }
-                            KeyCode::Char('l') | KeyCode::Char('L') => {
+                            KeyCode::Char('L') => {
                                 stats_state.heatmap_layout = stats_state.heatmap_layout.next();
                                 app.settings.heatmap_layout = stats_state.heatmap_layout;
                                 let _ = app.settings_store.save(&app.settings);
@@ -1653,7 +1716,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                                         stats_state.word_scroll.saturating_add(10);
                                 }
                             },
-                            KeyCode::Esc => app.state = AppState::Typing,
+                            KeyCode::Esc | KeyCode::Char('q') => app.state = AppState::Typing,
                             _ => {}
                         }
                     }
@@ -1794,17 +1857,17 @@ fn is_toggle_sidebar(key: KeyEvent) -> bool {
     key.code == KeyCode::Tab
 }
 
-/// 提前结束快捷键：Ctrl-S（Stop）。
+/// 提前结束快捷键：d / D（Done）。
 fn is_early_finish(key: KeyEvent) -> bool {
-    key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s')
+    key.modifiers.is_empty() && (key.code == KeyCode::Char('d') || key.code == KeyCode::Char('D'))
 }
 
-/// 重打快捷键：Ctrl-R（Restart）。
+/// 重打快捷键：r / R（Restart）。
 fn is_restart(key: KeyEvent) -> bool {
-    key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('r')
+    key.modifiers.is_empty() && (key.code == KeyCode::Char('r') || key.code == KeyCode::Char('R'))
 }
 
-/// 是否允许重打：离线赛文按 Ctrl-R 重打；在线赛文禁用重打。
+/// 是否允许重打：离线赛文按 r 重打；在线赛文禁用重打。
 fn restart_allowed(key: KeyEvent, is_online: bool) -> bool {
     is_restart(key) && !is_online
 }
@@ -1818,17 +1881,17 @@ fn hint_text(
     is_ready: bool,
 ) -> &'static str {
     if browsing {
-        " ↑↓ 选择 | Enter 载入 | Esc 取消 | Ctrl-E 设置 | Ctrl-Q 退出"
+        " jk 选择 | Enter 载入 | g/G 首尾 | Esc 取消 | o 设置 | q 退出"
     } else if browsing_builtin {
-        " ↑↓ 选择 | Enter 载入 | s 乱序 | Esc 取消 | Ctrl-Q 退出"
+        " jk 选择 | Enter 载入 | s 乱序 | g/G 首尾 | Esc 取消 | o 设置 | q 退出"
     } else if paused {
-        " ↑↓ 选择菜单 | Enter 激活 | Esc/Tab 恢复跟打 | Ctrl-Q 退出"
+        " jk 菜单导航 | Enter 执行 | i/Esc 恢复跟打 | d 提前结算 | r 重打 | s 统计 | o 设置 | Ctrl-Q 退出"
     } else if is_ready {
-        " ↑↓ 菜单导航 | Enter 执行 | 打字 自动聚焦 | Ctrl-B 内置 | Ctrl-F 载文 | Ctrl-Q 退出"
+        " jk 菜单导航 | Enter 执行 | f 载文 | b 内置 | i 自由发文 | p 剪贴板 | 1 极速杯 | s 统计 | o 设置 | Ctrl-Q 退出"
     } else if is_online {
-        " Ctrl-Q 退出 | Ctrl-S 结束 | Tab 暂停 | Ctrl-B 内置赛文 | Ctrl-F 载文 | Ctrl-O 登录 | Ctrl-E 设置 "
+        " Esc 暂停/命令 | Tab 侧栏 | s 统计 | o 设置 | u 登录 | Ctrl-Q 退出"
     } else {
-        " Ctrl-Q 退出 | Ctrl-S 结束 | Ctrl-R 重打 | Tab 暂停 | Ctrl-B 内置赛文 | Ctrl-F 载文 | Ctrl-O 登录 | Ctrl-E 设置 "
+        " Esc 暂停/命令 | Tab 侧栏 | r 重打 | s 统计 | o 设置 | Ctrl-Q 退出"
     }
 }
 
@@ -1884,7 +1947,6 @@ fn free_input_modal_input(modal: &mut FreeInputModal, key: KeyEvent) -> FreeInpu
         KeyCode::Char('d') | KeyCode::Char('D') if is_ctrl => true,
         KeyCode::Char('j') | KeyCode::Char('J') if is_ctrl => true,
         KeyCode::Char('m') | KeyCode::Char('M') if is_ctrl => true,
-        KeyCode::F(2) | KeyCode::F(10) => true,
         _ => false,
     };
 
@@ -2015,14 +2077,29 @@ fn try_submit_free_input(modal: &mut FreeInputModal) -> FreeInputAction {
     }
 }
 
-/// 进入载文浏览快捷键：Ctrl-F（File）。
+/// 进入载文浏览快捷键：f / F（File）。
 fn is_open_browser(key: KeyEvent) -> bool {
-    key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('f')
+    key.modifiers.is_empty() && (key.code == KeyCode::Char('f') || key.code == KeyCode::Char('F'))
 }
 
-/// 进入内置赛文浏览快捷键：Ctrl-B（Builtin）。
+/// 进入内置赛文浏览快捷键：b / B（Builtin）。
 fn is_open_builtin_browser(key: KeyEvent) -> bool {
-    key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('b')
+    key.modifiers.is_empty() && (key.code == KeyCode::Char('b') || key.code == KeyCode::Char('B'))
+}
+
+/// 打开自由发文模态框快捷键：i / I（Insert / Input）。
+fn is_open_free_input(key: KeyEvent) -> bool {
+    key.modifiers.is_empty() && (key.code == KeyCode::Char('i') || key.code == KeyCode::Char('I'))
+}
+
+/// 剪贴板发文快捷键：p / P（Paste / Put）。
+fn is_load_clipboard(key: KeyEvent) -> bool {
+    key.modifiers.is_empty() && (key.code == KeyCode::Char('p') || key.code == KeyCode::Char('P'))
+}
+
+/// 打开统计视图快捷键：s / S（Stats）。
+fn is_open_stats(key: KeyEvent) -> bool {
+    key.modifiers.is_empty() && (key.code == KeyCode::Char('s') || key.code == KeyCode::Char('S'))
 }
 
 /// 处理跟打键：退格回改，可打印字符上屏；同时记录按键频率与时序事件，并触发实时虚拟键盘（物理击键/汉字方案反查）高亮。
@@ -2070,10 +2147,15 @@ fn handle_key(
 }
 
 /// 处理成绩视图下的按键事件：
-/// - Ctrl-F: 打开载文浏览
-/// - Ctrl-B: 打开内置赛文浏览
-/// - Ctrl-E: 打开设置视图
-/// - Esc: 返回主界面（重置会话为就绪状态；在线赛文重置回内置赛文）
+/// - f / F: 打开载文浏览
+/// - b / B: 打开内置赛文浏览
+/// - i / I: 打开自由发文
+/// - p / P: 剪贴板发文
+/// - s / S: 打开数据统计
+/// - o / O: 打开设置视图
+/// - u / U: 打开登录模态框
+/// - 1/2/3: 在线比赛
+/// - Esc / q / Q: 返回主界面（重置会话为就绪状态；在线赛文重置回内置赛文）
 /// - Enter / r / R: 重新开始跟打当前赛文（仅限离线/内置赛文）
 fn handle_finished_key(app: &mut App, key: KeyEvent) -> bool {
     if is_open_browser(key) {
@@ -2084,16 +2166,33 @@ fn handle_finished_key(app: &mut App, key: KeyEvent) -> bool {
         app.open_builtin_browser();
         return true;
     }
+    if is_open_free_input(key) {
+        app.open_free_input();
+        return true;
+    }
+    if is_load_clipboard(key) {
+        app.load_from_clipboard();
+        return true;
+    }
+    if is_open_stats(key) {
+        app.state = AppState::Stats(StatsViewState::new(app.settings.heatmap_layout));
+        return true;
+    }
     if is_open_settings(key) {
         app.state = AppState::Settings;
         return true;
     }
+    if is_open_login(key) {
+        app.open_login();
+        return true;
+    }
+    if let Some(_ct) = online_shortcut(key) {
+        app.text = load_builtin_text(BUILTIN_SETS[0]);
+        app.restart();
+        return true;
+    }
     match key.code {
-        KeyCode::Char('s') | KeyCode::Char('S') => {
-            app.state = AppState::Stats(StatsViewState::new(app.settings.heatmap_layout));
-            true
-        }
-        KeyCode::Esc => {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
             if app.text.is_online() {
                 app.text = load_builtin_text(BUILTIN_SETS[0]);
             }
@@ -2118,25 +2217,25 @@ fn is_quit(key: KeyEvent) -> bool {
     is_ctrl_q || is_ctrl_c
 }
 
-/// 打开登录模态框快捷键：Ctrl-O。
+/// 打开登录模态框快捷键：u / U（User login）。
 fn is_open_login(key: KeyEvent) -> bool {
-    key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('o')
+    key.modifiers.is_empty() && (key.code == KeyCode::Char('u') || key.code == KeyCode::Char('U'))
 }
 
-/// 打开设置视图快捷键：Ctrl-E（Edit settings）。
+/// 打开设置视图快捷键：o / O（Options）。
 fn is_open_settings(key: KeyEvent) -> bool {
-    key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('e')
+    key.modifiers.is_empty() && (key.code == KeyCode::Char('o') || key.code == KeyCode::Char('O'))
 }
 
-/// 三个比赛入口快捷键：F1=极速杯、F2=锦标赛、F3=键神杯。
+/// 三个比赛入口快捷键：1=极速杯、2=锦标赛、3=键神杯。
 fn online_shortcut(key: KeyEvent) -> Option<CompetitionType> {
     if !key.modifiers.is_empty() {
         return None;
     }
     match key.code {
-        KeyCode::F(1) => Some(CompetitionType::Jisu),
-        KeyCode::F(2) => Some(CompetitionType::Jinbiao),
-        KeyCode::F(3) => Some(CompetitionType::Jianshen),
+        KeyCode::Char('1') => Some(CompetitionType::Jisu),
+        KeyCode::Char('2') => Some(CompetitionType::Jinbiao),
+        KeyCode::Char('3') => Some(CompetitionType::Jianshen),
         _ => None,
     }
 }
@@ -2323,6 +2422,30 @@ pub fn calculate_text_layout_position(
     (line, col)
 }
 
+/// 判断当前跟打页面是否未录入任何字符（处于空态或翻页后的初始就绪态）。
+fn is_current_page_empty(session: &Session, text: &Text) -> bool {
+    match text.source {
+        TextSource::Builtin { set } if set.is_words() => {
+            let start_word = builtin_page_start(session);
+            let owned;
+            let boundaries: &[(usize, usize)] = match &text.word_boundaries {
+                Some(b) if !b.is_empty() => b,
+                _ => {
+                    owned = set.word_boundaries();
+                    &owned
+                }
+            };
+            if start_word < boundaries.len() {
+                session.len() <= boundaries[start_word].0
+            } else {
+                session.is_empty()
+            }
+        }
+        TextSource::Builtin { .. } => session.len() <= builtin_page_start(session),
+        _ => session.is_empty(),
+    }
+}
+
 fn ui(frame: &mut Frame, app: &App) {
     if let AppState::Finished {
         stats,
@@ -2435,13 +2558,15 @@ fn ui(frame: &mut Frame, app: &App) {
             ref_block = ref_block.title_bottom(Line::from(spans).right_aligned());
         }
 
+        let is_builtin = matches!(app.text.source, TextSource::Builtin { .. });
+
         let ref_inner_width = ref_area.width.saturating_sub(2);
         let ref_inner_height = ref_area.height.saturating_sub(2);
-        let (ref_target_line, _) = calculate_text_layout_position(
-            app.text.content.chars().take(app.session.len()),
-            ref_inner_width,
-        );
-        let ref_scroll_y = if ref_inner_height > 0 {
+        let ref_scroll_y = if !is_builtin && ref_inner_height > 0 {
+            let (ref_target_line, _) = calculate_text_layout_position(
+                app.text.content.chars().take(app.session.len()),
+                ref_inner_width,
+            );
             ref_target_line.saturating_sub(ref_inner_height / 2)
         } else {
             0
@@ -2499,25 +2624,35 @@ fn ui(frame: &mut Frame, app: &App) {
 
         let type_inner_width = type_area.width.saturating_sub(2);
         let type_inner_height = type_area.height.saturating_sub(2);
-        let typed_chars: Vec<char> = app.session.display().into_iter().map(|(c, _)| c).collect();
-        let (type_cursor_line, type_cursor_col) =
-            calculate_text_layout_position(typed_chars.iter().copied(), type_inner_width);
-        let type_scroll_y = if type_inner_height > 0 {
+        let rendered_type_lines = type_line(
+            &app.session,
+            &app.text,
+            app.theme(),
+            app.settings.bold,
+        );
+
+        let (type_cursor_line, type_cursor_col) = if is_current_page_empty(&app.session, &app.text)
+        {
+            (0, 0)
+        } else {
+            let rendered_chars = rendered_type_lines
+                .lines
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .flat_map(|span| span.content.chars());
+            calculate_text_layout_position(rendered_chars, type_inner_width)
+        };
+        let type_scroll_y = if !is_builtin && type_inner_height > 0 {
             type_cursor_line.saturating_sub(type_inner_height / 2)
         } else {
             0
         };
 
         frame.render_widget(
-            Paragraph::new(type_line(
-                &app.session,
-                &app.text,
-                app.theme(),
-                app.settings.bold,
-            ))
-            .block(themed_block(&palette, typing_active).title(typing_title))
-            .wrap(Wrap { trim: false })
-            .scroll((type_scroll_y, 0)),
+            Paragraph::new(rendered_type_lines)
+                .block(themed_block(&palette, typing_active).title(typing_title))
+                .wrap(Wrap { trim: false })
+                .scroll((type_scroll_y, 0)),
             type_area,
         );
 
@@ -2787,12 +2922,12 @@ fn render_free_input_modal(
 
     let submit_btn = if is_submit_focus {
         Span::styled(
-            " [ 确认发文 (Ctrl-Enter/F2) ] ",
+            " [ 确认发文 (Ctrl-Enter) ] ",
             Style::default().reversed().fg(palette.accent).bold(),
         )
     } else {
         Span::styled(
-            " [ 确认发文 (Ctrl-Enter/F2) ] ",
+            " [ 确认发文 (Ctrl-Enter) ] ",
             Style::default().fg(palette.accent).bold(),
         )
     };
@@ -2926,22 +3061,21 @@ fn render_sidebar(
 
         for (idx, item) in SIDEBAR_MENU_ITEMS.iter().enumerate() {
             let is_sel = idx == app.sidebar_selected && (app.session.is_empty() || app.paused);
-            let prefix = if is_sel { " > " } else { "   " };
-            let (label, is_accent, is_warn) = match item {
-                SidebarMenuItem::LoadFile => ("载入文件（Ctrl-F）", false, false),
-                SidebarMenuItem::BuiltinText => ("内置赛文（Ctrl-B）", false, false),
-                SidebarMenuItem::FreeInput => ("自由发文", false, false),
-                SidebarMenuItem::Clipboard => ("剪贴板发文", false, false),
-                SidebarMenuItem::OnlineJisu => ("F1 极速杯", false, false),
-                SidebarMenuItem::OnlineJinbiao => ("F2 锦标赛", false, false),
-                SidebarMenuItem::OnlineJianshen => ("F3 键神杯", false, false),
-                SidebarMenuItem::Stats => ("数据统计（s）", false, false),
-                SidebarMenuItem::Settings => ("设置（Ctrl-E）", false, false),
+            let (key_badge, label, is_accent, is_warn) = match item {
+                SidebarMenuItem::LoadFile => ("f", "载入文件", false, false),
+                SidebarMenuItem::BuiltinText => ("b", "内置赛文", false, false),
+                SidebarMenuItem::FreeInput => ("i", "自由发文", false, false),
+                SidebarMenuItem::Clipboard => ("p", "剪贴板发文", false, false),
+                SidebarMenuItem::OnlineJisu => ("1", "极速杯", false, false),
+                SidebarMenuItem::OnlineJinbiao => ("2", "锦标赛", false, false),
+                SidebarMenuItem::OnlineJianshen => ("3", "键神杯", false, false),
+                SidebarMenuItem::Stats => ("s", "数据统计", false, false),
+                SidebarMenuItem::Settings => ("o", "设置", false, false),
                 SidebarMenuItem::Login => {
                     if app.logged_in {
-                        ("已登录 52dazi", true, false)
+                        ("u", "已登录 52dazi", true, false)
                     } else {
-                        ("登录 52dazi（Ctrl-O）", false, true)
+                        ("u", "登录 52dazi", false, true)
                     }
                 }
             };
@@ -2954,17 +3088,43 @@ fn render_sidebar(
                 lines.push(Line::from(" 统计与系统:").bold().fg(palette.fg));
             }
 
-            let mut line = Line::from(format!("{prefix}{label}"));
+            let mut spans = Vec::new();
             if is_sel {
-                line = line.fg(palette.accent).bold();
-            } else if is_accent {
-                line = line.fg(palette.accent);
-            } else if is_warn {
-                line = line.fg(palette.warning);
+                spans.push(Span::styled(" ▸ ", Style::default().fg(palette.accent).bold()));
+                spans.push(Span::styled("◖", Style::default().fg(palette.accent)));
+                spans.push(Span::styled(
+                    key_badge,
+                    Style::default()
+                        .fg(palette.bg)
+                        .bg(palette.accent)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                spans.push(Span::styled("◗", Style::default().fg(palette.accent)));
+                spans.push(Span::styled(
+                    format!(" {label}"),
+                    Style::default().fg(palette.accent).add_modifier(Modifier::BOLD),
+                ));
             } else {
-                line = line.fg(palette.fg);
+                spans.push(Span::styled("   ", Style::default().fg(palette.fg)));
+                spans.push(Span::styled("◖", Style::default().fg(palette.selection)));
+                spans.push(Span::styled(
+                    key_badge,
+                    Style::default()
+                        .fg(palette.accent)
+                        .bg(palette.selection)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                spans.push(Span::styled("◗", Style::default().fg(palette.selection)));
+                let label_style = if is_accent {
+                    Style::default().fg(palette.accent)
+                } else if is_warn {
+                    Style::default().fg(palette.warning)
+                } else {
+                    Style::default().fg(palette.fg)
+                };
+                spans.push(Span::styled(format!(" {label}"), label_style));
             }
-            lines.push(line);
+            lines.push(Line::from(spans));
         }
     }
 
@@ -3261,13 +3421,13 @@ fn render_stats_view(frame: &mut Frame, app: &App, stats_state: &StatsViewState)
     // 3. 底部快捷键提示
     let hint_str = match stats_state.tab {
         StatsTab::WpmTrend => {
-            " 1/2/3 切换选项卡 | r 切换时间范围 | Esc 返回跟打 | Ctrl-E 设置 | Ctrl-Q 退出 "
+            " 1/2/3 Tab | hl 左右 | r 时间范围 | Esc/q 返回 | o 设置 | Ctrl-Q 退出 "
         }
         StatsTab::Heatmap => {
-            " 1/2/3 切换选项卡 | l 切换键盘布局(斜列/直列) | m 切换数据视角(方案/物理) | Esc 返回跟打 | Ctrl-E 设置 | Ctrl-Q 退出 "
+            " 1/2/3 Tab | hl 左右 | L 键盘布局 | m 视角 | Esc/q 返回 | o 设置 | Ctrl-Q 退出 "
         }
         StatsTab::ErrorRanking => {
-            " 1/2/3 切换选项卡 | t 切换字/词焦点 | ↑↓/PgUp/PgDn 滚动浏览 | Esc 返回跟打 | Ctrl-E 设置 | Ctrl-Q 退出 "
+            " 1/2/3 Tab | t 字/词焦点 | jk 滚动 | PgUp/PgDn 翻页 | Esc/q 返回 | o 设置 | Ctrl-Q 退出 "
         }
     };
     let hint_title = Line::from(vec![Span::styled(
@@ -4142,7 +4302,7 @@ fn render_settings(frame: &mut Frame, app: &App) {
     lines.push(Line::from("  对正确对正确").fg(palette.success));
     lines.push(Line::from("  错错误错错误").fg(palette.error));
     lines.push(Line::from(""));
-    lines.push(hint_bar_line(" ↑↓ 选择 | ←→ 调整 | Esc 返回 ", &palette));
+    lines.push(hint_bar_line(" jk 选择 | hl 调整 | Esc/q 返回 ", &palette));
 
     let area = centered_rect(frame.area(), 60, 18);
     frame.render_widget(Clear, area);
@@ -4662,12 +4822,12 @@ fn render_result_view(
             need_relogin: true, ..
         } = upload
         {
-            " Esc 返回 | s 数据统计 | Ctrl-O 登录并上传 | Ctrl-F 载文 | Ctrl-B 内置赛文 | Ctrl-Q 退出"
+            " Esc/q 返回 | s 统计 | u 登录并上传 | f 载文 | b 内置 | i 自由发文 | p 剪贴板 | o 设置 | Ctrl-Q 退出"
         } else {
-            " Esc 返回 | s 数据统计 | Ctrl-F 载文 | Ctrl-B 内置赛文 | Ctrl-Q 退出"
+            " Esc/q 返回 | s 统计 | f 载文 | b 内置 | i 自由发文 | p 剪贴板 | o 设置 | Ctrl-Q 退出"
         }
     } else {
-        " Esc 返回 | Enter/r 重打 | s 数据统计 | Ctrl-F 载文 | Ctrl-B 内置赛文 | Ctrl-Q 退出"
+        " Esc/q 返回 | Enter/r 重打 | s 统计 | f 载文 | b 内置 | i 自由发文 | p 剪贴板 | o 设置 | Ctrl-Q 退出"
     };
     let hint_line = hint_bar_line(hint_str, &palette);
 
@@ -5097,6 +5257,9 @@ fn build_word_type_spans(
         .skip(page_start_word)
         .take(page_end_word - page_start_word)
     {
+        if display.len() <= ws {
+            break;
+        }
         if word_i > page_start_word {
             spans.push(Span::raw(" "));
         }
@@ -5418,40 +5581,52 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_s_early_finishes() {
+    fn d_early_finishes() {
         assert!(is_early_finish(KeyEvent::new(
+            KeyCode::Char('d'),
+            KeyModifiers::NONE
+        )));
+        assert!(is_early_finish(KeyEvent::new(
+            KeyCode::Char('D'),
+            KeyModifiers::NONE
+        )));
+        assert!(!is_early_finish(KeyEvent::new(
             KeyCode::Char('s'),
+            KeyModifiers::NONE
+        )));
+        assert!(!is_early_finish(KeyEvent::new(
+            KeyCode::Char('d'),
             KeyModifiers::CONTROL
-        )));
-        assert!(!is_early_finish(KeyEvent::new(
-            KeyCode::Char('s'),
-            KeyModifiers::NONE
-        )));
-        assert!(!is_early_finish(KeyEvent::new(
-            KeyCode::Char('q'),
-            KeyModifiers::NONE
         )));
     }
 
     #[test]
-    fn ctrl_r_restarts() {
+    fn r_restarts() {
         assert!(is_restart(KeyEvent::new(
             KeyCode::Char('r'),
-            KeyModifiers::CONTROL
+            KeyModifiers::NONE
+        )));
+        assert!(is_restart(KeyEvent::new(
+            KeyCode::Char('R'),
+            KeyModifiers::NONE
+        )));
+        assert!(!is_restart(KeyEvent::new(
+            KeyCode::Char('t'),
+            KeyModifiers::NONE
         )));
         assert!(!is_restart(KeyEvent::new(
             KeyCode::Char('r'),
-            KeyModifiers::NONE
+            KeyModifiers::CONTROL
         )));
     }
 
     #[test]
     fn restart_allowed_only_when_offline() {
-        let ctrl_r = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
-        // 离线赛文：Ctrl-R 允许重打。
-        assert!(restart_allowed(ctrl_r, false));
-        // 在线赛文：Ctrl-R 被禁用。
-        assert!(!restart_allowed(ctrl_r, true));
+        let r_key = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE);
+        // 离线赛文：r 允许重打。
+        assert!(restart_allowed(r_key, false));
+        // 在线赛文：r 被禁用。
+        assert!(!restart_allowed(r_key, true));
         // 非重打键：无论在线与否都不触发。
         let other = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
         assert!(!restart_allowed(other, false));
@@ -5476,14 +5651,82 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_b_opens_builtin_browser() {
+    fn b_opens_builtin_browser() {
         assert!(is_open_builtin_browser(KeyEvent::new(
             KeyCode::Char('b'),
-            KeyModifiers::CONTROL
+            KeyModifiers::NONE
+        )));
+        assert!(is_open_builtin_browser(KeyEvent::new(
+            KeyCode::Char('B'),
+            KeyModifiers::NONE
+        )));
+        assert!(!is_open_builtin_browser(KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE
         )));
         assert!(!is_open_builtin_browser(KeyEvent::new(
             KeyCode::Char('b'),
+            KeyModifiers::CONTROL
+        )));
+    }
+
+    #[test]
+    fn i_opens_free_input() {
+        assert!(is_open_free_input(KeyEvent::new(
+            KeyCode::Char('i'),
             KeyModifiers::NONE
+        )));
+        assert!(is_open_free_input(KeyEvent::new(
+            KeyCode::Char('I'),
+            KeyModifiers::NONE
+        )));
+        assert!(!is_open_free_input(KeyEvent::new(
+            KeyCode::Char('f'),
+            KeyModifiers::NONE
+        )));
+        assert!(!is_open_free_input(KeyEvent::new(
+            KeyCode::Char('i'),
+            KeyModifiers::CONTROL
+        )));
+    }
+
+    #[test]
+    fn p_loads_clipboard() {
+        assert!(is_load_clipboard(KeyEvent::new(
+            KeyCode::Char('p'),
+            KeyModifiers::NONE
+        )));
+        assert!(is_load_clipboard(KeyEvent::new(
+            KeyCode::Char('P'),
+            KeyModifiers::NONE
+        )));
+        assert!(!is_load_clipboard(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::NONE
+        )));
+        assert!(!is_load_clipboard(KeyEvent::new(
+            KeyCode::Char('p'),
+            KeyModifiers::CONTROL
+        )));
+    }
+
+    #[test]
+    fn s_opens_stats() {
+        assert!(is_open_stats(KeyEvent::new(
+            KeyCode::Char('s'),
+            KeyModifiers::NONE
+        )));
+        assert!(is_open_stats(KeyEvent::new(
+            KeyCode::Char('S'),
+            KeyModifiers::NONE
+        )));
+        assert!(!is_open_stats(KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE
+        )));
+        assert!(!is_open_stats(KeyEvent::new(
+            KeyCode::Char('s'),
+            KeyModifiers::CONTROL
         )));
     }
 
@@ -5680,14 +5923,22 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_f_opens_browser() {
+    fn f_opens_browser() {
         assert!(is_open_browser(KeyEvent::new(
             KeyCode::Char('f'),
-            KeyModifiers::CONTROL
+            KeyModifiers::NONE
+        )));
+        assert!(is_open_browser(KeyEvent::new(
+            KeyCode::Char('F'),
+            KeyModifiers::NONE
+        )));
+        assert!(!is_open_browser(KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE
         )));
         assert!(!is_open_browser(KeyEvent::new(
             KeyCode::Char('f'),
-            KeyModifiers::NONE
+            KeyModifiers::CONTROL
         )));
     }
 
@@ -6155,29 +6406,41 @@ mod tests {
     // ---- 登录 ----
 
     #[test]
-    fn ctrl_o_opens_login() {
+    fn u_opens_login() {
         assert!(is_open_login(KeyEvent::new(
-            KeyCode::Char('o'),
-            KeyModifiers::CONTROL
+            KeyCode::Char('u'),
+            KeyModifiers::NONE
+        )));
+        assert!(is_open_login(KeyEvent::new(
+            KeyCode::Char('U'),
+            KeyModifiers::NONE
         )));
         assert!(!is_open_login(KeyEvent::new(
-            KeyCode::Char('o'),
+            KeyCode::Char('x'),
             KeyModifiers::NONE
+        )));
+        assert!(!is_open_login(KeyEvent::new(
+            KeyCode::Char('u'),
+            KeyModifiers::CONTROL
         )));
     }
 
     #[test]
-    fn ctrl_e_opens_settings() {
+    fn o_opens_settings() {
         assert!(is_open_settings(KeyEvent::new(
-            KeyCode::Char('e'),
-            KeyModifiers::CONTROL
+            KeyCode::Char('o'),
+            KeyModifiers::NONE
+        )));
+        assert!(is_open_settings(KeyEvent::new(
+            KeyCode::Char('O'),
+            KeyModifiers::NONE
         )));
         assert!(!is_open_settings(KeyEvent::new(
             KeyCode::Char('e'),
             KeyModifiers::NONE
         )));
         assert!(!is_open_settings(KeyEvent::new(
-            KeyCode::Char('s'),
+            KeyCode::Char('o'),
             KeyModifiers::CONTROL
         )));
     }
@@ -6805,22 +7068,22 @@ mod tests {
     }
 
     #[test]
-    fn online_shortcut_maps_f_keys_to_competitions() {
+    fn online_shortcut_maps_number_keys_to_competitions() {
         assert_eq!(
-            online_shortcut(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE)),
+            online_shortcut(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE)),
             Some(CompetitionType::Jisu)
         );
         assert_eq!(
-            online_shortcut(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE)),
+            online_shortcut(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE)),
             Some(CompetitionType::Jinbiao)
         );
         assert_eq!(
-            online_shortcut(KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE)),
+            online_shortcut(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE)),
             Some(CompetitionType::Jianshen)
         );
-        // 带修饰键（Ctrl-F1 等）不触发，普通字符也不触发。
+        // 带修饰键（Ctrl-1 等）不触发，普通字符也不触发。
         assert_eq!(
-            online_shortcut(KeyEvent::new(KeyCode::F(1), KeyModifiers::CONTROL)),
+            online_shortcut(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::CONTROL)),
             None
         );
         assert_eq!(
@@ -7267,26 +7530,57 @@ mod tests {
     }
 
     #[test]
-    fn finished_key_ctrl_f_b_e_navigate() {
+    fn finished_key_navigation_shortcuts() {
         let mut app = test_app(file_text("文本"));
         app.finish_typing();
 
-        // Ctrl-F 打开载文浏览
-        let ctrl_f = KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL);
-        assert!(handle_finished_key(&mut app, ctrl_f));
+        // f 打开载文浏览
+        let f_key = KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE);
+        assert!(handle_finished_key(&mut app, f_key));
         assert!(matches!(app.state, AppState::Browsing));
 
-        // 回到 Finished 测试 Ctrl-B
+        // 回到 Finished 测试 b
         app.finish_typing();
-        let ctrl_b = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL);
-        assert!(handle_finished_key(&mut app, ctrl_b));
+        let b_key = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE);
+        assert!(handle_finished_key(&mut app, b_key));
         assert!(matches!(app.state, AppState::BrowsingBuiltin));
 
-        // 回到 Finished 测试 Ctrl-E
+        // 回到 Finished 测试 o (设置)
         app.finish_typing();
-        let ctrl_e = KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL);
-        assert!(handle_finished_key(&mut app, ctrl_e));
+        let o_key = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE);
+        assert!(handle_finished_key(&mut app, o_key));
         assert!(matches!(app.state, AppState::Settings));
+
+        // 回到 Finished 测试 i (自由发文)
+        app.finish_typing();
+        let i_key = KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE);
+        assert!(handle_finished_key(&mut app, i_key));
+        assert!(app.free_input_modal.is_some());
+        app.close_free_input();
+
+        // 回到 Finished 测试 p (剪贴板发文)
+        app.finish_typing();
+        let p_key = KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE);
+        assert!(handle_finished_key(&mut app, p_key));
+
+        // 回到 Finished 测试 s (数据统计)
+        app.finish_typing();
+        let s_key = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE);
+        assert!(handle_finished_key(&mut app, s_key));
+        assert!(matches!(app.state, AppState::Stats(_)));
+
+        // 回到 Finished 测试 u (登录)
+        app.finish_typing();
+        let u_key = KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE);
+        assert!(handle_finished_key(&mut app, u_key));
+        assert!(app.login_form.is_some());
+        app.login_form = None;
+
+        // 回到 Finished 测试 r (重打)
+        app.finish_typing();
+        let r_key = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE);
+        assert!(handle_finished_key(&mut app, r_key));
+        assert!(matches!(app.state, AppState::Typing));
     }
 
     #[test]
@@ -7523,10 +7817,10 @@ mod tests {
             }
         );
 
-        // 2. F2 快捷键
-        let f2 = KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE);
+        // 2. Ctrl-Enter 快捷键
+        let ctrl_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL);
         assert_eq!(
-            free_input_modal_input(&mut modal, f2),
+            free_input_modal_input(&mut modal, ctrl_enter),
             FreeInputAction::Submit {
                 title: "自由发章".to_string(),
                 content: "我打".to_string(),
@@ -7909,15 +8203,15 @@ mod tests {
                         assert_eq!(cell.bg, palette.bg, "Preset {:?} '菜' bg mismatch", preset);
                         found_nav = true;
                     }
-                    if cell.symbol() == "↑" {
+                    if cell.symbol() == "j" {
                         assert_eq!(
                             cell.fg, palette.accent,
-                            "Preset {:?} '↑' fg mismatch",
+                            "Preset {:?} 'j' fg mismatch",
                             preset
                         );
                         assert_eq!(
                             cell.bg, palette.selection,
-                            "Preset {:?} '↑' bg mismatch",
+                            "Preset {:?} 'j' bg mismatch",
                             preset
                         );
                         found_key = true;
@@ -7927,7 +8221,7 @@ mod tests {
             assert!(found_rounded_border, "底部快捷键栏应当有圆角边框 (╭/╰)");
             assert!(found_title, "底部快捷键栏应当包含标题 '快捷键'");
             assert!(found_nav, "应当在底部提示栏找到 '菜'");
-            assert!(found_key, "应当在底部提示栏找到按键胶囊 '↑'");
+            assert!(found_key, "应当在底部提示栏找到按键胶囊 'j'");
         }
     }
 
@@ -8805,6 +9099,80 @@ mod tests {
     }
 
     #[test]
+    fn test_cursor_follows_typed_character_on_builtin_page_and_words() {
+        // 1. 单字赛文：测试翻页后光标重置与紧跟
+        let text = load_builtin_text(BUILTIN_SETS[0]);
+        let mut app = test_app(text);
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+
+        // 初始第 1 页第 1 字前
+        term.draw(|f| ui(f, &app)).unwrap();
+        let (init_x, init_y): (u16, u16) = term.get_cursor_position().unwrap().into();
+
+        // 打入第 1 页 10 个字（全对）
+        let p1: String = BUILTIN_SETS[0].content().chars().take(10).collect();
+        app.session.type_text(&p1);
+        term.draw(|f| ui(f, &app)).unwrap();
+        let (p1_end_x, p1_end_y): (u16, u16) = term.get_cursor_position().unwrap().into();
+        assert_eq!((p1_end_x, p1_end_y), (init_x, init_y), "翻页后未打字光标应在起始位置");
+
+        // 打入第 2 页第 1 个字（宽 2）
+        let p2_c = BUILTIN_SETS[0].content().chars().nth(10).unwrap();
+        app.session.type_text(&p2_c.to_string());
+        term.draw(|f| ui(f, &app)).unwrap();
+        let (p2_x, p2_y): (u16, u16) = term.get_cursor_position().unwrap().into();
+        assert_eq!((p2_x, p2_y), (init_x + 2, init_y), "第 2 页打了 1 个字后光标应在第 1 个字后面");
+
+        // 2. 词组赛文：词间空格与光标位置
+        let set = BUILTIN_SETS[3]; // 常用词组前五百
+        let no_commas = set.content_no_commas();
+        let text_words = load_builtin_text(set);
+        let mut app_words = test_app(text_words);
+
+        term.draw(|f| ui(f, &app_words)).unwrap();
+        let (w_init_x, w_init_y): (u16, u16) = term.get_cursor_position().unwrap().into();
+
+        // 打入第 1 个词（2 字）
+        let w0: String = no_commas.chars().take(2).collect();
+        app_words.session.type_text(&w0);
+        term.draw(|f| ui(f, &app_words)).unwrap();
+        let (w0_x, w0_y): (u16, u16) = term.get_cursor_position().unwrap().into();
+        assert_eq!((w0_x, w0_y), (w_init_x + 4, w_init_y), "打了第 1 个词（2 字）光标应在第 4 列");
+
+        // 打入第 2 个词的第 1 个字（词间含空格，宽度: 2字*2 + 1空格 + 1字*2 = 7）
+        let w1_c0 = no_commas.chars().nth(2).unwrap();
+        app_words.session.type_text(&w1_c0.to_string());
+        term.draw(|f| ui(f, &app_words)).unwrap();
+        let (w1_x, w1_y): (u16, u16) = term.get_cursor_position().unwrap().into();
+        assert_eq!((w1_x, w1_y), (w_init_x + 7, w_init_y), "打第 2 词第 1 字后光标应在第 7 列（含空格）");
+
+        // 3. 单字赛文打到第 5 页（50 字以上），验证对照区不被误滚动而消失
+        let mut app_p5 = test_app(load_builtin_text(BUILTIN_SETS[0]));
+        let p5_chars: Vec<char> = app_p5.text.content.chars().take(45).collect();
+        for chunk in p5_chars.chunks(10) {
+            let s: String = chunk.iter().collect();
+            app_p5.session.type_text(&s);
+        }
+        term.draw(|f| ui(f, &app_p5)).unwrap();
+        let (p5_x, p5_y): (u16, u16) = term.get_cursor_position().unwrap().into();
+        // 第 5 页打了 5 个字（宽 10），光标应在第 10 列
+        assert_eq!((p5_x, p5_y), (init_x + 10, init_y), "第 5 页打 5 字后光标应在第 10 列");
+
+        // 验证第 5 页文字在缓冲区中正常可见（未被误滚出视口）
+        let buffer = term.backend().buffer();
+        let content = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let current_char = app_p5.text.content.chars().nth(44).unwrap();
+        assert!(content.contains(current_char), "第 5 页当前字符应在缓冲区可见");
+    }
+
+    #[test]
     fn test_reference_area_scrolls_with_progress_on_long_text() {
         // 创建超过单页容量的超长赛文
         let long_raw = "甲乙丙丁戊己庚辛壬癸子丑寅卯辰巳午未申酉戌亥".repeat(10);
@@ -8881,7 +9249,175 @@ mod tests {
             assert_eq!(s.heatmap_layout, HeatmapLayout::Ortholinear);
         }
     }
+
+    #[test]
+    fn test_sidebar_renders_keycaps_and_prominence() {
+        let app = test_app(file_text("测试功能栏键帽"));
+        let _palette = app.palette();
+
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| ui(f, &app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let mut found_cap_left = false;
+        let mut found_cap_right = false;
+        let mut found_f = false;
+        let mut found_b = false;
+        let mut found_i = false;
+        let mut found_p = false;
+        let mut found_s = false;
+        let mut found_o = false;
+        let mut found_u = false;
+
+        let mut all_lines = Vec::new();
+        for y in 0..buffer.area.height {
+            let mut line = String::new();
+            for x in 0..24 {
+                line.push_str(buffer[(x, y)].symbol());
+            }
+            let clean = line.replace(' ', "");
+            if clean.contains('◖') {
+                found_cap_left = true;
+            }
+            if clean.contains('◗') {
+                found_cap_right = true;
+            }
+            if clean.contains("◖f◗") && clean.contains("载入文件") {
+                found_f = true;
+            }
+            if clean.contains("◖b◗") && clean.contains("内置赛文") {
+                found_b = true;
+            }
+            if clean.contains("◖i◗") && clean.contains("自由发文") {
+                found_i = true;
+            }
+            if clean.contains("◖p◗") && clean.contains("剪贴板发文") {
+                found_p = true;
+            }
+            if clean.contains("◖s◗") && clean.contains("数据统计") {
+                found_s = true;
+            }
+            if clean.contains("◖o◗") && clean.contains("设置") {
+                found_o = true;
+            }
+            if clean.contains("◖u◗") && clean.contains("登录") {
+                found_u = true;
+            }
+            all_lines.push(line);
+        }
+
+        assert!(found_cap_left, "功能栏应包含左圆角键帽 ◖: {:?}", all_lines);
+        assert!(found_cap_right, "功能栏应包含右圆角键帽 ◗: {:?}", all_lines);
+        assert!(found_f, "功能栏应高亮显示 f 载入文件: {:?}", all_lines);
+        assert!(found_b, "功能栏应高亮显示 b 内置赛文: {:?}", all_lines);
+        assert!(found_i, "功能栏应高亮显示 i 自由发文: {:?}", all_lines);
+        assert!(found_p, "功能栏应高亮显示 p 剪贴板发文: {:?}", all_lines);
+        assert!(found_s, "功能栏应高亮显示 s 数据统计: {:?}", all_lines);
+        assert!(found_o, "功能栏应高亮显示 o 设置: {:?}", all_lines);
+        assert!(found_u, "功能栏应高亮显示 u 登录: {:?}", all_lines);
+    }
+
+    #[test]
+    fn test_all_shortcuts_without_ctrl_trigger_actions() {
+        let keys_and_checkers: [(
+            char,
+            fn(KeyEvent) -> bool,
+            &str,
+        ); 9] = [
+            ('f', is_open_browser, "f 载入文件"),
+            ('b', is_open_builtin_browser, "b 内置赛文"),
+            ('i', is_open_free_input, "i 自由发文"),
+            ('p', is_load_clipboard, "p 剪贴板发文"),
+            ('s', is_open_stats, "s 数据统计"),
+            ('o', is_open_settings, "o 设置"),
+            ('u', is_open_login, "u 登录"),
+            ('d', is_early_finish, "d 提前结束"),
+            ('r', is_restart, "r 重打"),
+        ];
+
+        for (code, checker, desc) in keys_and_checkers {
+            let direct_key = KeyEvent::new(KeyCode::Char(code), KeyModifiers::NONE);
+            assert!(checker(direct_key), "{desc} 在无 Ctrl 下应直接触发");
+
+            let upper_key = KeyEvent::new(KeyCode::Char(code.to_ascii_uppercase()), KeyModifiers::NONE);
+            assert!(checker(upper_key), "{desc} 大写在无 Ctrl 下亦应直接触发");
+
+            let ctrl_key = KeyEvent::new(KeyCode::Char(code), KeyModifiers::CONTROL);
+            assert!(!checker(ctrl_key), "{desc} 带 Ctrl 不应触发");
+        }
+
+        // 验证在线比赛快捷键 1/2/3
+        assert_eq!(
+            online_shortcut(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE)),
+            Some(CompetitionType::Jisu)
+        );
+        assert_eq!(
+            online_shortcut(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE)),
+            Some(CompetitionType::Jinbiao)
+        );
+        assert_eq!(
+            online_shortcut(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE)),
+            Some(CompetitionType::Jianshen)
+        );
+
+        // 验证退出使用 Ctrl-Q / Ctrl-C
+        assert!(is_quit(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)));
+        assert!(is_quit(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+        assert!(!is_quit(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)));
+    }
+
+    #[test]
+    fn test_vim_navigation_across_states() {
+        let mut app = test_app(file_text("测试文本"));
+
+        // 1. Browsing 状态 Vim 键位
+        app.state = AppState::Browsing;
+        app.browse_files = vec![PathBuf::from("a.txt"), PathBuf::from("b.txt"), PathBuf::from("c.txt")];
+        app.browse_selection = 0;
+
+        // j 下移
+        app.browse_selection = (app.browse_selection + 1).min(app.browse_files.len() - 1);
+        assert_eq!(app.browse_selection, 1);
+        // G 首尾跳跃
+        app.browse_selection = app.browse_files.len() - 1;
+        assert_eq!(app.browse_selection, 2);
+        // g 跳到首项
+        app.browse_selection = 0;
+        assert_eq!(app.browse_selection, 0);
+
+        // 2. BrowsingBuiltin 状态 Vim 键位
+        app.state = AppState::BrowsingBuiltin;
+        app.builtin_selection = 0;
+        app.builtin_selection = (app.builtin_selection + 1).min(BUILTIN_SETS.len() - 1);
+        assert_eq!(app.builtin_selection, 1);
+        app.builtin_selection = BUILTIN_SETS.len().saturating_sub(1);
+        assert_eq!(app.builtin_selection, BUILTIN_SETS.len() - 1);
+        app.builtin_selection = 0;
+        assert_eq!(app.builtin_selection, 0);
+
+        // 3. Settings 状态 Vim 键位 (j/k 移动焦点, h/l 调整数值)
+        app.state = AppState::Settings;
+        app.settings_focus = FOCUS_THEME;
+        app.settings_focus = move_focus(app.settings_focus, 1);
+        assert_eq!(app.settings_focus, FOCUS_RATIO);
+        let ratio_before = app.settings.reference_ratio;
+        app.adjust_ratio(5);
+        assert_eq!(app.settings.reference_ratio, (ratio_before + 5).min(90));
+        app.adjust_ratio(-5);
+        assert_eq!(app.settings.reference_ratio, ratio_before);
+
+        // 4. Stats 状态 Vim 键位
+        let mut stats_state = StatsViewState::new(app.settings.heatmap_layout);
+        assert_eq!(stats_state.tab, StatsTab::WpmTrend);
+        stats_state.tab = StatsTab::Heatmap;
+        assert_eq!(stats_state.tab, StatsTab::Heatmap);
+        stats_state.tab = StatsTab::ErrorRanking;
+        assert_eq!(stats_state.tab, StatsTab::ErrorRanking);
+    }
 }
+
+
 
 
 
