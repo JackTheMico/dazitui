@@ -1526,10 +1526,6 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                             continue;
                         }
 
-                        if key.code == KeyCode::Char('q') || key.code == KeyCode::Char('Q') {
-                            return Ok(());
-                        }
-
                         // 就绪态下输入非命令字符（如中文输入法上屏或英文首字）-> 自动切入跟打态
                         if app.session.is_empty() && matches!(key.code, KeyCode::Backspace | KeyCode::Char(_)) {
                             app.touch_typing();
@@ -2073,9 +2069,9 @@ fn hint_text(
     is_ready: bool,
 ) -> &'static str {
     if browsing {
-        " jk 选择 | Enter 载入 | g/G 首尾 | Esc 取消 | o 设置 | q 退出"
+        " jk 选择 | Enter 载入 | g/G 首尾 | Esc/q 取消 | o 设置 | Ctrl-Q 退出"
     } else if browsing_builtin {
-        " jk 选择 | Enter 载入 | s 乱序 | g/G 首尾 | Esc 取消 | o 设置 | q 退出"
+        " jk 选择 | Enter 载入 | s 乱序 | g/G 首尾 | Esc/q 取消 | o 设置 | Ctrl-Q 退出"
     } else if paused {
         " jk 菜单导航 | Enter 执行 | i/Esc 恢复跟打 | d 提前结算 | r 重打 | s 统计 | o 设置 | Ctrl-Q 退出"
     } else if is_ready {
@@ -9634,6 +9630,32 @@ mod tests {
         assert!(is_quit(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)));
         assert!(is_quit(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)));
         assert!(!is_quit(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)));
+    }
+
+    #[test]
+    fn plain_q_in_ready_state_types_char_instead_of_quitting() {
+        let mut app = test_app(file_text("quick"));
+        assert!(app.session.is_empty());
+
+        // 模拟就绪态输入单键 'q'
+        let key = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
+        assert!(!is_quit(key));
+        if app.session.is_empty() && matches!(key.code, KeyCode::Backspace | KeyCode::Char(_)) {
+            app.touch_typing();
+            let elapsed = app.current_elapsed();
+            handle_key(
+                &mut app.session,
+                &mut app.live_keyboard,
+                app.scheme_dict.as_ref(),
+                key,
+                elapsed,
+                Instant::now(),
+            );
+        }
+
+        assert_eq!(app.session.len(), 1);
+        assert!(!app.session.is_empty());
+        assert_eq!(app.session.display(), vec![('q', CharStatus::Correct)]);
     }
 
     #[test]
