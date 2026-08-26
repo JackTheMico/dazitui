@@ -371,6 +371,12 @@ impl StatsDb {
             .conn
             .execute("ALTER TABLE sessions ADD COLUMN total_strokes INTEGER NOT NULL DEFAULT 0", []);
 
+        // 清理历史异常与极端损坏记录（例如因输入法瞬间上屏导致 duration_secs < 0.5s 或 WPM/KPS 异常爆炸）
+        let _ = self.conn.execute(
+            "DELETE FROM sessions WHERE duration_secs < 0.5 OR wpm > 2000.0 OR kps > 100.0",
+            [],
+        );
+
         Ok(())
     }
 
@@ -381,6 +387,11 @@ impl StatsDb {
         errors: &[ErrorRecordItem],
         keys: &[KeypressRecordItem],
     ) -> Result<(), DbError> {
+        // 过滤瞬时异常/超短无效会话（时长 < 0.5s 或 WPM/KPS 超过物理极限），不写入持久化统计库
+        if session.duration_secs < 0.5 || session.wpm > 2000.0 || session.kps > 100.0 {
+            return Ok(());
+        }
+
         let tx = self.conn.transaction()?;
 
         // 1. 插入 sessions
@@ -1065,6 +1076,25 @@ mod tests {
         assert_eq!(top_words.len(), 1);
         assert_eq!(top_words[0].target_word, "世界");
         assert_eq!(top_words[0].error_count, 2);
+    }
+
+    #[test]
+    fn test_stats_db_sanitizes_and_ignores_extreme_outliers() {
+        let mut db = StatsDb::open_in_memory().unwrap();
+        // 正常记录：60s, 100 WPM
+        let normal = SessionRecord::new(60.0, 100.0, 0.98, 100, 2, 1, 102, "正常练习", "全拼");
+        db.insert_session_full(&normal, &[], &[]).unwrap();
+
+        // 异常记录：0.0002s, 579433 WPM
+        let corrupted = SessionRecord::new(0.0002, 579433.0, 1.0, 2, 0, 0, 2, "自由发文", "全拼");
+        db.insert_session_full(&corrupted, &[], &[]).unwrap();
+
+        // 验证异常记录被忽略，未写入数据库
+        assert_eq!(db.get_session_count().unwrap(), 1);
+        let summary = db.get_global_summary().unwrap();
+        assert_eq!(summary.total_sessions, 1);
+        assert_eq!(summary.best_wpm, 100.0);
+        assert_eq!(summary.avg_wpm, 100.0);
     }
 
     #[test]

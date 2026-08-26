@@ -494,11 +494,16 @@ impl Session {
         let total_secs = elapsed.as_secs_f64();
         let wpm = if total_secs <= 0.0 {
             0.0
+        } else if total_secs < 0.5 {
+            // 防御性保护：对于 <0.5s 的极短用时或单次瞬间上屏，按最小 0.5s 分母归一化并硬顶截断在 2000 WPM
+            (correct as f64 / 0.5 * 60.0).min(2000.0)
         } else {
             correct as f64 / total_secs * 60.0
         };
         let kps = if total_secs <= 0.0 {
             0.0
+        } else if total_secs < 0.5 {
+            (self.total_strokes as f64 / 0.5).min(100.0)
         } else {
             self.total_strokes as f64 / total_secs
         };
@@ -1093,6 +1098,17 @@ mod tests {
         let stats = session.finish(Duration::from_secs(5));
         // 打词字符总数 = 2(我们) + 0(一) + 0(起) + 3(打字推) + 2(练习) = 7
         assert_eq!(stats.phrase_chars, 7);
+    }
+
+    #[test]
+    fn finish_clamps_sub_second_burst_wpm() {
+        let mut session = Session::new("你好");
+        session.type_text("你好");
+        // 模拟瞬时 200 微秒上屏完成
+        let stats = session.finish(Duration::from_micros(200));
+        // 2 字 / 0.5s * 60 = 240 WPM，而非 579,433 WPM
+        assert_eq!(stats.wpm, 240.0);
+        assert!(stats.wpm <= 2000.0);
     }
 }
 

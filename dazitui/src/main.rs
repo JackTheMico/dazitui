@@ -1073,8 +1073,12 @@ impl App {
         };
         let stats = self.session.finish(elapsed);
 
-        // 异步持久化有效练习流水到 SQLite 数据库
-        if let Some(worker) = &self.db_worker {
+        // 异步持久化有效练习流水到 SQLite 数据库（过滤字数为0或用时 < 0.5s 的瞬时/无效跟打，防止脏数据污染）
+        if let Some(worker) = &self.db_worker
+            && stats.typed_chars > 0
+            && elapsed >= Duration::from_millis(500)
+            && stats.wpm <= 2000.0
+        {
             let session_record = SessionRecord::from_stats(
                 &stats,
                 elapsed,
@@ -8800,6 +8804,7 @@ mod tests {
         handle_key(&mut app.session, &mut app.live_keyboard, app.scheme_dict.as_ref(), KeyEvent::new(KeyCode::Char('界'), KeyModifiers::NONE), Duration::from_secs(6), now);
 
         assert!(app.session.is_complete());
+        app.accumulated_elapsed = Duration::from_secs(6);
 
         // 触发完成
         let _ = app.finish_typing();
@@ -10170,6 +10175,7 @@ mod tests {
         handle_key(&mut app.session, &mut app.live_keyboard, app.scheme_dict.as_ref(), KeyEvent::new(KeyCode::Char('界'), KeyModifiers::NONE), Duration::from_secs(5), now);
         handle_key(&mut app.session, &mut app.live_keyboard, app.scheme_dict.as_ref(), KeyEvent::new(KeyCode::Char('！'), KeyModifiers::NONE), Duration::from_secs(6), now);
 
+        app.accumulated_elapsed = Duration::from_secs(6);
         let _ = app.finish_typing();
         if let Some(w) = app.db_worker.take() {
             w.flush_and_stop();
