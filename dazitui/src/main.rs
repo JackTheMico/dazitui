@@ -4509,7 +4509,7 @@ fn append_idle_key_spans(
     palette: &ThemePalette,
     space_width: usize,
 ) {
-    let delim_style = Style::default().fg(palette.muted);
+    let delim_style = Style::default().fg(palette.accent);
     if k_lookup == "Space" {
         spans.push(Span::styled("[", delim_style));
         spans.push(Span::styled(
@@ -8305,32 +8305,72 @@ mod tests {
         let mut kb = LiveKeyboard::new();
         let now = Instant::now();
 
-        // 1. 常态（未击键）：测试主题颜色分层
+        // 1. 常态（未击键）：测试主题颜色分层与按键边框跟随主题强调色
         let lines = generate_live_keyboard_lines(&kb, KeyboardMode::Staggered, &palette, now, 80);
 
         // Row 2 包含 Caps, A, S, D, F, G, H, J, K, L, ;, ', Enter
         let row2 = &lines[2];
 
-        // 验证定位键 F 与 J 在常态下被高亮为 accent + bold
+        // 验证定位键 F 与 J 在常态下被高亮为 accent + bold，字母键边框为 accent
         let mut found_f = false;
         let mut found_j = false;
         let mut found_a = false;
-        for span in &row2.spans {
+        let mut found_caps = false;
+        for (i, span) in row2.spans.iter().enumerate() {
             if span.content == "F" {
                 assert_eq!(span.style.fg, Some(palette.accent));
                 assert!(span.style.add_modifier.contains(Modifier::BOLD));
+                // F 键的左右括号应为主题强调色
+                assert_eq!(row2.spans[i - 1].content, "[");
+                assert_eq!(row2.spans[i - 1].style.fg, Some(palette.accent));
+                assert_eq!(row2.spans[i + 1].content, "]");
+                assert_eq!(row2.spans[i + 1].style.fg, Some(palette.accent));
                 found_f = true;
             } else if span.content == "J" {
                 assert_eq!(span.style.fg, Some(palette.accent));
                 assert!(span.style.add_modifier.contains(Modifier::BOLD));
                 found_j = true;
             } else if span.content == "A" {
-                // 普通字母键为主要前景色 fg
+                // 普通字母键为主要前景色 fg，但左右边框为主题强调色 accent
                 assert_eq!(span.style.fg, Some(palette.fg));
+                assert_eq!(row2.spans[i - 1].content, "[");
+                assert_eq!(row2.spans[i - 1].style.fg, Some(palette.accent));
+                assert_eq!(row2.spans[i + 1].content, "]");
+                assert_eq!(row2.spans[i + 1].style.fg, Some(palette.accent));
                 found_a = true;
+            } else if span.content == "[Caps]" {
+                // 修饰键整体保持 muted 次要暗色
+                assert_eq!(span.style.fg, Some(palette.muted));
+                found_caps = true;
             }
         }
-        assert!(found_f && found_j && found_a);
+        assert!(found_f && found_j && found_a && found_caps);
+
+        // Row 4 空格键验证：左右括号为 accent，内部文字为 muted
+        let row4 = &lines[4];
+        let mut found_space_brackets = false;
+        for (i, span) in row4.spans.iter().enumerate() {
+            if span.content.contains("Space (空格)") {
+                assert_eq!(span.style.fg, Some(palette.muted));
+                assert_eq!(row4.spans[i - 1].content, "[");
+                assert_eq!(row4.spans[i - 1].style.fg, Some(palette.accent));
+                assert_eq!(row4.spans[i + 1].content, "]");
+                assert_eq!(row4.spans[i + 1].style.fg, Some(palette.accent));
+                found_space_brackets = true;
+            }
+        }
+        assert!(found_space_brackets, "空格键外侧括号应为主题强调色");
+
+        // 多主题预设联动验证：切换至 Dracula 主题，边框色彩随之变更
+        let dracula_palette = theme_palette(ThemePreset::Dracula);
+        let dracula_lines = generate_live_keyboard_lines(&kb, KeyboardMode::Staggered, &dracula_palette, now, 80);
+        let dracula_row2 = &dracula_lines[2];
+        for (i, span) in dracula_row2.spans.iter().enumerate() {
+            if span.content == "A" {
+                assert_eq!(dracula_row2.spans[i - 1].style.fg, Some(dracula_palette.accent));
+                assert_ne!(dracula_row2.spans[i - 1].style.fg, Some(palette.accent));
+            }
+        }
 
         // 2. 按键按下时：测试强高亮 (0-100ms) 反色填充 (bg: accent, fg: bg)
         kb.press_char('a', now);
