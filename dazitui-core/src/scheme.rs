@@ -323,8 +323,9 @@ impl SchemeDict {
 
     /// 解析指定文本对应的物理击数与展开的按键列表。
     ///
-    /// - 若在方案码表中命中词条：通过编码码元计算真实击数（并击算 1 击），并展开物理按键；
-    /// - 若未命中（ASCII、标点或无方案）：按字符数计算击数（每个字符 1 击）。
+    /// - 若在方案码表中直接命中词条（单字或多字词组，如 "怎么"、"为什么"）：通过编码码元计算真实击数（并击算 1 击），并展开物理按键；
+    /// - 若整段未直接命中（复合词句）：采用最大正向匹配 (Greedy Longest Matching) 分段反查码表，累加物理击数与按键序列；
+    /// - 未匹配字符（ASCII、标点或码表未收录字）：按字符数计算击数（每个字符 1 击）。
     pub fn resolve_strokes_and_keys(&self, text: &str) -> (u32, Vec<String>) {
         if text.is_empty() {
             return (0, Vec::new());
@@ -332,22 +333,45 @@ impl SchemeDict {
         if let Some(code) = self.get_primary_code(text) {
             let strokes = Self::calculate_code_strokes(code).max(1);
             let keys = self.decompose_code(code);
-            (strokes, keys)
-        } else {
-            let count = text.chars().count() as u32;
-            let strokes = count.max(1);
-            let keys = text
-                .chars()
-                .map(|c| {
-                    if c.is_ascii_graphic() {
-                        c.to_ascii_lowercase().to_string()
-                    } else {
-                        c.to_string()
-                    }
-                })
-                .collect();
-            (strokes, keys)
+            return (strokes, keys);
         }
+
+        let chars: Vec<char> = text.chars().collect();
+        let mut total_strokes = 0;
+        let mut all_keys = Vec::new();
+        let mut start = 0;
+
+        while start < chars.len() {
+            let mut matched = false;
+            // 尝试最长前缀匹配（从当前剩余最大长度到 1）
+            for len in (1..=(chars.len() - start)).rev() {
+                let sub: String = chars[start..start + len].iter().collect();
+                if let Some(code) = self.get_primary_code(&sub) {
+                    let strokes = Self::calculate_code_strokes(code).max(1);
+                    let keys = self.decompose_code(code);
+                    total_strokes += strokes;
+                    all_keys.extend(keys);
+                    start += len;
+                    matched = true;
+                    break;
+                }
+            }
+
+            if !matched {
+                let ch = chars[start];
+                total_strokes += 1;
+                if ch.is_ascii_graphic() {
+                    all_keys.push(ch.to_ascii_lowercase().to_string());
+                } else if ch == ' ' {
+                    all_keys.push("Space".to_string());
+                } else {
+                    all_keys.push(ch.to_string());
+                }
+                start += 1;
+            }
+        }
+
+        (total_strokes.max(1), all_keys)
     }
 
     /// 分解编码为物理按键序列。
@@ -472,61 +496,81 @@ impl ChordAlgebra {
         algebra
     }
 
+    /// 将单个码元字符根据手区展开为物理按键列表。
+    /// - 若 `is_right_hand` 为 true：先展开码元基础键，再将每个基础键通过镜像表映射为右手物理按键；
+    /// - 若 `is_right_hand` 为 false：展开码元基础键（左手物理按键）。
+    pub fn expand_symbol_with_hand(&self, c: char, is_right_hand: bool) -> Vec<String> {
+        let mut keys = Vec::new();
+        if let Some(chord_keys) = self.symbol_to_keys.get(&c) {
+            if is_right_hand {
+                for k in chord_keys {
+                    let ch = k.chars().next().unwrap_or(' ');
+                    let mirrored = self.mirror_left_to_right.get(&ch).copied().unwrap_or(ch);
+                    keys.push(mirrored.to_string());
+                }
+                keys.sort();
+            } else {
+                keys.extend(chord_keys.clone());
+            }
+        } else if c.is_ascii_alphanumeric() || c.is_ascii_punctuation() {
+            let base_c = c.to_ascii_lowercase();
+            if is_right_hand {
+                let mirrored = self.mirror_left_to_right.get(&base_c).copied().unwrap_or(base_c);
+                keys.push(mirrored.to_string());
+            } else {
+                keys.push(base_c.to_string());
+            }
+        } else {
+            keys.push(c.to_string());
+        }
+        keys
+    }
+
     /// 将逻辑编码根据指法规则展开为实际物理按键列表。
     pub fn decompose_code(&self, code: &str) -> Vec<String> {
         if code.is_empty() {
             return Vec::new();
         }
 
-        // 1. 左手单手前缀 `_`：如 `_.` 或 `_v`
+        // 1. 左手单手前缀 `_`：如 `_.` 或 `_v`（整段全为左手）
         if let Some(rest) = code.strip_prefix('_') {
             let mut keys = Vec::new();
             for c in rest.chars() {
                 if c == '-' || c == '\'' || c.is_whitespace() {
                     continue;
                 }
-                if let Some(chord_keys) = self.symbol_to_keys.get(&c) {
-                    keys.extend(chord_keys.clone());
-                } else if c.is_ascii_alphanumeric() || c.is_ascii_punctuation() {
-                    keys.push(c.to_ascii_lowercase().to_string());
-                }
+                keys.extend(self.expand_symbol_with_hand(c, false));
             }
             return keys;
         }
 
-        // 2. 右手单手前缀 `+`：如 `+e` (单键右手镜像为 i) 或 `+.` (并击 xv 镜像为 .m)
+        // 2. 右手单手前缀 `+`：如 `+e` 或 `+H` 或 `+.`（整段全为右手镜像）
         if let Some(rest) = code.strip_prefix('+') {
             let mut keys = Vec::new();
             for c in rest.chars() {
                 if c == '-' || c == '\'' || c.is_whitespace() {
                     continue;
                 }
-                if let Some(chord_keys) = self.symbol_to_keys.get(&c) {
-                    for k in chord_keys {
-                        let ch = k.chars().next().unwrap_or(' ');
-                        let mirrored = self.mirror_left_to_right.get(&ch).copied().unwrap_or(ch);
-                        keys.push(mirrored.to_string());
-                    }
-                } else if c.is_ascii_alphanumeric() || c.is_ascii_punctuation() {
-                    let base_c = c.to_ascii_lowercase();
-                    let mirrored = self.mirror_left_to_right.get(&base_c).copied().unwrap_or(base_c);
-                    keys.push(mirrored.to_string());
-                }
+                keys.extend(self.expand_symbol_with_hand(c, true));
             }
             return keys;
         }
 
-        // 3. 无单手前缀（双手并击 / 序列击键，如 ".Wd", "wCs", "x;de"）
+        // 3. 无单手前缀（双手并击 / 双手交替序列击键，如 "aI" (们), "az" (他们), "xkhr" (可以), "sl" (了), ".Wd", "wCs"）
+        // 在并击方案中，双手并击由偶数位左手码元与奇数位右手码元交替构成：
+        //   - 2 码 (c1 c2): c1 为左手，c2 为右手镜像
+        //   - 4 码 (c1 c2 c3 c4): c1/c3 为左手，c2/c4 为右手镜像
+        //   - 3 码 (c1 c2 c3): c1 为左手，c2 为右手镜像，c3 为第3码
+        let raw_chars: Vec<char> = code
+            .chars()
+            .filter(|&c| c != '+' && c != '_' && c != '-' && c != '\'' && !c.is_whitespace())
+            .collect();
+
         let mut keys = Vec::new();
-        for c in code.chars() {
-            if c == '+' || c == '_' || c == '-' || c == '\'' || c.is_whitespace() {
-                continue;
-            }
-            if let Some(chord_keys) = self.symbol_to_keys.get(&c) {
-                keys.extend(chord_keys.clone());
-            } else if c.is_ascii_alphanumeric() || c.is_ascii_punctuation() {
-                keys.push(c.to_ascii_lowercase().to_string());
-            }
+        for (idx, &c) in raw_chars.iter().enumerate() {
+            // 双手并击交替：第 2 码 (idx=1) 与 第 4 码 (idx=3) 为右手镜像
+            let is_right_hand = (idx % 2 == 1) && (raw_chars.len() >= 2);
+            keys.extend(self.expand_symbol_with_hand(c, is_right_hand));
         }
         keys
     }
@@ -1017,6 +1061,7 @@ algebra:
             "xform|xv|\\.|".to_string(),
             "xform|vw|W|".to_string(),
             "xform|cf|C|".to_string(),
+            "xform|eg|I|".to_string(),
             "xform|esf|Q|".to_string(),
         ];
 
@@ -1031,12 +1076,16 @@ algebra:
         assert_eq!(algebra.decompose_code("+r"), vec!["u"]);
 
         // 3. 右手单手前缀 `+` (并击码元镜像映射)
-        // xv 镜像到右手 -> v 对应 m, x 对应 . -> ["m", "."]
-        assert_eq!(algebra.decompose_code("+."), vec!["m", "."]);
+        // xv 镜像到右手 -> v 对应 m, x 对应 . -> [".", "m"]
+        assert_eq!(algebra.decompose_code("+."), vec![".", "m"]);
 
-        // 4. 双手并击 / 混打 (无前缀)
-        assert_eq!(algebra.decompose_code("wCs"), vec!["w", "c", "f", "s"]);
-        assert_eq!(algebra.decompose_code(".Wd"), vec!["v", "x", "v", "w", "d"]);
+        // 4. 双手并击 / 混打 (无前缀，双手并击交替左/右镜像)
+        // 们 (aI) -> 左手 a + 右手 I (eg 镜像为 h i) -> ["a", "h", "i"]
+        assert_eq!(algebra.decompose_code("aI"), vec!["a", "h", "i"]);
+        // 是 (wCs) -> 左手 w + 右手 C (cf 镜像为 , j) + 第3码 s -> ["w", ",", "j", "s"]
+        assert_eq!(algebra.decompose_code("wCs"), vec!["w", ",", "j", "s"]);
+        // 到 (.Wd) -> 左手 . (v x) + 右手 W (vw 镜像为 m o) + 第3码 d -> ["v", "x", "m", "o", "d"]
+        assert_eq!(algebra.decompose_code(".Wd"), vec!["v", "x", "m", "o", "d"]);
         assert_eq!(algebra.decompose_code("Q"), vec!["e", "f", "s"]);
     }
 
@@ -1045,22 +1094,29 @@ algebra:
         let mut dict = SchemeDict::default();
         dict.add_entry("到", "_.");
         dict.add_entry("是", "wCs");
+        dict.add_entry("们", "aI");
 
         let rules = vec![
             "xform|xv|\\.|".to_string(),
             "xform|cf|C|".to_string(),
+            "xform|eg|I|".to_string(),
+            "xform|j|f|".to_string(),
+            "xform|,|c|".to_string(),
+            "xform|h|g|".to_string(),
+            "xform|i|e|".to_string(),
         ];
         dict.set_chord_algebra(ChordAlgebra::from_rules(&rules));
 
         assert_eq!(dict.decompose_code("_."), vec!["v", "x"]);
-        assert_eq!(dict.decompose_code("wCs"), vec!["w", "c", "f", "s"]);
+        assert_eq!(dict.decompose_code("aI"), vec!["a", "h", "i"]);
+        assert_eq!(dict.decompose_code("wCs"), vec!["w", ",", "j", "s"]);
 
         let counts = dict.project_text_to_keys("到是");
         assert_eq!(counts.get("x"), Some(&1));
         assert_eq!(counts.get("v"), Some(&1));
         assert_eq!(counts.get("w"), Some(&1));
-        assert_eq!(counts.get("c"), Some(&1));
-        assert_eq!(counts.get("f"), Some(&1));
+        assert_eq!(counts.get(","), Some(&1));
+        assert_eq!(counts.get("j"), Some(&1));
         assert_eq!(counts.get("s"), Some(&1));
     }
 
@@ -1076,12 +1132,14 @@ algebra:
             assert!(dict.chord_algebra().is_some());
             let algebra = dict.chord_algebra().unwrap();
 
-            // yoyo-pure 使用「六脉神剑」指法：. 为 xz 并击，C 为 cx 并击
+            // yoyo-pure 使用「六脉神剑」指法：. 为 xz 并击，C 为 cx 并击，I 为 eq 镜像为 ip
             assert_eq!(algebra.decompose_code("_."), vec!["x", "z"]);
-            assert_eq!(algebra.decompose_code("wCs"), vec!["w", "c", "x", "s"]);
+            assert_eq!(algebra.decompose_code("aI"), vec!["a", "i", "p"]);
+            assert_eq!(algebra.decompose_code("wCs"), vec!["w", ",", ".", "s"]);
             assert!(dict.entry_count() > 1000);
             assert_eq!(dict.name(), Some("麓鸣·纯形·六脉"));
             assert_eq!(dict.get_primary_code("到"), Some("_."));
+            assert_eq!(dict.get_primary_code("们"), Some("aI"));
         }
 
         let km_schema_path = Path::new("/home/jackwy/codes/rime/yoyo/rime/yoyo-pure-km.schema.yaml");
@@ -1090,9 +1148,10 @@ algebra:
             assert!(dict.chord_algebra().is_some());
             let algebra = dict.chord_algebra().unwrap();
 
-            // yoyo-pure-km 使用「空明拳」指法：. 为 xv 并击，C 为 cf 并击
+            // yoyo-pure-km 使用「空明拳」指法：. 为 xv 并击，C 为 cf 并击，I 为 eg 镜像为 hi
             assert_eq!(algebra.decompose_code("_."), vec!["v", "x"]);
-            assert_eq!(algebra.decompose_code("wCs"), vec!["w", "c", "f", "s"]);
+            assert_eq!(algebra.decompose_code("aI"), vec!["a", "h", "i"]);
+            assert_eq!(algebra.decompose_code("wCs"), vec!["w", ",", "j", "s"]);
         }
     }
 
@@ -1134,19 +1193,56 @@ algebra:
         assert_eq!(SchemeDict::calculate_code_strokes("wCs"), 3);
         assert_eq!(SchemeDict::calculate_code_strokes("ggll"), 4);
         assert_eq!(SchemeDict::calculate_code_strokes("+e"), 1);
+        assert_eq!(SchemeDict::calculate_code_strokes("+H"), 1);
+        assert_eq!(SchemeDict::calculate_code_strokes("+H'"), 1);
         assert_eq!(SchemeDict::calculate_code_strokes(""), 0);
 
         let mut dict = SchemeDict::default();
         dict.add_entry("到", "_.");
         dict.add_entry("是", "wCs");
+        dict.add_entry("们", "aI");
+        dict.add_entry("怎么", "+H");
+        dict.add_entry("我们", "+w");
+        dict.add_entry("在", "_z");
+
+        let rules = vec![
+            "xform|y|t|".to_string(),
+            "xform|u|r|".to_string(),
+            "xform|i|e|".to_string(),
+            "xform|o|w|".to_string(),
+            "xform|p|q|".to_string(),
+            "xform|h|g|".to_string(),
+            "xform|j|f|".to_string(),
+            "xform|,|c|".to_string(),
+            "xform|;|a|".to_string(),
+            "xform|ar|H|".to_string(),
+            "xform|xv|\\.|".to_string(),
+            "xform|cf|C|".to_string(),
+            "xform|eg|I|".to_string(),
+        ];
+        dict.set_chord_algebra(ChordAlgebra::from_rules(&rules));
+
+        // 1. 单字与词组反查
+        let (strokes_zenme, keys_zenme) = dict.resolve_strokes_and_keys("怎么");
+        assert_eq!(strokes_zenme, 1);
+        assert_eq!(keys_zenme, vec![";", "u"]);
+
+        let (strokes_men, keys_men) = dict.resolve_strokes_and_keys("们");
+        assert_eq!(strokes_men, 2);
+        assert_eq!(keys_men, vec!["a", "h", "i"]);
 
         let (strokes_dao, keys_dao) = dict.resolve_strokes_and_keys("到");
         assert_eq!(strokes_dao, 1);
-        assert_eq!(keys_dao, vec!["."]); // 未挂载代数引擎时的单键过滤
+        assert_eq!(keys_dao, vec!["v", "x"]);
 
         let (strokes_shi, keys_shi) = dict.resolve_strokes_and_keys("是");
         assert_eq!(strokes_shi, 3);
-        assert_eq!(keys_shi, vec!["w", "c", "s"]);
+        assert_eq!(keys_shi, vec!["w", ",", "j", "s"]);
+
+        // 2. 复合词句最大正向匹配（"我们" + "在"）
+        let (strokes_combo, keys_combo) = dict.resolve_strokes_and_keys("我们在");
+        assert_eq!(strokes_combo, 2);
+        assert_eq!(keys_combo, vec!["o", "z"]);
 
         let (strokes_en, keys_en) = dict.resolve_strokes_and_keys("hello");
         assert_eq!(strokes_en, 5);

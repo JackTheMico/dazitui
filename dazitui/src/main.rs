@@ -1363,13 +1363,42 @@ fn run_tui(app: App) -> io::Result<()> {
     result
 }
 
+/// 在收到单个字符事件后，迅速清空 crossterm 事件缓冲区中紧随其后的可打印字符（例如输入法整词上屏 "怎么"）。
+fn drain_pending_chars(first_char: char) -> io::Result<(String, Option<KeyEvent>)> {
+    let mut text = String::new();
+    text.push(first_char);
+    let mut pending_key = None;
+    while event::poll(Duration::ZERO)? {
+        if let Event::Key(next_key) = event::read()? {
+            if is_quit(next_key) {
+                return Ok((text, Some(next_key)));
+            }
+            if let KeyCode::Char(next_c) = next_key.code {
+                if next_key.modifiers.is_empty() || next_key.modifiers == KeyModifiers::SHIFT {
+                    text.push(next_c);
+                    continue;
+                }
+            }
+            pending_key = Some(next_key);
+            break;
+        }
+    }
+    Ok((text, pending_key))
+}
+
 fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Result<()> {
+    let mut pending_key_event: Option<KeyEvent> = None;
     loop {
         terminal.draw(|frame| ui(frame, &app))?;
-        if !event::poll(Duration::from_millis(100))? {
-            continue;
-        }
-        match event::read()? {
+        let event_to_process = if let Some(pk) = pending_key_event.take() {
+            Event::Key(pk)
+        } else {
+            if !event::poll(Duration::from_millis(100))? {
+                continue;
+            }
+            event::read()?
+        };
+        match event_to_process {
             Event::Key(key) => {
                 if is_quit(key) {
                     return Ok(());
@@ -1442,7 +1471,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                                 app.pause();
                                 continue;
                             }
-                            if matches!(key.code, KeyCode::Backspace | KeyCode::Char(_)) {
+                            if key.code == KeyCode::Backspace {
                                 app.touch_typing();
                                 let elapsed = app.current_elapsed();
                                 handle_key(
@@ -1456,6 +1485,25 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                                 if app.session.is_complete() {
                                     finish_and_maybe_upload(&mut app, terminal)?;
                                 }
+                                continue;
+                            }
+                            if let KeyCode::Char(c) = key.code {
+                                let (text, next_key) = drain_pending_chars(c)?;
+                                pending_key_event = next_key;
+                                app.touch_typing();
+                                let elapsed = app.current_elapsed();
+                                handle_text(
+                                    &mut app.session,
+                                    &mut app.live_keyboard,
+                                    app.scheme_dict.as_ref(),
+                                    &text,
+                                    elapsed,
+                                    Instant::now(),
+                                );
+                                if app.session.is_complete() {
+                                    finish_and_maybe_upload(&mut app, terminal)?;
+                                }
+                                continue;
                             }
                             continue;
                         }
@@ -1535,19 +1583,37 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                         }
 
                         // 就绪态下输入非命令字符（如中文输入法上屏或英文首字）-> 自动切入跟打态
-                        if app.session.is_empty() && matches!(key.code, KeyCode::Backspace | KeyCode::Char(_)) {
-                            app.touch_typing();
-                            let elapsed = app.current_elapsed();
-                            handle_key(
-                                &mut app.session,
-                                &mut app.live_keyboard,
-                                app.scheme_dict.as_ref(),
-                                key,
-                                elapsed,
-                                Instant::now(),
-                            );
-                            if app.session.is_complete() {
-                                finish_and_maybe_upload(&mut app, terminal)?;
+                        if app.session.is_empty() {
+                            if key.code == KeyCode::Backspace {
+                                app.touch_typing();
+                                let elapsed = app.current_elapsed();
+                                handle_key(
+                                    &mut app.session,
+                                    &mut app.live_keyboard,
+                                    app.scheme_dict.as_ref(),
+                                    key,
+                                    elapsed,
+                                    Instant::now(),
+                                );
+                                if app.session.is_complete() {
+                                    finish_and_maybe_upload(&mut app, terminal)?;
+                                }
+                            } else if let KeyCode::Char(c) = key.code {
+                                let (text, next_key) = drain_pending_chars(c)?;
+                                pending_key_event = next_key;
+                                app.touch_typing();
+                                let elapsed = app.current_elapsed();
+                                handle_text(
+                                    &mut app.session,
+                                    &mut app.live_keyboard,
+                                    app.scheme_dict.as_ref(),
+                                    &text,
+                                    elapsed,
+                                    Instant::now(),
+                                );
+                                if app.session.is_complete() {
+                                    finish_and_maybe_upload(&mut app, terminal)?;
+                                }
                             }
                         }
                     }
@@ -1955,31 +2021,14 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                     app.touch_typing();
                     let elapsed = app.current_elapsed();
                     let now = Instant::now();
-                    let mut total_strokes = 0;
-                    for c in committed.chars() {
-                        let s = c.to_string();
-                        if let Some(ref dict) = app.scheme_dict {
-                            let (strokes, keys) = dict.resolve_strokes_and_keys(&s);
-                            total_strokes += strokes;
-                            if c == ' ' {
-                                app.live_keyboard.press_key("Space", now);
-                            } else if c.is_ascii() {
-                                app.live_keyboard.press_char(c, now);
-                            } else {
-                                for k in &keys {
-                                    app.live_keyboard.press_key(k, now);
-                                }
-                            }
-                        } else {
-                            total_strokes += 1;
-                            if c == ' ' {
-                                app.live_keyboard.press_key("Space", now);
-                            } else if c.is_ascii() {
-                                app.live_keyboard.press_char(c, now);
-                            }
-                        }
-                    }
-                    app.session.type_text_with_strokes_at(&committed, total_strokes, elapsed);
+                    handle_text(
+                        &mut app.session,
+                        &mut app.live_keyboard,
+                        app.scheme_dict.as_ref(),
+                        &committed,
+                        elapsed,
+                        now,
+                    );
                     if app.session.is_complete() {
                         finish_and_maybe_upload(&mut app, terminal)?;
                     }
@@ -2308,6 +2357,44 @@ fn is_open_stats(key: KeyEvent) -> bool {
     key.modifiers.is_empty() && (key.code == KeyCode::Char('s') || key.code == KeyCode::Char('S'))
 }
 
+/// 处理跟打文本上屏（支持单字符与多字词组，如输入法整词上屏 "怎么"）：
+/// 记录按键频率与时序事件，并触发实时虚拟键盘（物理击键/汉字方案反查）高亮。
+fn handle_text(
+    session: &mut Session,
+    live_kb: &mut LiveKeyboard,
+    scheme_dict: Option<&SchemeDict>,
+    text: &str,
+    elapsed: Duration,
+    now: Instant,
+) {
+    if text.is_empty() {
+        return;
+    }
+    if let Some(dict) = scheme_dict {
+        let (strokes, keys) = dict.resolve_strokes_and_keys(text);
+        for c in text.chars() {
+            session.record_key(&c.to_string());
+        }
+        session.type_text_with_strokes_at(text, strokes, elapsed);
+        for k in &keys {
+            live_kb.press_key(k, now);
+        }
+    } else {
+        for c in text.chars() {
+            session.record_key(&c.to_string());
+        }
+        let strokes = text.chars().count() as u32;
+        session.type_text_with_strokes_at(text, strokes, elapsed);
+        for c in text.chars() {
+            if c == ' ' {
+                live_kb.press_key("Space", now);
+            } else if c.is_ascii() {
+                live_kb.press_char(c, now);
+            }
+        }
+    }
+}
+
 /// 处理跟打键：退格回改，可打印字符上屏；同时记录按键频率与时序事件，并触发实时虚拟键盘（物理击键/汉字方案反查）高亮。
 fn handle_key(
     session: &mut Session,
@@ -2324,29 +2411,7 @@ fn handle_key(
             live_kb.press_key("Backspace", now);
         }
         KeyCode::Char(c) => {
-            let s = c.to_string();
-            if let Some(dict) = scheme_dict {
-                let (strokes, keys) = dict.resolve_strokes_and_keys(&s);
-                session.record_key(&s);
-                session.type_text_with_strokes_at(&s, strokes, elapsed);
-                if c == ' ' {
-                    live_kb.press_key("Space", now);
-                } else if c.is_ascii() {
-                    live_kb.press_char(c, now);
-                } else {
-                    for k in &keys {
-                        live_kb.press_key(k, now);
-                    }
-                }
-            } else {
-                session.record_key(&s);
-                session.type_text_with_strokes_at(&s, 1, elapsed);
-                if c == ' ' {
-                    live_kb.press_key("Space", now);
-                } else if c.is_ascii() {
-                    live_kb.press_char(c, now);
-                }
-            }
+            handle_text(session, live_kb, scheme_dict, &c.to_string(), elapsed, now);
         }
         _ => {}
     }
@@ -9142,14 +9207,20 @@ mod tests {
         let mut dict = SchemeDict::default();
         dict.add_entry("到", "_.");
         dict.add_entry("是", "wCs");
+        dict.add_entry("们", "aI");
 
         let rules = vec![
             "xform|xv|\\.|".to_string(),
             "xform|cf|C|".to_string(),
+            "xform|eg|I|".to_string(),
+            "xform|j|f|".to_string(),
+            "xform|,|c|".to_string(),
+            "xform|h|g|".to_string(),
+            "xform|i|e|".to_string(),
         ];
         dict.set_chord_algebra(dazitui_core::ChordAlgebra::from_rules(&rules));
 
-        let mut session = Session::new("到是");
+        let mut session = Session::new("到是们");
         let mut live_kb = LiveKeyboard::new();
         let now = Instant::now();
 
@@ -9168,7 +9239,7 @@ mod tests {
         assert_eq!(live_kb.active_keys.get("x"), Some(&now));
         assert_eq!(live_kb.active_keys.get("v"), Some(&now));
 
-        // 键入 "是" (反查为 "wCs" -> 由 ChordAlgebra 逆向展开为 "w", "c", "f", "s")
+        // 键入 "是" (反查为 "wCs" -> 双手并击 w (左) + C (右手 cf 镜像为 , j) + 结构码 s)
         let t2 = now + Duration::from_millis(500);
         handle_key(
             &mut session,
@@ -9180,14 +9251,81 @@ mod tests {
         );
 
         assert!(live_kb.active_keys.contains_key("w"));
-        assert!(live_kb.active_keys.contains_key("c"));
-        assert!(live_kb.active_keys.contains_key("f"));
+        assert!(live_kb.active_keys.contains_key(","));
+        assert!(live_kb.active_keys.contains_key("j"));
         assert!(live_kb.active_keys.contains_key("s"));
-        assert_eq!(live_kb.active_keys.get("c"), Some(&t2));
-        assert_eq!(live_kb.active_keys.get("f"), Some(&t2));
+        assert_eq!(live_kb.active_keys.get(","), Some(&t2));
+        assert_eq!(live_kb.active_keys.get("j"), Some(&t2));
 
-        // 验证 session 的击数：到 (1击) + 是 (3击) = 4击
-        assert_eq!(session.total_strokes(), 4);
+        // 键入 "们" (反查为 "aI" -> 双手并击 a (左) + I (右手 eg 镜像为 h i))
+        let t3 = now + Duration::from_millis(1000);
+        handle_key(
+            &mut session,
+            &mut live_kb,
+            Some(&dict),
+            KeyEvent::new(KeyCode::Char('们'), KeyModifiers::NONE),
+            Duration::from_millis(1100),
+            t3,
+        );
+
+        assert!(live_kb.active_keys.contains_key("a"));
+        assert!(live_kb.active_keys.contains_key("h"));
+        assert!(live_kb.active_keys.contains_key("i"));
+        assert!(!live_kb.active_keys.contains_key("e"));
+        assert!(!live_kb.active_keys.contains_key("g"));
+
+        // 验证 session 的击数：到 (1击) + 是 (3击) + 们 (2击) = 6击
+        assert_eq!(session.total_strokes(), 6);
+    }
+
+    #[test]
+    fn handle_text_chord_word_zenme_activates_only_chord_keys() {
+        let mut dict = SchemeDict::default();
+        dict.add_entry("怎", "H:");
+        dict.add_entry("么", "tB");
+        dict.add_entry("怎么", "+H");
+
+        let rules = vec![
+            "xform|y|t|".to_string(),
+            "xform|u|r|".to_string(),
+            "xform|i|e|".to_string(),
+            "xform|o|w|".to_string(),
+            "xform|p|q|".to_string(),
+            "xform|;|a|".to_string(),
+            "xform|ar|H|".to_string(),
+            "xform|as|:|".to_string(),
+            "xform|qw|B|".to_string(),
+        ];
+        dict.set_chord_algebra(dazitui_core::ChordAlgebra::from_rules(&rules));
+
+        let mut session = Session::new("怎么");
+        let mut live_kb = LiveKeyboard::new();
+        let now = Instant::now();
+
+        // 键入词组 "怎么" (反查为 "+H" -> 右手镜像展开为 ";" 和 "u")
+        handle_text(
+            &mut session,
+            &mut live_kb,
+            Some(&dict),
+            "怎么",
+            Duration::from_millis(100),
+            now,
+        );
+
+        // 应只激活右手镜像并击键 ";" 与 "u"
+        assert!(live_kb.active_keys.contains_key(";"));
+        assert!(live_kb.active_keys.contains_key("u"));
+
+        // 绝对不能亮 "怎" (H: -> ars) 和 "么" (tB -> qwt) 的散键 (qwasrt)
+        assert!(!live_kb.active_keys.contains_key("q"));
+        assert!(!live_kb.active_keys.contains_key("w"));
+        assert!(!live_kb.active_keys.contains_key("a"));
+        assert!(!live_kb.active_keys.contains_key("s"));
+        assert!(!live_kb.active_keys.contains_key("r"));
+        assert!(!live_kb.active_keys.contains_key("t"));
+
+        // 击数应为并击 1 击，而非 4 击
+        assert_eq!(session.total_strokes(), 1);
     }
 
     #[test]
