@@ -13,10 +13,10 @@ use dazitui_core::{
     ApiClient, ApiError, AuthSession, BUILTIN_SETS, CharStatus, CompetitionType, DbTask, DbWorker,
     ErrorRecordItem, ErrorType, HeatmapLayout, KeyboardMode, KeypressRecordItem, LoadError,
     LoadOptions, Rgb, SchemeDict, Session, SessionRecord, Settings, SettingsStore, Stats, StatsDb,
-    Text, TextSource, Theme, TokenStore, env_credentials, format_time, is_auth_failure,
-    load_builtin_text, load_builtin_text_shuffled, load_text_from_clipboard, load_text_from_file,
-    load_text_from_string, lttb_downsample, osc52_clipboard, prewarm_segmenter,
-    save_text_to_file,
+    Text, TextSource, Theme, TokenStore, env_credentials, format_stats_share_text, format_time,
+    is_auth_failure, load_builtin_text, load_builtin_text_shuffled, load_text_from_clipboard,
+    load_text_from_file, load_text_from_string, lttb_downsample, osc52_clipboard,
+    prewarm_segmenter, save_text_to_file,
 };
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -382,8 +382,8 @@ const SIDEBAR_MENU_ITEMS: &[SidebarMenuItem] = &[
 /// 成绩视图里的成绩上传状态（在线赛文完成跟打后自动上传）。
 #[derive(Debug, Clone, PartialEq)]
 enum UploadState {
-    /// 离线赛文：无需上传。
-    NotApplicable,
+    /// 非在线赛文：无需上传；`copied_stats` 为完成时已复制到剪贴板的统计分享文本（自由发文/离线赛文）。
+    NotApplicable { copied_stats: Option<String> },
     /// 上传中（同步网络请求期间）。
     Uploading,
     /// 上传成功：结构化排名（`None` = 服务器未返回）+ 已复制的分享文本。
@@ -1159,9 +1159,21 @@ impl App {
             };
             Some((stats, elapsed))
         } else {
+            let copied_stats = if copies_stats_to_clipboard(self.text.source) {
+                let share = format_stats_share_text(
+                    &self.text,
+                    &stats,
+                    elapsed,
+                    &self.settings.input_method,
+                );
+                write_clipboard(&share);
+                Some(share)
+            } else {
+                None
+            };
             self.state = AppState::Finished {
                 stats,
-                upload: UploadState::NotApplicable,
+                upload: UploadState::NotApplicable { copied_stats },
                 elapsed,
             };
             None
@@ -2657,10 +2669,19 @@ fn api_error_text(err: &ApiError) -> String {
 }
 
 /// 通过 OSC 52 转义序列把文本写入系统剪贴板（终端转发，失败静默忽略）。
+/// 测试构建直接跳过：避免单测向真实终端输出转义序列并覆盖开发者剪贴板。
 fn write_clipboard(text: &str) {
+    if cfg!(test) {
+        return;
+    }
     use crossterm::style::Print;
     let seq = osc52_clipboard(text);
     let _ = crossterm::execute!(std::io::stdout(), Print(seq));
+}
+
+/// 完成后自动复制统计结果到剪贴板的赛文来源：自由发文与离线赛文。
+fn copies_stats_to_clipboard(source: TextSource) -> bool {
+    matches!(source, TextSource::Custom | TextSource::File)
 }
 
 /// 焦点在设置项间循环移动（向上为负、向下为正）。
@@ -5393,15 +5414,16 @@ fn render_result_view(
         let details: String = stats.edit_details.iter().collect();
         summary_lines.push(Line::from(format!(" 回改明细: {details}")));
     }
-    // 上传状态（在线赛文；离线赛文不显示）
+    // 上传状态（在线赛文）/ 统计复制状态（自由发文与离线赛文）
     summary_lines.extend(upload_lines(upload, theme));
 
-    // 计算顶部高度
-    let summary_height = if matches!(upload, UploadState::NotApplicable) {
-        if stats.edit_details.is_empty() { 3 } else { 4 }
-    } else {
-        if stats.edit_details.is_empty() { 5 } else { 6 }
-    };
+    // 计算顶部高度：内容行按终端内宽折算换行（超宽行占多行）后的总行数 + 边框 2 行
+    let inner_width = (total_area.width.saturating_sub(2)).max(1) as usize;
+    let content_rows: usize = summary_lines
+        .iter()
+        .map(|line| line.width().div_ceil(inner_width).max(1))
+        .sum();
+    let summary_height = (content_rows + 2) as u16;
 
     // 2. 错字时间线行生成
     let mut timeline_lines = Vec::new();
@@ -5785,7 +5807,14 @@ fn overlay_error_chars_on_chart(
 /// 成绩视图里的上传状态行（纯函数，供渲染与测试）。
 fn upload_lines(upload: &UploadState, theme: Theme) -> Vec<Line<'static>> {
     match upload {
-        UploadState::NotApplicable => vec![],
+        UploadState::NotApplicable { copied_stats } => match copied_stats {
+            None => vec![],
+            Some(stats_text) => vec![
+                Line::from(""),
+                Line::from(format!(" 统计: {stats_text}")).fg(color(theme.accent)),
+                Line::from(" 已复制到剪贴板").fg(color(theme.muted)),
+            ],
+        },
         UploadState::Uploading => vec![
             Line::from(""),
             Line::from(" 成绩上传中…").fg(color(theme.warn)),
@@ -7759,8 +7788,18 @@ mod tests {
     #[test]
     fn upload_lines_renders_each_state() {
         let theme = Theme::preset(ThemePreset::CatppuccinMocha);
-        // 离线：不显示上传状态。
-        assert!(upload_lines(&UploadState::NotApplicable, theme).is_empty());
+        // 离线未复制：不显示上传状态。
+        assert!(upload_lines(&UploadState::NotApplicable { copied_stats: None }, theme).is_empty());
+        // 离线已复制统计（自由发文/离线赛文）：统计行 + 已复制提示。
+        let lines = upload_lines(
+            &UploadState::NotApplicable {
+                copied_stats: Some("自由发文《日常》 · WPM 85.2".into()),
+            },
+            theme,
+        );
+        let text: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+        assert!(text.iter().any(|s| s.contains("统计: 自由发文《日常》")));
+        assert!(text.iter().any(|s| s.contains("已复制到剪贴板")));
         // 上传中。
         let lines = upload_lines(&UploadState::Uploading, theme);
         assert!(lines.iter().any(|l| l.to_string().contains("上传中")));
@@ -7901,7 +7940,7 @@ mod tests {
 
     #[test]
     fn finish_typing_offline_no_upload_online_uploading() {
-        // 离线：直接进入成绩视图，无上传。
+        // 离线：直接进入成绩视图，无上传，统计结果已复制到剪贴板。
         let mut app = test_app(Text {
             title: "t".into(),
             content: "你好".into(),
@@ -7914,7 +7953,51 @@ mod tests {
         assert!(matches!(
             &app.state,
             AppState::Finished {
-                upload: UploadState::NotApplicable,
+                upload: UploadState::NotApplicable { copied_stats: Some(s) },
+                ..
+            } if s.starts_with("离线赛文《t》") && s.contains("WPM")
+        ));
+        // 自由发文：同样复制统计结果。
+        let mut app = test_app(Text {
+            title: "随笔".into(),
+            content: "你好".into(),
+            source: TextSource::Custom,
+            word_boundaries: None,
+            shuffled: false,
+        });
+        app.session.type_text("你好");
+        assert!(app.finish_typing().is_none());
+        assert!(matches!(
+            &app.state,
+            AppState::Finished {
+                upload: UploadState::NotApplicable { copied_stats: Some(s) },
+                ..
+            } if s.starts_with("自由发文《随笔》")
+        ));
+        // 内置/剪贴板来源：不复制。
+        let mut app = test_app(builtin_text("你好"));
+        app.session.type_text("你好");
+        app.finish_typing();
+        assert!(matches!(
+            &app.state,
+            AppState::Finished {
+                upload: UploadState::NotApplicable { copied_stats: None },
+                ..
+            }
+        ));
+        let mut app = test_app(Text {
+            title: "剪贴板赛文".into(),
+            content: "你好".into(),
+            source: TextSource::Clipboard,
+            word_boundaries: None,
+            shuffled: false,
+        });
+        app.session.type_text("你好");
+        app.finish_typing();
+        assert!(matches!(
+            &app.state,
+            AppState::Finished {
+                upload: UploadState::NotApplicable { copied_stats: None },
                 ..
             }
         ));
@@ -7929,6 +8012,19 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn copies_stats_to_clipboard_scopes_to_custom_and_file() {
+        assert!(copies_stats_to_clipboard(TextSource::File));
+        assert!(copies_stats_to_clipboard(TextSource::Custom));
+        assert!(!copies_stats_to_clipboard(TextSource::Clipboard));
+        assert!(!copies_stats_to_clipboard(TextSource::Builtin {
+            set: BUILTIN_SETS[0]
+        }));
+        assert!(!copies_stats_to_clipboard(TextSource::Online {
+            competition_type: CompetitionType::Jisu
+        }));
     }
 
     // ---- T9 成绩上传可靠性：token 校验 + 自动重登 ----
@@ -8225,6 +8321,56 @@ mod tests {
     }
 
     // ---- Issue #40 / #41 速度图表与错字时间线渲染测试 ----
+
+    /// 渲染整个终端缓冲区并拼接为去除空格的纯文本（供结果视图断言）。
+    fn render_buffer_text(app: &App, width: u16, height: u16) -> String {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| ui(f, app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let content = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        content.replace(' ', "")
+    }
+
+    #[test]
+    fn render_result_view_shows_copied_stats_feedback() {
+        // 离线赛文完成后：成绩视图应显示「统计: …」与「已复制到剪贴板」反馈行。
+        let mut app = test_app(file_text("你好世界"));
+        app.session.type_text_at("你", Duration::from_secs(1));
+        app.session.type_text_at("好", Duration::from_secs(2));
+        app.finish_typing();
+
+        let content = render_buffer_text(&app, 100, 30);
+        assert!(content.contains("统计:离线赛文《t》"), "应显示统计分享文本");
+        assert!(content.contains("已复制到剪贴板"), "应显示已复制提示");
+    }
+
+    #[test]
+    fn render_result_view_shows_online_share_lines() {
+        // 在线赛文上传成功后：分享文本与「已复制到剪贴板」行应可见
+        // （历史 bug：固定 summary 高度不足导致这两行被裁剪，宽度自适应高度后修复）。
+        let mut app = test_app(online_text("你好世界"));
+        app.session.type_text("你好世界");
+        app.state = AppState::Finished {
+            stats: app.session.finish(Duration::from_secs(4)),
+            upload: UploadState::Success {
+                ranking: Some("5".into()),
+                share_text: "极速杯 第5名 · WPM 85.2 · 击键 3.5 · 码长 2.8".into(),
+            },
+            elapsed: Duration::from_secs(4),
+        };
+
+        let content = render_buffer_text(&app, 100, 30);
+        assert!(content.contains("分享:极速杯第5名"), "应显示分享文本行");
+        assert!(content.contains("已复制到剪贴板"), "应显示已复制提示");
+    }
 
     #[test]
     fn render_result_view_renders_chart_and_errors() {
@@ -8939,7 +9085,7 @@ mod tests {
         let stats = app.session.finish(Duration::from_secs(10));
         app.state = AppState::Finished {
             stats,
-            upload: UploadState::NotApplicable,
+            upload: UploadState::NotApplicable { copied_stats: None },
             elapsed: Duration::from_secs(10),
         };
 
@@ -10111,7 +10257,7 @@ mod tests {
         let mut app = test_app(file_text("测试"));
         app.state = AppState::Finished {
             stats: app.session.finish(Duration::from_secs(5)),
-            upload: UploadState::NotApplicable,
+            upload: UploadState::NotApplicable { copied_stats: None },
             elapsed: Duration::from_secs(5),
         };
 
@@ -10124,7 +10270,7 @@ mod tests {
         // 返回成绩视图后测试全角 'ｆ' 触发进入文件浏览
         app.state = AppState::Finished {
             stats: app.session.finish(Duration::from_secs(5)),
-            upload: UploadState::NotApplicable,
+            upload: UploadState::NotApplicable { copied_stats: None },
             elapsed: Duration::from_secs(5),
         };
         let mut key_f = KeyEvent::new(KeyCode::Char('ｆ'), KeyModifiers::NONE);
@@ -10135,7 +10281,7 @@ mod tests {
         // 返回成绩视图后测试全角 'ｉ' 触发进入自由发文
         app.state = AppState::Finished {
             stats: app.session.finish(Duration::from_secs(5)),
-            upload: UploadState::NotApplicable,
+            upload: UploadState::NotApplicable { copied_stats: None },
             elapsed: Duration::from_secs(5),
         };
         let mut key_i = KeyEvent::new(KeyCode::Char('ｉ'), KeyModifiers::NONE);

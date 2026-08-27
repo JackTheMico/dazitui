@@ -5,7 +5,7 @@ use std::time::Duration;
 use base64::Engine;
 use serde_json::Value;
 
-use crate::{Stats, Text, TextSource};
+use crate::{Stats, Text, TextSource, format_time, input_method_suffix};
 
 /// 52dazi.cn 上传字段。
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -61,23 +61,13 @@ pub fn format_share_text(
         TextSource::Online { competition_type } => competition_type.name(),
     };
     let rank_part = rank.map(|r| format!(" 第{r}名")).unwrap_or_default();
-    let im_part = if input_method.is_empty() {
-        String::new()
-    } else {
-        format!(" · {input_method}")
-    };
     format!(
-        "{name}{rank_part} · WPM {:.1} · 击键 {:.1} · 码长 {:.1}{im_part}",
-        stats.speed, stats.keystrokes, stats.key_length
+        "{name}{rank_part} · WPM {:.1} · 击键 {:.1} · 码长 {:.1}{}",
+        stats.speed,
+        stats.keystrokes,
+        stats.key_length,
+        input_method_suffix(input_method)
     )
-}
-
-/// 用时格式化为 `MM:SS.sss`（与前端 `formatTime` 一致，秒保留 3 位小数）。
-pub fn format_time(elapsed: Duration) -> String {
-    let secs = elapsed.as_secs_f64();
-    let minutes = (secs / 60.0).floor() as u64;
-    let seconds = secs - (minutes as f64) * 60.0;
-    format!("{minutes:02}:{seconds:06.3}")
 }
 
 /// 构造 52dazi.cn 上传请求体（业务字段，公共字段由 `client.upload_result` 自动合并）。
@@ -234,13 +224,6 @@ mod tests {
         assert_eq!(CompetitionType::Jisu.name(), "极速杯");
         assert_eq!(CompetitionType::Jinbiao.name(), "锦标赛");
         assert_eq!(CompetitionType::Jianshen.name(), "键神杯");
-    }
-
-    #[test]
-    fn format_time_minutes_seconds_millis() {
-        assert_eq!(format_time(Duration::from_secs_f64(85.23)), "01:25.230");
-        assert_eq!(format_time(Duration::from_secs(5)), "00:05.000");
-        assert_eq!(format_time(Duration::ZERO), "00:00.000");
     }
 
     #[test]

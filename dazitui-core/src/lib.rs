@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::time::Duration;
 
 mod db;
 mod lttb;
@@ -33,8 +34,7 @@ pub use online::client::{
 pub use online::protocol::{ProtocolError, build_request, decrypt, encrypt, parse_json};
 #[cfg(feature = "online")]
 pub use online::share::{
-    UploadStats, build_upload_payload, format_share_text, format_time, osc52_clipboard,
-    to_upload_stats,
+    UploadStats, build_upload_payload, format_share_text, osc52_clipboard, to_upload_stats,
 };
 #[cfg(feature = "online")]
 pub use online::token::{AuthSession, TokenStore};
@@ -472,6 +472,55 @@ fn is_punctuation(c: char) -> bool {
                 | '×'
                 | '÷'
         )
+}
+
+/// 用时格式化为 `MM:SS.sss`（与前端 `formatTime` 一致，秒保留 3 位小数）。
+pub fn format_time(elapsed: Duration) -> String {
+    let secs = elapsed.as_secs_f64();
+    let minutes = (secs / 60.0).floor() as u64;
+    let seconds = secs - (minutes as f64) * 60.0;
+    format!("{minutes:02}:{seconds:06.3}")
+}
+
+/// 输入法分享文本后缀：空输入法返回空串，否则返回 ` · <输入法>`（在线分享与统计复制共用）。
+fn input_method_suffix(input_method: &str) -> String {
+    if input_method.is_empty() {
+        String::new()
+    } else {
+        format!(" · {input_method}")
+    }
+}
+
+/// 把非在线跟打的统计结果格式化为单行分享文本（自由发文/离线赛文完成后复制到剪贴板）。
+///
+/// 格式：`<来源>《<标题>》 · WPM 85.2 · 击键 3.5 · 码长 2.8 · 正确字数 40/42 · 错字 3 · 用时 01:25.230 · <输入法>`；
+/// `input_method` 为空时省略末尾输入法段。
+pub fn format_stats_share_text(
+    text: &Text,
+    stats: &Stats,
+    elapsed: Duration,
+    input_method: &str,
+) -> String {
+    let source = match text.source {
+        TextSource::File => "离线赛文",
+        TextSource::Custom => "自由发文",
+        TextSource::Clipboard => "剪贴板",
+        TextSource::Builtin { set } => set.name(),
+        TextSource::Online { competition_type } => competition_type.name(),
+    };
+    let total_chars = text.content.chars().count();
+    format!(
+        "{source}《{}》 · WPM {:.1} · 击键 {:.1} · 码长 {:.1} · 正确字数 {}/{} · 错字 {} · 用时 {}{}",
+        text.title,
+        stats.wpm,
+        stats.kps,
+        stats.key_length,
+        stats.correct_chars,
+        total_chars,
+        stats.wrong_total,
+        format_time(elapsed),
+        input_method_suffix(input_method)
+    )
 }
 
 #[cfg(test)]
@@ -932,5 +981,66 @@ mod tests {
                 let _ = fs::remove_dir(grand);
             }
         }
+    }
+
+    fn sample_stats() -> Stats {
+        Stats {
+            wpm: 85.2,
+            kps: 3.5,
+            key_length: 2.8,
+            total_strokes: 140,
+            correct_chars: 3,
+            wrong_chars: 1,
+            edits: 0,
+            wrong_total: 1,
+            typed_chars: 4,
+            phrase_chars: 0,
+            key_frequency: vec![],
+            edit_details: vec![],
+            speed_samples: vec![],
+            kps_samples: vec![],
+            error_points: vec![],
+        }
+    }
+
+    #[test]
+    fn format_time_minutes_seconds_millis() {
+        assert_eq!(format_time(Duration::from_secs_f64(85.23)), "01:25.230");
+        assert_eq!(format_time(Duration::from_secs(5)), "00:05.000");
+        assert_eq!(format_time(Duration::ZERO), "00:00.000");
+    }
+
+    #[test]
+    fn stats_share_text_file_source_full_line() {
+        let text = Text {
+            title: "背影节选".into(),
+            content: "你好世界".into(),
+            source: TextSource::File,
+            word_boundaries: None,
+            shuffled: false,
+        };
+        let stats = sample_stats();
+        let s = format_stats_share_text(&text, &stats, Duration::from_secs_f64(85.23), "虎码");
+        assert_eq!(
+            s,
+            "离线赛文《背影节选》 · WPM 85.2 · 击键 3.5 · 码长 2.8 · 正确字数 3/4 · 错字 1 · 用时 01:25.230 · 虎码"
+        );
+    }
+
+    #[test]
+    fn stats_share_text_custom_source_omits_empty_input_method() {
+        let text = Text {
+            title: "日常练习".into(),
+            content: "你好世界".into(),
+            source: TextSource::Custom,
+            word_boundaries: None,
+            shuffled: false,
+        };
+        let stats = sample_stats();
+        let s = format_stats_share_text(&text, &stats, Duration::from_secs(60), "");
+        assert_eq!(
+            s,
+            "自由发文《日常练习》 · WPM 85.2 · 击键 3.5 · 码长 2.8 · 正确字数 3/4 · 错字 1 · 用时 01:00.000"
+        );
     }
 }
