@@ -392,10 +392,12 @@ enum UploadState {
         share_text: String,
     },
     /// 上传失败：友好文案 + 是否需要重新登录 + 原始服务器错误（次要信息）。
+    /// `copied_stats` 为失败时已复制到剪贴板的统计分享文本（成绩不因网络问题丢失）。
     Failed {
         message: String,
         need_relogin: bool,
         detail: Option<String>,
+        copied_stats: Option<String>,
     },
 }
 
@@ -1337,10 +1339,15 @@ impl App {
     /// 执行上传：调用 API 客户端一站式上传成绩（包含指标计算、payload 构建、网关通信、自动重登与分享文本生成）。
     fn perform_upload(&self, stats: &Stats, elapsed: Duration) -> UploadState {
         if !self.logged_in && !self.api.is_logged_in() {
+            // 未登录时成绩也不该丢失：先把统计复制到剪贴板。
+            let share =
+                format_stats_share_text(&self.text, stats, elapsed, &self.settings.input_method);
+            write_clipboard(&share);
             return UploadState::Failed {
                 message: "未登录，无法上传成绩".to_string(),
                 need_relogin: true,
                 detail: None,
+                copied_stats: Some(share),
             };
         }
         if !self.api.is_logged_in()
@@ -1366,18 +1373,32 @@ impl App {
                     let _ = self.token_store.clear();
                 }
                 // 登录失效：主文案用友好提示，原始服务器错误降级为次要信息。
+                // 传输/解析失败：主文案保持友好，原始错误作为次要信息透出（供诊断，不再吞掉）。
                 let (message, detail) = if need_relogin {
                     (
                         "登录已失效，请重新登录".to_string(),
                         Some(api_error_text(&e)),
                     )
                 } else {
-                    (api_error_text(&e), None)
+                    let detail = match &e {
+                        ApiError::Transport(raw) | ApiError::Parse(raw) => Some(raw.clone()),
+                        ApiError::Server(_) => None,
+                    };
+                    (api_error_text(&e), detail)
                 };
+                // 上传失败也把统计复制到剪贴板：跟打结果不因网络问题而丢失。
+                let share = format_stats_share_text(
+                    &self.text,
+                    stats,
+                    elapsed,
+                    &self.settings.input_method,
+                );
+                write_clipboard(&share);
                 UploadState::Failed {
                     message,
                     need_relogin,
                     detail,
+                    copied_stats: Some(share),
                 }
             }
         }
@@ -5840,6 +5861,7 @@ fn upload_lines(upload: &UploadState, theme: Theme) -> Vec<Line<'static>> {
             message,
             need_relogin,
             detail,
+            copied_stats,
         } => {
             let mut lines = vec![
                 Line::from(""),
@@ -5852,6 +5874,10 @@ fn upload_lines(upload: &UploadState, theme: Theme) -> Vec<Line<'static>> {
                 lines.push(
                     Line::from(" 请按 Ctrl-O 重新登录（登录后自动重试上传）").fg(color(theme.warn)),
                 );
+            }
+            if let Some(stats_text) = copied_stats {
+                lines.push(Line::from(format!(" 统计: {stats_text}")).fg(color(theme.accent)));
+                lines.push(Line::from(" 已复制到剪贴板").fg(color(theme.muted)));
             }
             lines
         }
@@ -7827,12 +7853,13 @@ mod tests {
             theme,
         );
         assert!(lines.iter().any(|l| l.to_string().contains("已上传")));
-        // 失败：显示原因，不提示重新登录。
+        // 失败：显示原因（含原始错误详情）与已复制的统计，不提示重新登录。
         let lines = upload_lines(
             &UploadState::Failed {
                 message: "网络连接失败".into(),
                 need_relogin: false,
-                detail: None,
+                detail: Some("传输层错误详情".into()),
+                copied_stats: Some("离线赛文《t》 · WPM 85.2".into()),
             },
             theme,
         );
@@ -7841,13 +7868,29 @@ mod tests {
                 .iter()
                 .any(|l| l.to_string().contains("上传失败: 网络连接失败"))
         );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.to_string().contains("原始错误: 传输层错误详情"))
+        );
         assert!(lines.iter().all(|l| !l.to_string().contains("重新登录")));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.to_string().contains("统计: 离线赛文《t》"))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.to_string().contains("已复制到剪贴板"))
+        );
         // 失败且鉴权失效：提示重新登录；原始错误降级为次要信息。
         let lines = upload_lines(
             &UploadState::Failed {
                 message: "登录已失效，请重新登录".into(),
                 need_relogin: true,
                 detail: Some("用户名不能为空！".into()),
+                copied_stats: None,
             },
             theme,
         );
@@ -7865,14 +7908,21 @@ mod tests {
         app.token = None;
         let stats = app.session.finish(Duration::from_secs(10));
         let up = app.perform_upload(&stats, Duration::from_secs(10));
-        assert_eq!(
-            up,
+        match up {
             UploadState::Failed {
-                message: "未登录，无法上传成绩".to_string(),
-                need_relogin: true,
-                detail: None,
+                message,
+                need_relogin,
+                detail,
+                copied_stats,
+            } => {
+                assert_eq!(message, "未登录，无法上传成绩");
+                assert!(need_relogin);
+                assert_eq!(detail, None);
+                let cs = copied_stats.expect("未登录时也应把统计复制到剪贴板");
+                assert!(cs.contains("WPM"), "统计文本应含 WPM: {cs}");
             }
-        );
+            other => panic!("期望 Failed，得到 {other:?}"),
+        }
     }
 
     #[test]
@@ -7880,18 +7930,26 @@ mod tests {
         let mut app = test_app(online_text("你好世界"));
         app.token = Some("dead-token".into());
         app.logged_in = true;
-        // 指向必然拒绝连接的地址，验证网络错误被友好化。
+        // 指向必然拒绝连接的地址，验证网络错误被友好化、原始错误透出、统计仍复制。
         app.api = ApiClient::with_base_url("http://127.0.0.1:1");
         let stats = app.session.finish(Duration::from_secs(10));
         let up = app.perform_upload(&stats, Duration::from_secs(10));
-        assert_eq!(
-            up,
+        match up {
             UploadState::Failed {
-                message: "网络连接失败".to_string(),
-                need_relogin: false,
-                detail: None,
+                message,
+                need_relogin,
+                detail,
+                copied_stats,
+            } => {
+                assert_eq!(message, "网络连接失败");
+                assert!(!need_relogin);
+                let d = detail.expect("传输错误应透出原始错误详情供诊断");
+                assert!(!d.is_empty(), "原始错误详情不应为空: {d}");
+                let cs = copied_stats.expect("上传失败也应把统计复制到剪贴板");
+                assert!(cs.contains("WPM"), "统计文本应含 WPM: {cs}");
             }
-        );
+            other => panic!("期望 Failed，得到 {other:?}"),
+        }
     }
 
     #[test]
@@ -8129,14 +8187,21 @@ mod tests {
         let stats = app.session.finish(Duration::from_secs(10));
         let up = app.perform_upload(&stats, Duration::from_secs(10));
         handle.join().unwrap();
-        assert_eq!(
-            up,
+        match up {
             UploadState::Failed {
-                message: "登录已失效，请重新登录".to_string(),
-                need_relogin: true,
-                detail: Some("用户名不能为空！".to_string()),
+                message,
+                need_relogin,
+                detail,
+                copied_stats,
+            } => {
+                assert_eq!(message, "登录已失效，请重新登录");
+                assert!(need_relogin);
+                assert_eq!(detail.as_deref(), Some("用户名不能为空！"));
+                let cs = copied_stats.expect("上传失败也应把统计复制到剪贴板");
+                assert!(cs.contains("WPM"), "统计文本应含 WPM: {cs}");
             }
-        );
+            other => panic!("期望 Failed，得到 {other:?}"),
+        }
     }
 
     #[test]
@@ -8160,6 +8225,7 @@ mod tests {
                 message: "登录已失效，请重新登录".to_string(),
                 need_relogin: true,
                 detail: Some("用户名不能为空！".to_string()),
+                copied_stats: None,
             },
             elapsed: Duration::from_secs(30),
         };

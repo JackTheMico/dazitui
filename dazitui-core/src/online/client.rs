@@ -396,7 +396,14 @@ impl ApiClient {
         let upload_stats = super::share::to_upload_stats(stats, elapsed);
         let payload =
             super::share::build_upload_payload(text, stats, &upload_stats, elapsed, input_method);
-        let rank_res = match self.upload_result(&token, &payload) {
+        // 瞬时传输失败（连接抖动、服务端 5xx、超时）自动重试一次：
+        // 上传是完成跟打后的关键一跳，不因一次网络抖动就丢成绩。
+        let mut rank_res = self.upload_result(&token, &payload);
+        if matches!(rank_res, Err(ApiError::Transport(_))) {
+            std::thread::sleep(Duration::from_millis(300));
+            rank_res = self.upload_result(&token, &payload);
+        }
+        let rank_res = match rank_res {
             Ok(r) => Ok(r),
             Err(e) => {
                 if super::auth::is_auth_failure(&e) {
@@ -1187,6 +1194,103 @@ mod tests {
         }
 
         server.join().unwrap();
+    }
+
+    #[test]
+    fn upload_session_retries_once_on_transport_failure() {
+        use crate::TextSource;
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = std::thread::spawn(move || {
+            // 第一次：接受连接后读走请求立即断开，模拟瞬时网络失败（→ Transport）
+            let (mut conn1, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = conn1.read(&mut buf).unwrap();
+            drop(conn1);
+            // 第二次：正常响应上传成功
+            let (mut conn2, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = conn2.read(&mut buf).unwrap();
+            let resp = r#"{"error":0,"msg":"上传成功"}"#;
+            conn2.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp}",
+                    resp.len()
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        });
+
+        let client = ApiClient::with_base_url(&format!("http://{addr}"));
+        client.set_session(Some(AuthSession::from_token("tok-retry")));
+        let text = Text {
+            title: "极速杯第100期".into(),
+            content: "打字练习测试".into(),
+            source: TextSource::Online {
+                competition_type: CompetitionType::Jisu,
+            },
+            word_boundaries: None,
+            shuffled: false,
+        };
+        let stats = Stats {
+            wpm: 88.0,
+            kps: 1.0,
+            key_length: 1.67,
+            total_strokes: 10,
+            typed_chars: 6,
+            correct_chars: 6,
+            wrong_chars: 0,
+            edits: 0,
+            wrong_total: 0,
+            phrase_chars: 0,
+            key_frequency: vec![("a".into(), 10)],
+            edit_details: Vec::new(),
+            speed_samples: Vec::new(),
+            kps_samples: Vec::new(),
+            error_points: Vec::new(),
+        };
+        // 第一次连接被断 → 自动重试 → 第二次成功
+        let outcome = client
+            .upload_session(&text, &stats, Duration::from_secs(10), "")
+            .unwrap();
+        assert!(outcome.share_text.contains("WPM 88.0"));
+        assert!(outcome.message.contains("上传成功"));
+
+        server.join().unwrap();
+    }
+
+    /// 只读诊断探针：用本机已保存会话调用 getBaseInfo（isLogin）与 getContent，
+    /// 判断 token/cookie 是否仍被服务端认可。不产生任何副作用。
+    #[test]
+    #[ignore = "manual probe: read-only live 52dazi checks with saved session"]
+    fn probe_saved_session_readonly() {
+        let client = ApiClient::new();
+        let sess = client.current_session();
+        println!("saved session: {sess:?}");
+        let Some(token) = client.current_token() else {
+            println!("NO SAVED TOKEN");
+            return;
+        };
+        // 1) getBaseInfo — 只读，验证会话是否仍被服务端认可
+        let body = encrypt_value(&Value::Object(base_fields(Some(&token))));
+        println!(
+            "getBaseInfo: {:?}",
+            client.post("Api/System/getBaseInfo", &body)
+        );
+        // 2) getContent — 只读，带真实 cookie 载极速杯赛文
+        match client.get_content(CompetitionType::Jisu) {
+            Ok(t) => println!(
+                "getContent OK: title={:?} content_chars={}",
+                t.title,
+                t.content.chars().count()
+            ),
+            Err(e) => println!("getContent ERR: {e:?}"),
+        }
     }
 
     #[test]
