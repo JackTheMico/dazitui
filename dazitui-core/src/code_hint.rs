@@ -50,13 +50,20 @@ fn format_hint_cell(code: &str, target_width: usize) -> String {
 ///
 /// `words` 为本页正文词（与 `hints` 同序），每个提示按对应词的可视列宽截断/居中，
 /// 词间以单空格分隔，使提示行与正文行（同样以单空格分词）逐词对齐。
-pub fn layout_code_hint_line(words: &[String], hints: &[CodeHint]) -> String {
+///
+/// `typed_mask[i]` 为真表示该词已全部正确上屏，其提示留空（仍按词宽占位，不影响对齐）。
+pub fn layout_code_hint_line(words: &[String], hints: &[CodeHint], typed_mask: &[bool]) -> String {
     words
         .iter()
         .enumerate()
         .map(|(i, w)| {
             let target = display_width(w);
-            let code = hints.get(i).map(|h| h.code.as_str()).unwrap_or("");
+            let typed = typed_mask.get(i).copied().unwrap_or(false);
+            let code = if typed {
+                ""
+            } else {
+                hints.get(i).map(|h| h.code.as_str()).unwrap_or("")
+            };
             format_hint_cell(code, target)
         })
         .collect::<Vec<_>>()
@@ -82,7 +89,7 @@ mod tests {
         // 单字「中」可视宽 2，提示 "k" 居中 → 定宽 2、右侧补 1 空格。
         let words = vec!["中".to_string()];
         let hints = vec![hint("k")];
-        assert_eq!(layout_code_hint_line(&words, &hints), "k ");
+        assert_eq!(layout_code_hint_line(&words, &hints, &[]), "k ");
     }
 
     #[test]
@@ -91,7 +98,7 @@ mod tests {
         // 词间单空格分隔，提示行与正文行逐词对齐。
         let words = vec!["中".to_string(), "中国".to_string()];
         let hints = vec![hint("k"), hint("lgyinay")];
-        assert_eq!(layout_code_hint_line(&words, &hints), "k  lgyi");
+        assert_eq!(layout_code_hint_line(&words, &hints, &[]), "k  lgyi");
     }
 
     #[test]
@@ -104,6 +111,20 @@ mod tests {
             strokes: 0,
             is_oov: true,
         }];
-        assert_eq!(layout_code_hint_line(&words, &hints), "  ");
+        assert_eq!(layout_code_hint_line(&words, &hints, &[]), "  ");
+    }
+
+    #[test]
+    fn layout_typed_word_is_blank_but_aligned() {
+        // T04：已全对上屏的词，其上方提示留空（按词宽占位，不影响对齐）。
+        // 「中」(2) 已打 → 2 空格；词间单空格分隔符；「中国」(4) 未打 → 显示 lgyi。
+        // 故提示行 = "  " + " " + "lgyi" = "   lgyi"（3 前导空格）。
+        let words = vec!["中".to_string(), "中国".to_string()];
+        let hints = vec![hint("k"), hint("lgyinay")];
+        let typed_mask = vec![true, false];
+        assert_eq!(
+            layout_code_hint_line(&words, &hints, &typed_mask),
+            "   lgyi"
+        );
     }
 }

@@ -6212,12 +6212,20 @@ fn code_hint_overlay_line(
     }
     let statuses = session.original_status();
     let mut words: Vec<String> = Vec::new();
+    let mut typed_mask: Vec<bool> = Vec::new();
     for &(ws, we) in boundaries[page_start..page_end].iter() {
         let word: String = statuses[ws..we].iter().map(|(c, _)| *c).collect();
+        // T04：该词所有字符均已正确上屏 → 隐藏其上方提示（回改后随状态重现）。
+        let all_correct = (ws..we).all(|i| {
+            statuses
+                .get(i)
+                .is_some_and(|(_, s)| *s == Some(CharStatus::Correct))
+        });
         words.push(word);
+        typed_mask.push(all_correct);
     }
     let hints: Vec<CodeHint> = dict.build_code_hints(&words);
-    let hint_str = layout_code_hint_line(&words, &hints);
+    let hint_str = layout_code_hint_line(&words, &hints, &typed_mask);
     Some(Line::from(hint_str).fg(color(theme.muted)))
 }
 
@@ -7975,6 +7983,60 @@ mod tests {
         assert!(
             code_hint_overlay_line(&char_session, &char_text, Some(&dict), theme).is_none(),
             "单字赛文不应生成提示行"
+        );
+    }
+
+    #[test]
+    fn code_hint_overlay_hides_typed_word_and_reveals_on_backspace() {
+        // T04：已全对上屏的词，其上方提示隐藏；回改（删一个字符）后该词提示重现。
+        // 对所有本页其他未打字词提示不产生影响。
+        let theme = Theme::preset(ThemePreset::CatppuccinMocha);
+        let set = BUILTIN_SETS[3]; // 常用词组前五百，首词「可以」（双字·列宽 4）
+        let text = load_builtin_text(set);
+        let boundaries = set.word_boundaries();
+        let mut session =
+            Session::new_gated_with_words_and_size(&text.content, true, &boundaries, 10);
+        // 字典涵盖首词「可以」及若干后续词（中国=lgy 用于验证其余提示不受影响）。
+        let tsv = "可以\tkr\n一个\tyg\n自己\tvm\n没有\tei\n我们\twm\n这个\tvi\n问题\tuj\n中国\tlgy\n";
+        let dict = SchemeDict::parse(tsv);
+
+        let (fw_s, fw_e) = boundaries[0];
+        let first_word: String =
+            text.content.chars().skip(fw_s).take(fw_e - fw_s).collect();
+        assert_eq!(first_word, "可以", "首词应为「可以」");
+
+        // 未打字时首词「可以」的提示首格（4 列）应显示编码（非空白）。
+        let untyped = code_hint_overlay_line(&session, &text, Some(&dict), theme)
+            .expect("应生成提示行");
+        let untyped_str: String = untyped.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            !untyped_str.chars().take(4).all(|c| c.is_whitespace()),
+            "未打字时首词「可以」应显示编码，得到: {untyped_str:?}"
+        );
+
+        // 打满首词「可以」→ 其提示首格应隐藏（4 列空格占位），其余词提示不变。
+        session.type_text(&first_word);
+        let typed = code_hint_overlay_line(&session, &text, Some(&dict), theme)
+            .expect("应生成提示行");
+        let typed_str: String = typed.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            typed_str.chars().take(4).all(|c| c.is_whitespace()),
+            "首词已上屏后其提示应隐藏（4 列空格占位），得到: {typed_str:?}"
+        );
+        assert!(
+            typed_str.contains("lgy"),
+            "其余未打字词（如中国）提示应仍在，得到: {typed_str:?}"
+        );
+
+        // 回改：删除末字符 → 首词变为部分输入，提示随状态重现（首格不再全空白）。
+        session.backspace();
+        let reverted = code_hint_overlay_line(&session, &text, Some(&dict), theme)
+            .expect("应生成提示行");
+        let reverted_str: String =
+            reverted.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            !reverted_str.chars().take(4).all(|c| c.is_whitespace()),
+            "回改后首词提示应重现，得到: {reverted_str:?}"
         );
     }
 
