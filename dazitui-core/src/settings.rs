@@ -125,6 +125,8 @@ pub struct Theme {
     pub hand_left: Rgb,
     /// 遍码提示：右手单手码配色（原黄）。由各主题自行定义，保证在该主题背景上可读。
     pub hand_right: Rgb,
+    /// 遍码提示：无前缀双手并击/普通全码配色（青/蓝系）。由各主题自行定义，与粉/黄区分且可读。
+    pub hand_two: Rgb,
 }
 
 impl Theme {
@@ -140,6 +142,7 @@ impl Theme {
                 muted: Rgb(0x6c, 0x70, 0x86),
                 hand_left: Rgb(0xf5, 0xc2, 0xe7),
                 hand_right: Rgb(0xf9, 0xe2, 0xaf),
+                hand_two: Rgb(0x89, 0xdc, 0xeb),
             },
             ThemePreset::Cyberpunk => Self {
                 text: Rgb(240, 240, 240),
@@ -150,6 +153,7 @@ impl Theme {
                 muted: Rgb(100, 100, 140),
                 hand_left: Rgb(0xff, 0x5f, 0xa2),
                 hand_right: Rgb(0xff, 0xe6, 0x00),
+                hand_two: Rgb(0x00, 0xff, 0xff),
             },
             ThemePreset::Nord => Self {
                 text: Rgb(236, 239, 244),
@@ -160,6 +164,7 @@ impl Theme {
                 muted: Rgb(76, 86, 106),
                 hand_left: Rgb(0xb4, 0x8e, 0xad),
                 hand_right: Rgb(0xeb, 0xcb, 0x8b),
+                hand_two: Rgb(0x88, 0xc0, 0xd0),
             },
             ThemePreset::Dracula => Self {
                 text: Rgb(0xf8, 0xf8, 0xf2),
@@ -170,6 +175,7 @@ impl Theme {
                 muted: Rgb(0x62, 0x72, 0xa4),
                 hand_left: Rgb(0xff, 0x79, 0xc6),
                 hand_right: Rgb(0xf1, 0xfa, 0x8c),
+                hand_two: Rgb(0x8b, 0xe9, 0xfd),
             },
             ThemePreset::Gruvbox => Self {
                 text: Rgb(0xeb, 0xdb, 0xb2),
@@ -180,6 +186,7 @@ impl Theme {
                 muted: Rgb(0x92, 0x83, 0x74),
                 hand_left: Rgb(0xb1, 0x62, 0x86),
                 hand_right: Rgb(0xfa, 0xbd, 0x2f),
+                hand_two: Rgb(0x83, 0xa5, 0x98),
             },
             ThemePreset::RosePine => Self {
                 text: Rgb(224, 222, 244),
@@ -190,6 +197,7 @@ impl Theme {
                 muted: Rgb(110, 106, 134),
                 hand_left: Rgb(0xeb, 0x6f, 0x92),
                 hand_right: Rgb(0xf6, 0xc1, 0x77),
+                hand_two: Rgb(0x9c, 0xcf, 0xd8),
             },
             ThemePreset::Kanagawa => Self {
                 text: Rgb(220, 215, 186),
@@ -200,6 +208,7 @@ impl Theme {
                 muted: Rgb(114, 113, 105),
                 hand_left: Rgb(0xf4, 0x72, 0xb6),
                 hand_right: Rgb(0xfa, 0xcc, 0x15),
+                hand_two: Rgb(0x7d, 0xae, 0xa3),
             },
             ThemePreset::OneDark => Self {
                 text: Rgb(171, 178, 191),
@@ -210,6 +219,7 @@ impl Theme {
                 muted: Rgb(92, 99, 112),
                 hand_left: Rgb(0xc6, 0x78, 0xdd),
                 hand_right: Rgb(0xe5, 0xc0, 0x7b),
+                hand_two: Rgb(0x56, 0xb6, 0xc2),
             },
         }
     }

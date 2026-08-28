@@ -4,15 +4,19 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::scheme::CodeHint;
 
-/// 简码/并击码的手区归属，用于提示区配色（左手粉、右手黄）。
+/// 简码/并击码的手区归属，用于提示区配色（左手粉、右手黄、双手并击青）。
 ///
-/// 由编码的前导手区修饰符推断：`_` 左手、`+` 右手、`-` 其它；无前缀（双手并击或普通码）为 `None`。
+/// 由编码的前导手区修饰符推断：`_` 左手、`+` 右手、`-` 其它；无前缀（双手并击或普通码）为
+/// `TwoHand`；`None` 仅用于已打/缺失提示（留空占位，不显色）。
 /// 该枚举不依赖 ratatui，颜色映射由渲染层（`dazitui`）据此施加。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HintHand {
     Left,
     Right,
     Other,
+    /// 无前缀的双手并击/普通全码（原 muted 灰，现单独配色）。
+    TwoHand,
+    /// 已全对上屏或缺失提示的留空占位（不显色）。
     None,
 }
 
@@ -22,7 +26,7 @@ pub struct HintCell {
     pub hand: HintHand,
 }
 
-/// 由编码推断其手区归属（用于提示区左右手配色）。
+/// 由编码推断其手区归属（用于提示区左右手/双手并击配色）。
 pub fn hand_of_code(code: &str) -> HintHand {
     if code.starts_with('_') {
         HintHand::Left
@@ -31,7 +35,7 @@ pub fn hand_of_code(code: &str) -> HintHand {
     } else if code.starts_with('-') {
         HintHand::Other
     } else {
-        HintHand::None
+        HintHand::TwoHand
     }
 }
 
@@ -294,11 +298,11 @@ mod tests {
         let cells2 = layout_code_hint_line(&words, &hints2, &[]);
         assert_eq!(cells_text(&cells2), "e ");
         assert_eq!(cells2[0].hand, HintHand::Right);
-        // 无前缀并击码 wCs 不受影响（超宽截断为 2 列），手区 None。
+        // 无前缀并击码 wCs 不受影响（超宽截断为 2 列），手区 TwoHand（单独配色）。
         let hints3 = vec![hint("wCs")];
         let cells3 = layout_code_hint_line(&words, &hints3, &[]);
         assert_eq!(cells_text(&cells3), "wC");
-        assert_eq!(cells3[0].hand, HintHand::None);
+        assert_eq!(cells3[0].hand, HintHand::TwoHand);
     }
 
     #[test]
@@ -423,6 +427,6 @@ mod tests {
         let cells = &rows[0].0;
         assert_eq!(cells[0].hand, HintHand::Left); // 是 → _w 左手
         assert_eq!(cells[1].hand, HintHand::Right); // 有 → +e 右手
-        assert_eq!(cells[2].hand, HintHand::None); // 中 → wCs 双手并击无前缀
+        assert_eq!(cells[2].hand, HintHand::TwoHand); // 中 → wCs 双手并击无前缀 → TwoHand 单独配色
     }
 }
