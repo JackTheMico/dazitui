@@ -622,7 +622,7 @@ dependencies = [
  "ratatui",
  "ratatui-image",
  "ratatui-themes",
- "unicode-width",
+ "unicode-width 0.2.2",
 ]
 
 [[package]]
@@ -638,6 +638,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "unicode-width 0.1.14",
  "ureq",
 ]
 
@@ -2326,7 +2327,7 @@ dependencies = [
  "thiserror 2.0.20",
  "unicode-segmentation",
  "unicode-truncate",
- "unicode-width",
+ "unicode-width 0.2.2",
 ]
 
 [[package]]
@@ -2416,7 +2417,7 @@ dependencies = [
  "strum",
  "time",
  "unicode-segmentation",
- "unicode-width",
+ "unicode-width 0.2.2",
 ]
 
 [[package]]
@@ -3134,8 +3135,14 @@ checksum = "16b380a1238663e5f8a691f9039c73e1cdae598a30e9855f541d29b08b53e9a5"
 dependencies = [
  "itertools",
  "unicode-segmentation",
- "unicode-width",
+ "unicode-width 0.2.2",
 ]
+
+[[package]]
+name = "unicode-width"
+version = "0.1.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7dd6e30e90baa6f72411720665d41d89b9a3d039dc45b8faea1ddd07f617f6af"
 
 [[package]]
 name = "unicode-width"

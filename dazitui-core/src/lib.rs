@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::time::Duration;
 
+mod code_hint;
 mod db;
 mod lttb;
 mod scheme;
@@ -16,7 +17,8 @@ pub use db::{
     MistypedCharStat, MistypedWordStat, SessionRecord, StatsDb,
 };
 pub use lttb::lttb_downsample;
-pub use scheme::{ChordAlgebra, RimeSchemaResolver, SchemeDict, YamlValue, parse_rime_yaml};
+pub use code_hint::layout_code_hint_line;
+pub use scheme::{ChordAlgebra, CodeHint, RimeSchemaResolver, SchemeDict, YamlValue, parse_rime_yaml};
 pub use segmenter::{WordIndex, WordToken, prewarm_segmenter};
 pub use session::{CharStatus, ErrorPoint, ErrorType, GROUP_SIZE, Session, Stats, TypeResult};
 pub use settings::{

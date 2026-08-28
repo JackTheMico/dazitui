@@ -11,11 +11,11 @@ use ratatui_image::protocol::StatefulProtocol;
 use ratatui_image::StatefulImage;
 use dazitui_core::{
     ApiClient, ApiError, AuthSession, BuiltinProgress, BuiltinSet, BUILTIN_SETS, CharStatus,
-    CompetitionType, DbTask, DbWorker,
+    CodeHint, CompetitionType, DbTask, DbWorker,
     ErrorRecordItem, ErrorType, HeatmapLayout, KeyboardMode, KeypressRecordItem, LoadError,
     LoadOptions, Rgb, SchemeDict, Session, SessionRecord, Settings, SettingsStore, Stats, StatsDb,
-    Text, TextSource, Theme, TokenStore, env_credentials, format_stats_share_text, format_time,
-    key_accuracy_pct, word_ratio_pct,
+    Text, TextSource, Theme, TokenStore, layout_code_hint_line, env_credentials,
+    format_stats_share_text, format_time, key_accuracy_pct, word_ratio_pct,
     is_auth_failure, load_builtin_text, load_builtin_text_shuffled, load_text_from_clipboard,
     load_text_from_file, load_text_from_string, lttb_downsample, osc52_clipboard,
     prewarm_segmenter, save_text_to_file,
@@ -3159,16 +3159,20 @@ fn ui(frame: &mut Frame, app: &App) {
             0
         };
 
+        let mut ref_text = original_line(&app.session, &app.text, app.theme(), app.settings.bold);
+        // 遍码提示（编码提示）：开启且已配置方案时，在内置词组赛文正文行之上插入提示行。
+        if app.settings.code_hint {
+            if let Some(hint_line) =
+                code_hint_overlay_line(&app.session, &app.text, app.scheme_dict.as_ref(), app.theme())
+            {
+                ref_text.lines.insert(0, hint_line);
+            }
+        }
         frame.render_widget(
-            Paragraph::new(original_line(
-                &app.session,
-                &app.text,
-                app.theme(),
-                app.settings.bold,
-            ))
-            .block(ref_block)
-            .wrap(Wrap { trim: false })
-            .scroll((ref_scroll_y, 0)),
+            Paragraph::new(ref_text)
+                .block(ref_block)
+                .wrap(Wrap { trim: false })
+                .scroll((ref_scroll_y, 0)),
             ref_area,
         );
 
@@ -6179,6 +6183,44 @@ fn build_word_spans(
     spans
 }
 
+/// 内置词组赛文开启遍码提示时，根据当前页词条与已载入方案反查，生成「提示行」。
+///
+/// 仅对内置词组赛文生效；未开启、非词组赛文或未配置方案时返回 `None`。
+/// 提示行与正文行（同样以单空格分词、按词可视列宽对齐）逐词对齐。
+fn code_hint_overlay_line(
+    session: &Session,
+    text: &Text,
+    scheme_dict: Option<&SchemeDict>,
+    theme: Theme,
+) -> Option<Line<'static>> {
+    let set = match text.source {
+        TextSource::Builtin { set } => set,
+        _ => return None,
+    };
+    if !set.is_words() {
+        return None;
+    }
+    let dict = scheme_dict?;
+    let boundaries: Vec<(usize, usize)> = match &text.word_boundaries {
+        Some(b) if !b.is_empty() => b.clone(),
+        _ => set.word_boundaries(),
+    };
+    let page_start = builtin_page_start(session);
+    let page_end = (page_start + session.group_size()).min(boundaries.len());
+    if page_start >= boundaries.len() {
+        return None;
+    }
+    let statuses = session.original_status();
+    let mut words: Vec<String> = Vec::new();
+    for &(ws, we) in boundaries[page_start..page_end].iter() {
+        let word: String = statuses[ws..we].iter().map(|(c, _)| *c).collect();
+        words.push(word);
+    }
+    let hints: Vec<CodeHint> = dict.build_code_hints(&words);
+    let hint_str = layout_code_hint_line(&words, &hints);
+    Some(Line::from(hint_str).fg(color(theme.muted)))
+}
+
 /// 跟打区：将当前页指定数量词的已打字符按对/错着色，词间插入空格 span。
 fn build_word_type_spans(
     display: &[(char, CharStatus)],
@@ -7154,9 +7196,9 @@ mod tests {
 
     #[test]
     fn move_focus_wraps_around() {
-        // SETTINGS_FOCUS_COUNT = 7（主题/占比/粗体/实时键盘/反查方案/上传名称/分组大小）
-        assert_eq!(move_focus(0, -1), 6); // 第 0 项向前 → 末项（6）
-        assert_eq!(move_focus(6, 1), 0); // 末项向后 → 第 0 项
+        // SETTINGS_FOCUS_COUNT = 8（主题/占比/粗体/实时键盘/反查方案/上传名称/分组大小/遍码提示）
+        assert_eq!(move_focus(0, -1), 7); // 第 0 项向前 → 末项（7）
+        assert_eq!(move_focus(7, 1), 0); // 末项向后 → 第 0 项
         assert_eq!(move_focus(0, 1), 1);
         assert_eq!(move_focus(5, 1), 6);
         assert_eq!(move_focus(2, -1), 1);
@@ -7897,6 +7939,42 @@ mod tests {
         assert!(
             !non_placeholder.is_empty(),
             "打 5 个词后跟打区不应空白，应显示已打字符"
+        );
+    }
+
+    #[test]
+    fn code_hint_overlay_shows_hint_above_word_for_builtin_word_set() {
+        // T03：内置词组赛文开启遍码提示且方案已载入时，提示行应出现在正文行之上且含首词编码。
+        let theme = Theme::preset(ThemePreset::CatppuccinMocha);
+        let set = BUILTIN_SETS[3]; // 常用词组前五百
+        let text = load_builtin_text(set);
+        let boundaries = set.word_boundaries();
+        let session =
+            Session::new_gated_with_words_and_size(&text.content, true, &boundaries, 10);
+        // yoyo-pure 风格字典夹具：首词「中国」→ lgy
+        let tsv = "中国\tlgy\n中\tk\n国\tlgyi\n人民\twvww\n人\tw\n民\tnay\n";
+        let dict = SchemeDict::parse(tsv);
+        let line = code_hint_overlay_line(&session, &text, Some(&dict), theme);
+        let line = line.expect("应生成提示行");
+        let rendered: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            rendered.contains("lgy"),
+            "提示行应含首词「中国」的编码 lgy，得到: {rendered:?}"
+        );
+        // 提示行为单行（与正文行逐词对齐，不自动折行）
+        assert_eq!(line.spans.len(), 1, "提示行应为单行");
+
+        // 未配置方案时不生成提示行
+        assert!(
+            code_hint_overlay_line(&session, &text, None, theme).is_none(),
+            "未配置方案时不应生成提示行"
+        );
+        // 非词组（单字）赛文不生成提示行
+        let char_text = load_builtin_text(BUILTIN_SETS[0]);
+        let char_session = Session::new_gated(char_text.content.as_str(), true);
+        assert!(
+            code_hint_overlay_line(&char_session, &char_text, Some(&dict), theme).is_none(),
+            "单字赛文不应生成提示行"
         );
     }
 
