@@ -5,8 +5,7 @@
 //! 将汉字编码精准逆向还原为物理按键列表（例如麓鸣并击、空明码并击、虎码、五笔、小鹤音形等）。
 
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
-use std::io::{self, BufRead, BufReader};
+use std::io;
 use std::path::{Path, PathBuf};
 
 /// 方案反查与码表映射管理器。
@@ -498,6 +497,7 @@ impl SchemeDict {
     ///
     /// 规则（与 ADR 0008 决策一致）：
     /// - 整词已登录：取击数最小编码；若其击数 ≤ 逐字击数之和则取整词码，否则逐字拼接；
+    ///   逐字分解采用各字「无手区前缀的双手形式」，避免单手简码拼进词组产生不可键入的混合码；
     /// - 整词未登录但各字均登录：逐字拼接各字最优编码；
     /// - 任意字未登录（含整词未登录且含未登录字）：提示留空并标记 `is_oov`。
     ///
@@ -512,9 +512,11 @@ impl SchemeDict {
     /// 计算单个词组单位的最优编码提示。
     fn build_hint_for_word(&self, word: &str) -> CodeHint {
         let word_best = self.best_code(word);
+        // 逐字分解使用各字「词组语境」的最优编码（无手区前缀的双手形式），
+        // 避免把单字独立输入用的单手简码拼进词组产生不可直接键入的混合码。
         let char_parts: Vec<Option<(String, u32)>> = word
             .chars()
-            .map(|c| self.best_code(&c.to_string()))
+            .map(|c| self.best_composition_code(&c.to_string()))
             .collect();
         let any_oov = char_parts.iter().any(|p| p.is_none());
 
@@ -593,6 +595,24 @@ impl SchemeDict {
         } else {
             code
         }
+    }
+
+    /// 取某字在「多字词组逐字拼接」语境下的最优编码：优先无手区前缀的形式
+    /// （双手并击/双拼全码），因为词组输入时各字以双手形式并击；单手简码（`_/+` 前缀）
+    /// 仅适用于单字独立输入，若拼进词组会产生不可直接键入的混合码（如 方 的 `+<` 剥前缀后丢 `f`）。
+    /// 若某字仅提供带前缀的简码（无无前缀形式），则退回其最优简码。未登录返回 `None`。
+    fn best_composition_code(&self, ch: &str) -> Option<(String, u32)> {
+        let codes = self.word_to_codes.get(ch)?;
+        let unprefixed: Vec<&String> = codes.iter().filter(|c| !Self::has_hand_prefix(c)).collect();
+        let pool: &[&String] = if unprefixed.is_empty() {
+            &codes.iter().collect::<Vec<_>>()
+        } else {
+            &unprefixed
+        };
+        let best = pool
+            .iter()
+            .min_by_key(|c| (Self::calculate_code_strokes(c), c.len()))?;
+        Some(((*best).clone(), Self::calculate_code_strokes(best)))
     }
 
     /// 取某词条「优先简码（击数最少）、其次并击/全码」的编码及其击数；未登录返回 `None`。
@@ -1653,6 +1673,27 @@ algebra:
         assert_eq!(get("就").code, "+s", "应优先单手简码 +s 而非并击 sE:");
         // 词语 4 码（无更短简码）：直接显示
         assert_eq!(get("可以").code, "xkhr");
+    }
+
+    #[test]
+    fn build_code_hints_phrase_uses_double_hand_form_not_single_hand_jianma() {
+        // yoyo-pure 中 方 同时含单手简码 `+<`(1 击) 与双手形式 `<f`(2 击)；
+        // 言 为双手码 `uy`。整词「方言」在词典中登录为 `<fuy`(4 击)。
+        // 逐字分解若误用单手简码 `+<` 会得到 `+<uy`，剥前缀后变 `<uy` 且丢 `f`。
+        // 正确行为：逐字分解应采用双手形式 `<f`，拼得 `<fuy`，与整词码一致。
+        let dict_str = "---\nname: yoyo-pure\n...\n\
+方言\t<fuy\t121039\n方\t+<\t2500808\n方\t<f\t0\n言\tuy\t481513\n";
+        let mut dict = SchemeDict::parse(dict_str);
+        dict.set_chord_algebra(ChordAlgebra::default());
+
+        let hints = dict.build_code_hints(&["方言".to_string(), "方".to_string(), "言".to_string()]);
+        let get = |w: &str| hints.iter().find(|h| h.word == w).expect("应有该词提示");
+
+        // 整词已登录：直接显示词典整词码 <fuy（而非退化混合码 <uy）
+        assert_eq!(get("方言").code, "<fuy", "方言应显示整词码 <fuy");
+        // 单字仍优先其单手简码（词组语境之外）
+        assert_eq!(get("方").code, "+<", "单字方应优先单手简码 +<");
+        assert_eq!(get("言").code, "uy");
     }
 
     #[test]
