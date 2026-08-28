@@ -628,6 +628,30 @@ impl Session {
         self.group_size
     }
 
+    /// 从指定已完成组数续打（用于跨会话保留进度）。
+    ///
+    /// 将内部已完成组计数直接置为 `completed`（裁剪到合法范围），并把 `input`
+    /// 预填为这 `completed` 组的正确原文，使会话状态与「用户已亲手打完这些组」一致：
+    /// `current_group_bounds()` / TUI 当前页起始落到第 `completed` 组，且已完成组的
+    /// 对照状态为全对，续打时从正确位置继续而非从篇首重打。
+    pub fn set_completed_groups(&mut self, completed: usize) {
+        let completed = completed.min(self.total_groups());
+        self.completed_groups = completed;
+        self.input.clear();
+        if completed == 0 {
+            return;
+        }
+        // 词组赛文：已完成范围 = 第 0 组到已完成组最后一个词的结束边界。
+        if let Some(&(_, last_end)) = self.group_bounds.get(completed - 1) {
+            let end = last_end.min(self.original.len());
+            self.input.extend_from_slice(&self.original[..end]);
+        } else {
+            // 单字赛文：每组 group_size 字。
+            let end = (completed * self.group_size).min(self.original.len());
+            self.input.extend_from_slice(&self.original[..end]);
+        }
+    }
+
     /// 总组数。
     pub fn total_groups(&self) -> usize {
         if !self.group_bounds.is_empty() {
@@ -1156,6 +1180,21 @@ mod tests {
         assert!(!session.is_complete());
 
         // 输入最后 2 字
+        session.type_text("一二");
+        assert_eq!(session.completed_groups(), 3);
+        assert!(session.is_complete());
+    }
+
+    #[test]
+    fn resume_at_seeds_completed_groups() {
+        // 12 字赛文，每组 5 字，共 3 组。
+        let mut session =
+            Session::new_gated_with_words_and_size("一二三四五六七八九十一二", true, &[], 5);
+        assert_eq!(session.total_groups(), 3);
+        // 从已完成 2 组的位置续打：completed_groups 被种到 2。
+        session.set_completed_groups(2);
+        assert_eq!(session.completed_groups(), 2);
+        // 当前组应是第 3 组（字符 10..12 = "一二"）。
         session.type_text("一二");
         assert_eq!(session.completed_groups(), 3);
         assert!(session.is_complete());

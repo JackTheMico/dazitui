@@ -20,8 +20,8 @@ pub use scheme::{ChordAlgebra, RimeSchemaResolver, SchemeDict, YamlValue, parse_
 pub use segmenter::{WordIndex, WordToken, prewarm_segmenter};
 pub use session::{CharStatus, ErrorPoint, ErrorType, GROUP_SIZE, Session, Stats, TypeResult};
 pub use settings::{
-    FONT_SIZE_PT, HeatmapLayout, KeyboardMode, Rgb, Settings, SettingsStore, Theme, ThemePreset,
-    osc_font_size_sequence,
+    BuiltinProgress, FONT_SIZE_PT, HeatmapLayout, KeyboardMode, Rgb, Settings, SettingsStore, Theme,
+    ThemePreset, osc_font_size_sequence,
 };
 
 #[cfg(feature = "online")]
@@ -121,7 +121,7 @@ impl TextSource {
 }
 
 /// 内置赛文集合（每套一个枚举变体）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BuiltinSet {
     /// 常用单字前五百。
     CommonCharsQian,
@@ -135,6 +135,8 @@ pub enum BuiltinSet {
     CommonWordsZhong,
     /// 常用词组后五百。
     CommonWordsHou,
+    /// yoyo 方案词典抽取的全部唯一单字（约 6640 字，即社区常说的「6636 单字无重」）。
+    YoyoChars,
 }
 
 impl BuiltinSet {
@@ -147,6 +149,7 @@ impl BuiltinSet {
             Self::CommonWordsQian => "常用词组前五百",
             Self::CommonWordsZhong => "常用词组中五百",
             Self::CommonWordsHou => "常用词组后五百",
+            Self::YoyoChars => "yoyo 单字",
         }
     }
 
@@ -167,6 +170,7 @@ impl BuiltinSet {
             Self::CommonWordsQian => include_str!("../data/common-words-qian.txt"),
             Self::CommonWordsZhong => include_str!("../data/common-words-zhong.txt"),
             Self::CommonWordsHou => include_str!("../data/common-words-hou.txt"),
+            Self::YoyoChars => include_str!("../data/yoyo-chars.txt"),
         }
     }
 
@@ -215,13 +219,14 @@ impl BuiltinSet {
 }
 
 /// 所有内置赛文，按功能栏展示顺序。
-pub const BUILTIN_SETS: [BuiltinSet; 6] = [
+pub const BUILTIN_SETS: [BuiltinSet; 7] = [
     BuiltinSet::CommonCharsQian,
     BuiltinSet::CommonCharsZhong,
     BuiltinSet::CommonCharsHou,
     BuiltinSet::CommonWordsQian,
     BuiltinSet::CommonWordsZhong,
     BuiltinSet::CommonWordsHou,
+    BuiltinSet::YoyoChars,
 ];
 
 /// 载入内置赛文：内容为纯字符串（已去除换行）。

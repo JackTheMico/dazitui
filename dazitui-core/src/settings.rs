@@ -316,6 +316,20 @@ impl HeatmapLayout {
     }
 }
 
+/// 内置赛文进度（跨会话保留）。
+///
+/// 以赛文名（`BuiltinSet::name()`）为 key 存入 `Settings.builtin_progress`。
+/// `completed_groups` 为已全对完成的组数；`group_size` 记录该赛文练习时使用的分组大小，
+/// 用以在下次打开时还原「每赛文单独记」的分组大小。整本是否打完由 `completed_groups` 与
+/// 实际总组数比较得出，无需额外字段。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BuiltinProgress {
+    /// 已全对完成的组数（续打起点）。
+    pub completed_groups: u32,
+    /// 该赛文练习时使用的分组大小（字/词数）。
+    pub group_size: u8,
+}
+
 /// 应用外观设置。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
@@ -338,6 +352,8 @@ pub struct Settings {
     pub heatmap_layout: HeatmapLayout,
     /// 内置赛文每组大小（单字赛文字数 / 词组赛文词数）。
     pub group_size: u8,
+    /// 各内置赛文的练习进度（跨会话保留），key 为赛文名。
+    pub builtin_progress: HashMap<String, BuiltinProgress>,
 }
 
 impl Settings {
@@ -395,6 +411,7 @@ impl Default for Settings {
             scheme_dict_paths: HashMap::new(),
             heatmap_layout: HeatmapLayout::Staggered,
             group_size: Self::DEFAULT_GROUP_SIZE,
+            builtin_progress: HashMap::new(),
         }
     }
 }
@@ -455,6 +472,12 @@ impl SettingsStore {
         for (scheme, path) in &settings.scheme_dict_paths {
             content.push_str(&format!("scheme_dict.{}={}\n", scheme, path));
         }
+        for (name, p) in &settings.builtin_progress {
+            content.push_str(&format!(
+                "builtin_progress.{}={},{}\n",
+                name, p.completed_groups, p.group_size
+            ));
+        }
         std::fs::write(&self.path, content)
     }
 
@@ -468,6 +491,23 @@ impl SettingsStore {
         for line in raw.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            // 内置赛文进度：`builtin_progress.<赛文名>=<已完成组数>,<分组大小>`
+            if let Some(rest) = line.strip_prefix("builtin_progress.") {
+                if let Some((name, val)) = rest.split_once('=') {
+                    if let Some((cg, gs)) = val.split_once(',') {
+                        if let (Ok(cg), Ok(gs)) = (cg.trim().parse::<u32>(), gs.trim().parse::<u8>()) {
+                            settings.builtin_progress.insert(
+                                name.trim().to_string(),
+                                BuiltinProgress {
+                                    completed_groups: cg,
+                                    group_size: gs,
+                                },
+                            );
+                        }
+                    }
+                }
                 continue;
             }
             let Some((key, value)) = line.split_once('=') else {
@@ -684,6 +724,7 @@ mod tests {
             group_size: 10,
             scheme_dict_paths,
             heatmap_layout: HeatmapLayout::Ortholinear,
+            builtin_progress: HashMap::new(),
         };
         store.save(&s).unwrap();
         assert_eq!(store.load(), s);
@@ -932,6 +973,31 @@ mod tests {
         // 缺省时回退到默认值 10
         std::fs::write(store.path(), "theme=default\n").unwrap();
         assert_eq!(store.load().group_size, 10);
+        let _ = std::fs::remove_file(store.path());
+    }
+
+    #[test]
+    fn builtin_progress_roundtrip() {
+        let store = SettingsStore::new(temp_path("builtin_progress_roundtrip"));
+        let mut s = Settings::default();
+        s.builtin_progress.insert(
+            "yoyo 单字".to_string(),
+            BuiltinProgress {
+                completed_groups: 37,
+                group_size: 20,
+            },
+        );
+        store.save(&s).unwrap();
+        let loaded = store.load();
+        let p = loaded.builtin_progress.get("yoyo 单字").expect("进度应被持久化");
+        assert_eq!(p.completed_groups, 37);
+        assert_eq!(p.group_size, 20);
+
+        // 清除后回退为空
+        let mut s2 = loaded;
+        s2.builtin_progress.remove("yoyo 单字");
+        store.save(&s2).unwrap();
+        assert!(store.load().builtin_progress.is_empty());
         let _ = std::fs::remove_file(store.path());
     }
 }

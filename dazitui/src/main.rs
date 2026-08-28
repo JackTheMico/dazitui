@@ -10,7 +10,8 @@ use ratatui_image::picker::Picker;
 use ratatui_image::protocol::StatefulProtocol;
 use ratatui_image::StatefulImage;
 use dazitui_core::{
-    ApiClient, ApiError, AuthSession, BUILTIN_SETS, CharStatus, CompetitionType, DbTask, DbWorker,
+    ApiClient, ApiError, AuthSession, BuiltinProgress, BuiltinSet, BUILTIN_SETS, CharStatus,
+    CompetitionType, DbTask, DbWorker,
     ErrorRecordItem, ErrorType, HeatmapLayout, KeyboardMode, KeypressRecordItem, LoadError,
     LoadOptions, Rgb, SchemeDict, Session, SessionRecord, Settings, SettingsStore, Stats, StatsDb,
     Text, TextSource, Theme, TokenStore, env_credentials, format_stats_share_text, format_time,
@@ -653,6 +654,10 @@ struct App {
     /// 乱序开时存乱序版预览（避免每帧重新随机导致闪烁），关时存顺序版预览。
     /// 在 `open_builtin_browser` 与 Up/Down/s 按键时重新生成。
     builtin_preview: Option<(String, String)>,
+    /// 内置赛文续打弹窗：`Some((赛文, 已存已完成组数, 总组数))` 时显示「继续/重开/重置」选择。
+    resume_prompt: Option<(BuiltinSet, usize, usize)>,
+    /// 上次已落盘存档的已完成组数（跟打中用于增量保存，避免每键写盘）。
+    last_saved_completed: usize,
     /// 自定义设置文本弹窗（`None` = 未打开）。
     text_setting_modal: Option<TextSettingModal>,
     /// 自由发文编辑弹窗（`None` = 未打开）。
@@ -833,6 +838,8 @@ impl App {
             settings_focus: FOCUS_THEME,
             builtin_shuffle: false,
             builtin_preview: None,
+            resume_prompt: None,
+            last_saved_completed: 0,
             text_setting_modal: None,
             free_input_modal: None,
             live_keyboard: LiveKeyboard::new(),
@@ -1064,6 +1071,7 @@ impl App {
         );
         self.start = Instant::now();
         self.accumulated_elapsed = Duration::ZERO;
+        self.last_saved_completed = 0;
         self.active_start = None;
         self.paused = false;
         self.live_keyboard.clear();
@@ -1154,6 +1162,10 @@ impl App {
         }
 
         let is_online = self.text.is_online();
+        // 内置赛文整本打完：把进度记为「全部完成」并落盘，供下次打开时提示重置。
+        if self.text.source.is_builtin() {
+            self.save_builtin_progress(self.session.total_groups());
+        }
         if is_online {
             self.state = AppState::Finished {
                 stats: stats.clone(),
@@ -1265,11 +1277,30 @@ impl App {
         }
     }
 
-    /// 载入当前选中的内置赛文，进入新跟打。
+    /// 载入当前选中的内置赛文：若已有存档进度则弹出「继续/重开/重置」选择，
+    /// 否则直接进入第 0 组跟打。
     fn load_selected_builtin(&mut self) {
         let Some(set) = BUILTIN_SETS.get(self.builtin_selection).copied() else {
             return;
         };
+        if let Some(p) = self.builtin_progress_for(set) {
+            if p.completed_groups > 0 {
+                let total = self.builtin_total_groups(set, p.group_size as usize);
+                self.resume_prompt = Some((set, p.completed_groups as usize, total));
+                return;
+            }
+        }
+        self.start_builtin_set(set, 0);
+    }
+
+    /// 从指定已完成组数开始某个内置赛文跟打。
+    ///
+    /// 若该赛文有存档，还原其「每赛文单独记」的分组大小；清空计时与暂停态，
+    /// 并用 `set_completed_groups` 把会话跳到对应组。
+    fn start_builtin_set(&mut self, set: BuiltinSet, completed_groups: usize) {
+        if let Some(p) = self.builtin_progress_for(set) {
+            self.settings.group_size = p.group_size;
+        }
         self.text = if self.builtin_shuffle {
             load_builtin_text_shuffled(set)
         } else {
@@ -1282,8 +1313,62 @@ impl App {
             &wb,
             self.settings.group_size as usize,
         );
+        self.session.set_completed_groups(completed_groups);
         self.start = Instant::now();
+        self.accumulated_elapsed = Duration::ZERO;
+        self.active_start = None;
+        self.paused = false;
+        self.live_keyboard.clear();
+        self.last_saved_completed = completed_groups;
         self.state = AppState::Typing;
+    }
+
+    /// 读取某内置赛文的已存进度。
+    fn builtin_progress_for(&self, set: BuiltinSet) -> Option<BuiltinProgress> {
+        self.settings.builtin_progress.get(set.name()).copied()
+    }
+
+    /// 计算某内置赛文在指定分组大小下的总组数（用于续打弹窗与进度展示）。
+    fn builtin_total_groups(&self, set: BuiltinSet, group_size: usize) -> usize {
+        let text = if self.builtin_shuffle {
+            load_builtin_text_shuffled(set)
+        } else {
+            load_builtin_text(set)
+        };
+        let wb = text.session_word_boundaries();
+        Session::new_gated_with_words_and_size(&text.content, true, &wb, group_size.max(1)).total_groups()
+    }
+
+    /// 保存当前内置赛文的进度（已完成组数 + 分组大小）。
+    fn save_builtin_progress(&mut self, completed_groups: usize) {
+        if let TextSource::Builtin { set } = self.text.source {
+            let entry = BuiltinProgress {
+                completed_groups: completed_groups as u32,
+                group_size: self.settings.group_size,
+            };
+            self.settings
+                .builtin_progress
+                .insert(set.name().to_string(), entry);
+            let _ = self.settings_store.save(&self.settings);
+        }
+    }
+
+    /// 清除某内置赛文的存档进度。
+    fn clear_builtin_progress(&mut self, set: BuiltinSet) {
+        self.settings.builtin_progress.remove(set.name());
+        let _ = self.settings_store.save(&self.settings);
+    }
+
+    /// 跟打中增量落盘：仅当已完成组数比上次存档更多时才写设置文件。
+    fn persist_builtin_progress_if_changed(&mut self) {
+        if !self.text.source.is_builtin() {
+            return;
+        }
+        let cg = self.session.completed_groups();
+        if cg > self.last_saved_completed {
+            self.save_builtin_progress(cg);
+            self.last_saved_completed = cg;
+        }
     }
 
     /// 按比赛类型下载在线赛文并进入跟打。
@@ -1598,6 +1683,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                                 if app.session.is_complete() {
                                     finish_and_maybe_upload(&mut app, terminal)?;
                                 }
+                                app.persist_builtin_progress_if_changed();
                                 continue;
                             }
                             if let KeyCode::Char(c) = key.code {
@@ -1616,6 +1702,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                                 if app.session.is_complete() {
                                     finish_and_maybe_upload(&mut app, terminal)?;
                                 }
+                                app.persist_builtin_progress_if_changed();
                                 continue;
                             }
                             continue;
@@ -1768,6 +1855,37 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                         }
                     }
                     AppState::BrowsingBuiltin => {
+                        // 续打弹窗优先：拦截所有按键，处理「继续/重开/重置」选择。
+                        if let Some((set, saved, total)) = app.resume_prompt {
+                            match key.code {
+                                KeyCode::Char('c')
+                                | KeyCode::Char('C')
+                                | KeyCode::Enter
+                                | KeyCode::Char('l') => {
+                                    // 已打完则从头开始新一轮；否则续到存档组。
+                                    let completed = if saved >= total { 0 } else { saved };
+                                    app.resume_prompt = None;
+                                    app.start_builtin_set(set, completed);
+                                }
+                                KeyCode::Char('r') | KeyCode::Char('R') => {
+                                    app.resume_prompt = None;
+                                    app.start_builtin_set(set, 0);
+                                }
+                                KeyCode::Char('x')
+                                | KeyCode::Char('d')
+                                | KeyCode::Char('X')
+                                | KeyCode::Char('D') => {
+                                    app.clear_builtin_progress(set);
+                                    app.resume_prompt = None;
+                                    app.start_builtin_set(set, 0);
+                                }
+                                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('h') => {
+                                    app.resume_prompt = None;
+                                }
+                                _ => {}
+                            }
+                            continue;
+                        }
                         if is_open_settings(key) {
                             app.state = AppState::Settings;
                             continue;
@@ -3519,13 +3637,51 @@ fn render_sidebar(
             } else {
                 "   "
             };
-            let mut line = Line::from(format!("{prefix}{}", set.name()));
+            let mut label = set.name().to_string();
+            // 已存进度则在名称后追加「已完成 X/Y 组」
+            if let Some(p) = app.builtin_progress_for(*set) {
+                if p.completed_groups > 0 {
+                    let total = app.builtin_total_groups(*set, p.group_size as usize);
+                    label.push_str(&format!(" · 已完成 {}/{} 组", p.completed_groups, total));
+                }
+            }
+            let mut line = Line::from(format!("{prefix}{label}"));
             if i == app.builtin_selection {
                 line = line.fg(palette.accent).bold();
             } else {
                 line = line.fg(palette.fg);
             }
             lines.push(line);
+        }
+        // 续打弹窗覆盖层
+        if let Some((set, saved, total)) = &app.resume_prompt {
+            lines.push(Line::from(""));
+            if *saved >= *total {
+                lines.push(
+                    Line::from(format!("「{}」已全部完成 {} 组", set.name(), total))
+                        .fg(palette.warning)
+                        .bold(),
+                );
+                lines.push(
+                    Line::from("   [r] 重新开始   [x] 重置进度   [Esc] 返回")
+                        .fg(palette.muted),
+                );
+            } else {
+                lines.push(
+                    Line::from(format!(
+                        "「{}」已有进度：第 {}/{} 组",
+                        set.name(),
+                        saved,
+                        total
+                    ))
+                    .fg(palette.warning)
+                    .bold(),
+                );
+                lines.push(
+                    Line::from("   [c] 继续   [r] 重新开始   [x] 重置进度   [Esc] 返回")
+                        .fg(palette.muted),
+                );
+            }
         }
     } else {
         if app.paused {
@@ -6461,13 +6617,14 @@ mod tests {
 
     #[test]
     fn builtin_sets_in_order() {
-        assert_eq!(BUILTIN_SETS.len(), 6);
+        assert_eq!(BUILTIN_SETS.len(), 7);
         assert_eq!(BUILTIN_SETS[0].name(), "常用单字前五百");
         assert_eq!(BUILTIN_SETS[1].name(), "常用单字中五百");
         assert_eq!(BUILTIN_SETS[2].name(), "常用单字后五百");
         assert_eq!(BUILTIN_SETS[3].name(), "常用词组前五百");
         assert_eq!(BUILTIN_SETS[4].name(), "常用词组中五百");
         assert_eq!(BUILTIN_SETS[5].name(), "常用词组后五百");
+        assert_eq!(BUILTIN_SETS[6].name(), "yoyo 单字");
     }
 
     #[test]
@@ -6481,6 +6638,69 @@ mod tests {
                 set.name()
             );
         }
+    }
+
+    #[test]
+    fn yoyo_chars_set_is_large_and_deduped() {
+        let set = BUILTIN_SETS[6];
+        assert_eq!(set.name(), "yoyo 单字");
+        let text = load_builtin_text(set);
+        let chars: Vec<char> = text.content.chars().collect();
+        assert!(
+            chars.len() > 6000,
+            "yoyo 单字应约 6640 字，实际 {}",
+            chars.len()
+        );
+        // 内容应无重复单字（即社区常说的「6636 单字无重」）。
+        let mut sorted = chars.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), chars.len(), "yoyo 单字应无重复");
+    }
+
+    #[test]
+    fn builtin_progress_persists_and_resume_prompt_appears() {
+        let set = BUILTIN_SETS[6]; // yoyo 单字
+        let text = load_builtin_text(set);
+        let mut app = test_app(text);
+
+        // 首次直接进入第 0 组跟打
+        app.start_builtin_set(set, 0);
+        assert!(matches!(app.state, AppState::Typing));
+
+        // 打完前两组（每组 group_size 字），进度应增量落盘
+        let gs = app.settings.group_size as usize;
+        let chars: Vec<char> = app.text.content.chars().collect();
+        let g1: String = chars[..gs].iter().collect();
+        let g2: String = chars[gs..2 * gs].iter().collect();
+        app.session.type_text(&g1);
+        assert_eq!(app.session.completed_groups(), 1);
+        app.session.type_text(&g2);
+        assert_eq!(app.session.completed_groups(), 2);
+        app.persist_builtin_progress_if_changed();
+
+        // 存档中应记录已完成 2 组
+        let prog = app.builtin_progress_for(set).expect("应已存档进度");
+        assert_eq!(prog.completed_groups, 2);
+
+        // 再次打开该内置赛文：应弹出续打选择而非直接开打
+        app.resume_prompt = None;
+        app.builtin_selection = 6;
+        app.load_selected_builtin();
+        assert!(
+            app.resume_prompt.is_some(),
+            "有存档进度时应弹出续打选择"
+        );
+
+        // 选「继续」等价于从已完成组数续打：会话应被种到对应组
+        app.start_builtin_set(set, prog.completed_groups as usize);
+        assert_eq!(app.session.completed_groups(), 2);
+
+        // 整本打完应记为全部完成（completed_groups == total）
+        app.session.set_completed_groups(app.session.total_groups());
+        app.save_builtin_progress(app.session.total_groups());
+        let done = app.builtin_progress_for(set).unwrap();
+        assert_eq!(done.completed_groups as usize, app.session.total_groups());
     }
 
     #[test]
