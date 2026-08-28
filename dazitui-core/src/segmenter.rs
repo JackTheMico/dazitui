@@ -125,6 +125,28 @@ impl WordIndex {
     pub fn find_word_containing_char(&self, ch: char) -> Option<&str> {
         self.char_lookup.get(&ch).map(|s| s.as_str())
     }
+
+    /// 返回全篇分词边界 `[(start, end), ...]`（字符下标，左闭右开），用于双行词格锁步折行。
+    ///
+    /// 多字词汇（`char_to_token` 命中）作为一个整体词单元；未命中分词器的孤立单字各自成词，
+    /// 保证长文（含 ASCII/标点）也能逐词打包，提示行与正文行折行点完全一致。
+    pub fn word_boundaries(&self) -> Vec<(usize, usize)> {
+        let n = self.char_to_token.len();
+        let mut boundaries = Vec::new();
+        let mut i = 0;
+        while i < n {
+            if let Some(tok) = &self.char_to_token[i] {
+                let start = tok.start_char_idx;
+                let end = tok.end_char_idx.max(start + 1).min(n);
+                boundaries.push((start, end));
+                i = end;
+            } else {
+                boundaries.push((i, i + 1));
+                i += 1;
+            }
+        }
+        boundaries
+    }
 }
 
 #[cfg(test)]
@@ -169,5 +191,30 @@ mod tests {
     #[test]
     fn test_prewarm_segmenter() {
         prewarm_segmenter();
+    }
+
+    #[test]
+    fn test_word_boundaries_covers_all_chars_contiguously() {
+        // 多字词作为一个整体单元；覆盖全部字符、相邻单元首尾相接、无空单元。
+        let text = "中国共产党领导人民不断创造历史伟业。";
+        let index = WordIndex::build(text, false);
+        let bounds = index.word_boundaries();
+        let total: usize = bounds.iter().map(|&(s, e)| e - s).sum();
+        assert_eq!(total, text.chars().count());
+        for w in bounds.windows(2) {
+            assert_eq!(w[0].1, w[1].0, "boundaries must be contiguous");
+        }
+        for &(s, e) in &bounds {
+            assert!(e > s, "empty boundary unit");
+        }
+    }
+
+    #[test]
+    fn test_word_boundaries_builtin_space_split() {
+        // 内置词组：原生空格分词，词单元为空格分隔的整词；空格本身作为孤立单字单元。
+        let text = "打字 练习 极速";
+        let index = WordIndex::build(text, true);
+        let bounds = index.word_boundaries();
+        assert_eq!(bounds, vec![(0, 2), (2, 3), (3, 5), (5, 6), (6, 8)]);
     }
 }

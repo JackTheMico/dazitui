@@ -17,7 +17,7 @@ pub use db::{
     MistypedCharStat, MistypedWordStat, SessionRecord, StatsDb,
 };
 pub use lttb::lttb_downsample;
-pub use code_hint::layout_code_hint_line;
+pub use code_hint::{layout_code_hint_grid, layout_code_hint_line, pack_words_by_width};
 pub use scheme::{ChordAlgebra, CodeHint, RimeSchemaResolver, SchemeDict, YamlValue, parse_rime_yaml};
 pub use segmenter::{WordIndex, WordToken, prewarm_segmenter};
 pub use session::{CharStatus, ErrorPoint, ErrorType, GROUP_SIZE, Session, Stats, TypeResult};
@@ -35,9 +35,7 @@ pub use online::client::{
 #[cfg(feature = "online")]
 pub use online::protocol::{ProtocolError, build_request, decrypt, encrypt, parse_json};
 #[cfg(feature = "online")]
-pub use online::share::{
-    UploadStats, build_upload_payload, format_share_text, osc52_clipboard, to_upload_stats,
-};
+pub use online::share::{UploadStats, build_upload_payload, osc52_clipboard, to_upload_stats};
 #[cfg(feature = "online")]
 pub use online::token::{AuthSession, TokenStore};
 
@@ -531,15 +529,18 @@ pub fn word_ratio_pct(text: &Text, stats: &Stats) -> f64 {
     (stats.phrase_chars as f64 / total_chars as f64 * 100.0).clamp(0.0, 100.0)
 }
 
-/// 把非在线跟打的统计结果格式化为单行分享文本（自由发文/离线赛文完成后复制到剪贴板）。
+/// 把跟打统计结果格式化为单行分享文本（复制到剪贴板）。
 ///
-/// 每个指标前加 emoji，并补充 回改 / 键数 / 键准 / 打词率；
+/// 离线赛文、自由发文、剪贴板发文、内置赛文与在线赛文（比赛）统一使用本函数，
+/// 保证各来源的复制结果口径一致：每个指标前加 emoji，并补充 回改 / 键数 / 键准 / 打词率；
+/// `rank` 为 `Some(n)` 时（在线比赛上传成功）在来源名后追加 ` 第n名`；
 /// 末尾保留输入法名并固定追加设备 `🖥️dazitui`。
 pub fn format_stats_share_text(
     text: &Text,
     stats: &Stats,
     elapsed: Duration,
     input_method: &str,
+    rank: Option<u32>,
 ) -> String {
     let source = match text.source {
         TextSource::File => "离线赛文",
@@ -548,6 +549,7 @@ pub fn format_stats_share_text(
         TextSource::Builtin { set } => set.name(),
         TextSource::Online { competition_type } => competition_type.name(),
     };
+    let rank_part = rank.map(|r| format!(" 第{r}名")).unwrap_or_default();
     let total_chars = text.content.chars().count();
     let strokes = if stats.total_strokes > 0 {
         stats.total_strokes
@@ -558,7 +560,7 @@ pub fn format_stats_share_text(
     let word_ratio = word_ratio_pct(text, stats);
     let device_suffix = format!("{}{}", input_method_suffix(input_method), " 🖥️dazitui");
     format!(
-        "{source}《{}》 · 🚀WPM {:.1} · ⌨️击键 {:.1} · 📏码长 {:.1} · ✅正确字数 {}/{} · ❌错字 {} · ↩️回改 {} · 🔢键数 {} · 🎯键准 {:.2}% · 💬打词率 {:.2}% · ⏱️用时 {}{}",
+        "{source}{rank_part}《{}》 · 🚀WPM {:.1} · ⌨️击键 {:.1} · 📏码长 {:.1} · ✅正确字数 {}/{} · ❌错字 {} · ↩️回改 {} · 🔢键数 {} · 🎯键准 {:.2}% · 💬打词率 {:.2}% · ⏱️用时 {}{}",
         text.title,
         stats.wpm,
         stats.kps,
@@ -1072,7 +1074,7 @@ mod tests {
             shuffled: false,
         };
         let stats = sample_stats();
-        let s = format_stats_share_text(&text, &stats, Duration::from_secs_f64(85.23), "虎码");
+        let s = format_stats_share_text(&text, &stats, Duration::from_secs_f64(85.23), "虎码", None);
         assert_eq!(
             s,
             "离线赛文《背影节选》 · 🚀WPM 85.2 · ⌨️击键 3.5 · 📏码长 2.8 · ✅正确字数 3/4 · ❌错字 1 · ↩️回改 0 · 🔢键数 140 · 🎯键准 100.00% · 💬打词率 0.00% · ⏱️用时 01:25.230 · 虎码 🖥️dazitui"
@@ -1089,10 +1091,34 @@ mod tests {
             shuffled: false,
         };
         let stats = sample_stats();
-        let s = format_stats_share_text(&text, &stats, Duration::from_secs(60), "");
+        let s = format_stats_share_text(&text, &stats, Duration::from_secs(60), "", None);
         assert_eq!(
             s,
             "自由发文《日常练习》 · 🚀WPM 85.2 · ⌨️击键 3.5 · 📏码长 2.8 · ✅正确字数 3/4 · ❌错字 1 · ↩️回改 0 · 🔢键数 140 · 🎯键准 100.00% · 💬打词率 0.00% · ⏱️用时 01:00.000 🖥️dazitui"
         );
+    }
+
+    #[test]
+    fn stats_share_text_online_with_rank_matches_offline_format() {
+        // 在线比赛上传成功：排名追加在来源名后，且指标口径与离线完全一致
+        // （含 🎯键准 / ↩️回改），不能像旧版那样只剩 WPM/击键/码长。
+        let text = Text {
+            title: "锦标赛第3279期".into(),
+            content: "你好世界".into(),
+            source: TextSource::Online {
+                competition_type: CompetitionType::Jinbiao,
+            },
+            word_boundaries: None,
+            shuffled: false,
+        };
+        let stats = sample_stats();
+        let s = format_stats_share_text(&text, &stats, Duration::from_secs(60), "虎码", Some(5));
+        assert_eq!(
+            s,
+            "锦标赛 第5名《锦标赛第3279期》 · 🚀WPM 85.2 · ⌨️击键 3.5 · 📏码长 2.8 · ✅正确字数 3/4 · ❌错字 1 · ↩️回改 0 · 🔢键数 140 · 🎯键准 100.00% · 💬打词率 0.00% · ⏱️用时 01:00.000 · 虎码 🖥️dazitui"
+        );
+        // 与离线格式一致的关键指标必须存在
+        assert!(s.contains("🎯键准"), "在线复制结果必须含键准");
+        assert!(s.contains("↩️回改"), "在线复制结果必须含回改");
     }
 }

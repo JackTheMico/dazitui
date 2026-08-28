@@ -70,6 +70,77 @@ pub fn layout_code_hint_line(words: &[String], hints: &[CodeHint], typed_mask: &
         .join(" ")
 }
 
+/// 贪心按词宽打包：返回若干「行」，每行包含若干词的索引，
+/// 使该行（词宽之和 + 词间单空格分隔）不超过 `max_width`。
+///
+/// 若单个词宽已超过 `max_width`，则独占一行（由上层按原宽溢出渲染），
+/// 保证永不分词错位、也不会产生空行或无限循环。
+pub fn pack_words_by_width(word_widths: &[usize], max_width: usize) -> Vec<Vec<usize>> {
+    let mut rows: Vec<Vec<usize>> = Vec::new();
+    let mut cur: Vec<usize> = Vec::new();
+    let mut cur_w = 0usize;
+    for (i, &w) in word_widths.iter().enumerate() {
+        let sep = if cur_w == 0 { 0 } else { 1 };
+        if cur_w > 0 && cur_w + sep + w > max_width {
+            rows.push(std::mem::take(&mut cur));
+            cur_w = 0;
+        }
+        if cur_w > 0 {
+            cur_w += 1; // 词间分隔空格
+        }
+        cur.push(i);
+        cur_w += w;
+    }
+    if !cur.is_empty() {
+        rows.push(cur);
+    }
+    rows
+}
+
+/// 双行词格（长文）：将提示行与正文行按词边界锁步折行，返回逐行 `(提示行, 正文行)`。
+///
+/// 每词提示按对应词宽截断/居中，词间单空格分隔；正文行为对应词原文（同样单空格分隔）。
+/// 两者列结构完全一致，故每行提示与其下方正文逐词对齐、永不错位。
+/// `typed_mask[i]` 为真表示该词已全部正确上屏，其提示留空但仍占位。
+///
+/// 与 `layout_code_hint_line`（内置分页单页单行）不同，本函数面向非内置长文：
+/// 以 `WordIndex` 词边界为最小换行单元打包，使提示行与正文行折行点锁步。
+pub fn layout_code_hint_grid(
+    words: &[String],
+    hints: &[CodeHint],
+    typed_mask: &[bool],
+    max_width: usize,
+) -> Vec<(String, String)> {
+    let widths: Vec<usize> = words.iter().map(|w| display_width(w)).collect();
+    let rows = pack_words_by_width(&widths, max_width);
+    rows.into_iter()
+        .map(|row| {
+            let row_words: Vec<String> = row.iter().map(|&i| words[i].clone()).collect();
+            let row_hints: Vec<CodeHint> = row
+                .iter()
+                .map(|&i| {
+                    hints
+                        .get(i)
+                        .cloned()
+                        .unwrap_or_else(|| CodeHint {
+                            word: String::new(),
+                            code: String::new(),
+                            strokes: 0,
+                            is_oov: true,
+                        })
+                })
+                .collect();
+            let row_typed: Vec<bool> = row
+                .iter()
+                .map(|&i| typed_mask.get(i).copied().unwrap_or(false))
+                .collect();
+            let hint_line = layout_code_hint_line(&row_words, &row_hints, &row_typed);
+            let body_line = row_words.join(" ");
+            (hint_line, body_line)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,5 +213,106 @@ mod tests {
         let words = vec!["世界".to_string()];
         let hints = vec![hint("wCs")];
         assert_eq!(layout_code_hint_line(&words, &hints, &[]), "wCs ");
+    }
+
+    // ---- T06 长文折行对齐 ----
+
+    /// 断言提示行与正文行逐词锁步对齐：整行列宽一致，且提示行在各词位置处恰为对应词宽的单元。
+    ///
+    /// 提示单元可能内含居中/留空空格，故不能简单按空格切分；改为由正文行（仅词间有单空格）
+    /// 推断各词宽，再校验提示行在同样分隔下逐单元列宽一致、总宽相等。
+    fn assert_lockstep_aligned(rows: &[(String, String)]) {
+        for (h, b) in rows {
+            assert_eq!(
+                display_width(h),
+                display_width(b),
+                "row width mismatch hint={:?} body={:?}",
+                h,
+                b
+            );
+            let body_words: Vec<&str> = b.split(' ').filter(|w| !w.is_empty()).collect();
+            let mut pos = 0usize;
+            for w in body_words {
+                let ww = display_width(w);
+                // 提示行在 [pos, pos+ww) 必须是宽为 ww 的单元（居中/留空/截断后均恰为 ww）。
+                assert!(
+                    display_width(h) >= pos + ww,
+                    "hint too short vs body at pos {}: hint={:?} body={:?}",
+                    pos,
+                    h,
+                    b
+                );
+                pos += ww + 1; // 跳过词间单空格分隔
+            }
+        }
+    }
+
+    #[test]
+    fn pack_words_by_width_groups_within_max() {
+        // 词宽 [4,4,4]，max=10：前两词同处一行（4+1+4=9 ≤ 10），第三词另起一行。
+        let widths = vec![4usize, 4, 4];
+        let rows = pack_words_by_width(&widths, 10);
+        assert_eq!(rows, vec![vec![0, 1], vec![2]]);
+    }
+
+    #[test]
+    fn pack_words_by_width_oversized_word_own_row() {
+        // 单文宽 14 远超 max=5：独占一行（避免空行/无限循环），由上层按原宽溢出渲染。
+        let widths = vec![14usize, 2, 2];
+        let rows = pack_words_by_width(&widths, 5);
+        assert_eq!(rows, vec![vec![0], vec![1, 2]]);
+    }
+
+    #[test]
+    fn layout_code_hint_grid_narrow_keeps_alignment() {
+        // 窄宽度 + 长文：6 个双字词（各宽 4），max=9 → 每行 2 词、共 3 行；
+        // 每行提示与正文折行点锁步、逐词对齐。
+        let words = vec![
+            "中国".to_string(),
+            "发展".to_string(),
+            "人民".to_string(),
+            "社会".to_string(),
+            "主义".to_string(),
+            "制度".to_string(),
+        ];
+        let hints = vec![
+            hint("zk"),
+            hint("vzoi"),
+            hint("wfaa"),
+            hint("pwwi"),
+            hint("uyit"),
+            hint("sira"),
+        ];
+        let rows = layout_code_hint_grid(&words, &hints, &[], 9);
+        assert_eq!(rows.len(), 3, "expected 3 wrapped rows, got {}", rows.len());
+        assert_lockstep_aligned(&rows);
+        // 首行应包含前两词（"中国"+"发展"），提示码按词宽居中/原样。
+        assert_eq!(rows[0].1, "中国 发展");
+        assert_eq!(rows[0].0, " zk  vzoi"); // "zk"居中宽4→" zk "；"vzoi"恰为宽4原样
+    }
+
+    #[test]
+    fn layout_code_hint_grid_typed_word_blank_but_aligned() {
+        // 已全对上屏的词提示留空（仍按词宽占位），折行后仍与其下方字词对齐。
+        let words = vec!["中".to_string(), "中国".to_string()];
+        let hints = vec![hint("k"), hint("lgyinay")];
+        let typed = vec![true, false];
+        let rows = layout_code_hint_grid(&words, &hints, &typed, 10);
+        assert_eq!(rows.len(), 1);
+        assert_lockstep_aligned(&rows);
+        assert_eq!(rows[0].1, "中 中国");
+        assert_eq!(rows[0].0, "   lgyi"); // 「中」(2) 留空→2空格 + 词间1空格 = 3 前导空格；「中国」(4) 显示 lgyi
+    }
+
+    #[test]
+    fn layout_code_hint_grid_oversized_word_still_aligned() {
+        // 超长单字（宽 14）超过 max：独占一行，提示码截断到词宽、仍与正文对齐。
+        let words = vec!["中华人民共和国".to_string()];
+        let hints = vec![hint("abc")];
+        let rows = layout_code_hint_grid(&words, &hints, &[], 5);
+        assert_eq!(rows.len(), 1);
+        assert_lockstep_aligned(&rows);
+        assert_eq!(rows[0].1, "中华人民共和国");
+        assert_eq!(display_width(&rows[0].0), 14);
     }
 }

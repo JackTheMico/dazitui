@@ -14,7 +14,8 @@ use dazitui_core::{
     CodeHint, CompetitionType, DbTask, DbWorker,
     ErrorRecordItem, ErrorType, HeatmapLayout, KeyboardMode, KeypressRecordItem, LoadError,
     LoadOptions, Rgb, SchemeDict, Session, SessionRecord, Settings, SettingsStore, Stats, StatsDb,
-    Text, TextSource, Theme, TokenStore, layout_code_hint_line, env_credentials,
+    Text, TextSource, Theme, TokenStore, layout_code_hint_line, pack_words_by_width,
+    env_credentials,
     format_stats_share_text, format_time, key_accuracy_pct, word_ratio_pct,
     is_auth_failure, load_builtin_text, load_builtin_text_shuffled, load_text_from_clipboard,
     load_text_from_file, load_text_from_string, lttb_downsample, osc52_clipboard,
@@ -1187,6 +1188,7 @@ impl App {
                     &stats,
                     elapsed,
                     &self.settings.input_method,
+                    None,
                 );
                 write_clipboard(&share);
                 Some(share)
@@ -1434,7 +1436,7 @@ impl App {
         if !self.logged_in && !self.api.is_logged_in() {
             // 未登录时成绩也不该丢失：先把统计复制到剪贴板。
             let share =
-                format_stats_share_text(&self.text, stats, elapsed, &self.settings.input_method);
+                format_stats_share_text(&self.text, stats, elapsed, &self.settings.input_method, None);
             write_clipboard(&share);
             return UploadState::Failed {
                 message: "未登录，无法上传成绩".to_string(),
@@ -1485,6 +1487,7 @@ impl App {
                     stats,
                     elapsed,
                     &self.settings.input_method,
+                    None,
                 );
                 write_clipboard(&share);
                 UploadState::Failed {
@@ -3146,6 +3149,9 @@ fn ui(frame: &mut Frame, app: &App) {
         }
 
         let is_builtin = matches!(app.text.source, TextSource::Builtin { .. });
+        // 非内置长文 + 开启提示 + 已配置方案：走双行词格（按词边界锁步折行）路径。
+        let use_code_hint_grid =
+            app.settings.code_hint && !is_builtin && app.scheme_dict.is_some();
 
         let ref_inner_width = ref_area.width.saturating_sub(2);
         let ref_inner_height = ref_area.height.saturating_sub(2);
@@ -3154,17 +3160,41 @@ fn ui(frame: &mut Frame, app: &App) {
                 app.text.content.chars().take(app.session.len()),
                 ref_inner_width,
             );
-            ref_target_line.saturating_sub(ref_inner_height / 2)
+            // 双行词格下正文行前各有一行提示，故折行后目标行号翻倍以对齐滚动。
+            let target = if use_code_hint_grid {
+                ref_target_line.saturating_mul(2)
+            } else {
+                ref_target_line
+            };
+            target.saturating_sub(ref_inner_height / 2)
         } else {
             0
         };
 
-        let mut ref_text = original_line(&app.session, &app.text, app.theme(), app.settings.bold);
-        // 遍码提示（编码提示）：开启且已配置方案时，在内置词组赛文正文行之上插入提示行。
+        let mut ref_text = if use_code_hint_grid {
+            // 非内置长文双行词格：提示行与正文行已按词宽锁步预排版（无需 Paragraph 再折行）。
+            code_hint_grid_text(
+                &app.session,
+                &app.text,
+                app.scheme_dict.as_ref(),
+                app.theme(),
+                app.settings.bold,
+                ref_inner_width as usize,
+            )
+            .unwrap_or_else(|| {
+                original_line(&app.session, &app.text, app.theme(), app.settings.bold)
+            })
+        } else {
+            original_line(&app.session, &app.text, app.theme(), app.settings.bold)
+        };
+        // 遍码提示（编码提示）：内置词组赛文在正文行之上插入单行提示（单页，由 Paragraph 按词宽折行）。
         if app.settings.code_hint {
-            if let Some(hint_line) =
-                code_hint_overlay_line(&app.session, &app.text, app.scheme_dict.as_ref(), app.theme())
-            {
+            if let Some(hint_line) = code_hint_overlay_line(
+                &app.session,
+                &app.text,
+                app.scheme_dict.as_ref(),
+                app.theme(),
+            ) {
                 ref_text.lines.insert(0, hint_line);
             }
         }
@@ -6229,6 +6259,107 @@ fn code_hint_overlay_line(
     Some(Line::from(hint_str).fg(color(theme.muted)))
 }
 
+/// 非内置长文（离线/自由/剪贴板/在线）开启遍码提示时，按词边界锁步折行渲染「双行词格」。
+///
+/// 以 `WordIndex` 词边界为最小换行单元打包：提示行（上方反查编码，已全对上屏词留空占位）
+/// 与正文行（下方按跟打状态着色）折行点完全一致、永不错位。每词单元间以单空格分隔，
+/// 使提示行与正文行列结构等同，从而逐词对齐。
+///
+/// 仅对非内置长文生效；内置词组赛文仍走 `code_hint_overlay_line` 单页路径。
+/// 未配置方案（`dict` 为 `None`）或内置词组赛文或文本无词边界时返回 `None`，交由上层回退到普通渲染。
+fn code_hint_grid_text(
+    session: &Session,
+    text: &Text,
+    dict: Option<&SchemeDict>,
+    theme: Theme,
+    bold: bool,
+    max_width: usize,
+) -> Option<TextLines<'static>> {
+    // 内置词组赛文由 code_hint_overlay_line 单页路径处理，不走双行词格。
+    if matches!(text.source, TextSource::Builtin { .. }) {
+        return None;
+    }
+    let dict = dict?;
+    let index = text.build_word_index();
+    let boundaries = index.word_boundaries();
+    if boundaries.is_empty() {
+        return None;
+    }
+    let content: Vec<char> = text.content.chars().collect();
+    // 过滤空白单元（空格/换行仅作分隔），避免提示格里出现空白占位单元与双倍间距。
+    let units: Vec<(usize, usize)> = boundaries
+        .into_iter()
+        .filter(|&(s, e)| {
+            let e = e.min(content.len());
+            s < e && !content[s..e].iter().all(|c| c.is_whitespace())
+        })
+        .collect();
+    if units.is_empty() {
+        return None;
+    }
+
+    let statuses = session.original_status();
+    let mut words: Vec<String> = Vec::new();
+    let mut word_ranges: Vec<(usize, usize)> = Vec::new();
+    let mut typed_mask: Vec<bool> = Vec::new();
+    for &(ws, we) in &units {
+        let we = we.min(content.len());
+        if ws >= we {
+            continue;
+        }
+        let word: String = content[ws..we].iter().collect();
+        let all_correct = (ws..we).all(|i| {
+            statuses
+                .get(i)
+                .is_some_and(|(_, s)| *s == Some(CharStatus::Correct))
+        });
+        words.push(word);
+        word_ranges.push((ws, we));
+        typed_mask.push(all_correct);
+    }
+    if words.is_empty() {
+        return None;
+    }
+
+    let hints: Vec<CodeHint> = dict.build_code_hints(&words);
+    let widths: Vec<usize> = words.iter().map(|w| w.width()).collect();
+    let rows = pack_words_by_width(&widths, max_width);
+
+    let mut text_lines = TextLines::default();
+    for row in rows {
+        // 提示行：本行词单元的编码（按词宽居中/留空），muted 色。
+        let row_words: Vec<String> = row.iter().map(|&i| words[i].clone()).collect();
+        let row_hints: Vec<CodeHint> = row.iter().map(|&i| hints[i].clone()).collect();
+        let row_typed: Vec<bool> = row.iter().map(|&i| typed_mask[i]).collect();
+        let hint_str = layout_code_hint_line(&row_words, &row_hints, &row_typed);
+        text_lines.push_line(Line::from(hint_str).fg(color(theme.muted)));
+
+        // 正文行：本行词单元按跟打状态着色（每词间单空格分隔，与提示行锁步）。
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        for (k, &wi) in row.iter().enumerate() {
+            if k > 0 {
+                spans.push(Span::raw(" "));
+            }
+            let (ws, we) = word_ranges[wi];
+            for ci in ws..we {
+                if let Some((c, status)) = statuses.get(ci) {
+                    let style = match status {
+                        Some(CharStatus::Correct) => Style::default().fg(color(theme.correct)),
+                        Some(CharStatus::Wrong) => Style::default().fg(color(theme.wrong)),
+                        None => Style::default(),
+                    };
+                    spans.push(Span::styled(
+                        c.to_string(),
+                        style.add_modifier(bold_modifier(bold)),
+                    ));
+                }
+            }
+        }
+        text_lines.push_line(Line::from(spans));
+    }
+    Some(text_lines)
+}
+
 /// 跟打区：将当前页指定数量词的已打字符按对/错着色，词间插入空格 span。
 fn build_word_type_spans(
     display: &[(char, CharStatus)],
@@ -8037,6 +8168,87 @@ mod tests {
         assert!(
             !reverted_str.chars().take(4).all(|c| c.is_whitespace()),
             "回改后首词提示应重现，得到: {reverted_str:?}"
+        );
+    }
+
+    #[test]
+    fn code_hint_grid_lockstep_wraps_long_text_narrow_width() {
+        // T06：非内置长文（离线/自由/剪贴板/在线）开启提示时，双行词格按词边界锁步折行，
+        // 提示行与正文行折行点完全一致、逐词对齐、永不错位。
+        let theme = Theme::preset(ThemePreset::CatppuccinMocha);
+        let content =
+            "我们看着这个美丽的世界，人民在静静地生活。社会主义事业发展得越来越好。";
+        let text = load_text_from_string(
+            "长文",
+            content.to_string(),
+            TextSource::File,
+            &LoadOptions::default(),
+        )
+        .unwrap();
+        // 未打字：全部词的提示都应可见。
+        let session = Session::new(&text.content);
+        // yoyo 风格字典夹具：覆盖正文中的词与单字。
+        let tsv = "我们\twm\n看着\tva\n这个\tvi\n美丽\tmwi\n世界\twj\n人民\trvww\n\
+                   生活\twvi\n社会\twpww\n主义\tuyit\n事业\tsira\n发展\tvzoi\n越来越好\tylyh\n";
+        let dict = SchemeDict::parse(tsv);
+        let max_width = 12; // 窄：约 2 个双字词一行
+        let grid = code_hint_grid_text(&session, &text, Some(&dict), theme, false, max_width);
+        let grid = grid.expect("非内置长文应生成双行词格");
+        let lines: Vec<String> = grid
+            .lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert!(
+            lines.len() >= 4,
+            "应有若干 (提示,正文) 行对，实际 {} 行",
+            lines.len()
+        );
+        assert_eq!(lines.len() % 2, 0, "行数应为偶数（提示+正文成对）");
+        // 逐对校验：提示行与正文行总列宽一致（折行点锁步），且提示行在上方。
+        for pair in lines.chunks(2) {
+            let (hint, body) = (&pair[0], &pair[1]);
+            assert_eq!(
+                hint.width(),
+                body.width(),
+                "提示行与正文行应等宽对齐: hint={:?} body={:?}",
+                hint,
+                body
+            );
+        }
+        // 至少应出现某个词的反查编码（如「我们」→ wm）。
+        let joined: String = lines.concat();
+        assert!(joined.contains("wm"), "提示格应含词码，得到: {:?}", joined);
+    }
+
+    #[test]
+    fn code_hint_grid_returns_none_without_dict_or_builtin() {
+        // T06：未配置方案或非内置词组赛文时，双行词格路径应回退（返回 None）。
+        let theme = Theme::preset(ThemePreset::CatppuccinMocha);
+        let content = "我们看着这个美丽的世界。";
+        let text = load_text_from_string(
+            "长文",
+            content.to_string(),
+            TextSource::File,
+            &LoadOptions::default(),
+        )
+        .unwrap();
+        let session = Session::new(&text.content);
+        // 未配置方案 → 不生成词格（交由上层回退到普通渲染）。
+        assert!(
+            code_hint_grid_text(&session, &text, None, theme, false, 20).is_none(),
+            "未配置方案时不应生成词格"
+        );
+
+        // 内置词组赛文不在此路径（由 code_hint_overlay_line 处理）。
+        let set = BUILTIN_SETS[3];
+        let builtin_text = load_builtin_text(set);
+        let builtin_session =
+            Session::new_gated_with_words_and_size(&builtin_text.content, true, &set.word_boundaries(), 10);
+        let dict = SchemeDict::parse("我们\twm\n");
+        assert!(
+            code_hint_grid_text(&builtin_session, &builtin_text, Some(&dict), theme, false, 20).is_none(),
+            "内置词组赛文不应走双行词格路径"
         );
     }
 
