@@ -3304,6 +3304,10 @@ fn ui(frame: &mut Frame, app: &App) {
     if let Some(modal) = &app.text_setting_modal {
         render_text_setting_modal(frame, modal, &palette, app.theme());
     }
+    // 续打选择弹窗：独立居中模态层（不再塞进侧边栏）
+    if let Some((set, saved, total)) = app.resume_prompt {
+        render_resume_prompt_popup(frame, set, saved, total, &palette, app.theme());
+    }
 }
 
 /// 登录模态框：居中弹层，用户名 + 遮蔽密码。
@@ -3405,6 +3409,89 @@ fn render_text_setting_modal(
     if cursor_y < area.y + area.height.saturating_sub(1) && cursor_x < area.x + area.width.saturating_sub(1) {
         frame.set_cursor_position((cursor_x, cursor_y));
     }
+}
+
+/// 续打选择弹窗：从侧边栏剥离出来的居中模态层，展示进度并提供继续/重开/重置操作。
+fn render_resume_prompt_popup(
+    frame: &mut Frame,
+    set: BuiltinSet,
+    saved: usize,
+    total: usize,
+    palette: &ThemePalette,
+    _theme: Theme,
+) {
+    let complete = total > 0 && saved >= total;
+    let area = centered_rect(frame.area(), 48, 10);
+    frame.render_widget(Clear, area);
+
+    let block = themed_block(palette, true)
+        .title(" 📚 续打进度 ")
+        .style(Style::default().bg(palette.bg).fg(palette.fg));
+
+    // 进度条：█ 已完 / ░ 未完
+    let bar_w: u64 = 16;
+    let pct = if total == 0 { 0 } else { saved * 100 / total };
+    let filled = if total == 0 {
+        0
+    } else {
+        (saved as u64 * bar_w / total as u64) as usize
+    };
+    let filled = filled.min(bar_w as usize);
+    let bar = format!(
+        "{}{}",
+        "█".repeat(filled),
+        "░".repeat((bar_w as usize) - filled)
+    );
+
+    let name = set.name();
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(""));
+    if complete {
+        lines.push(Line::from(vec![
+            Span::styled(" 🎉 ", Style::default().fg(palette.success).bold()),
+            Span::styled(
+                format!("「{name}」已全部完成！"),
+                Style::default().fg(palette.success).bold(),
+            ),
+        ]));
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled(" 📖 ", Style::default().fg(palette.accent)),
+            Span::styled(format!("「{name}」"), Style::default().fg(palette.fg).bold()),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(" 📊 已完成 ", Style::default().fg(palette.muted)),
+        Span::styled(
+            format!("{saved} / {total} 组"),
+            Style::default().fg(palette.fg).bold(),
+        ),
+        Span::styled(format!("  {pct}%"), Style::default().fg(palette.accent)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled(" ", Style::default().fg(palette.muted)),
+        Span::styled(bar, Style::default().fg(palette.accent)),
+    ]));
+    lines.push(Line::from(""));
+    if complete {
+        lines.push(hint_bar_line(
+            " [r] 重新开始 🔄 | [x] 重置进度 🗑️ | [Esc] 返回 ↩️ ",
+            palette,
+        ));
+    } else {
+        lines.push(hint_bar_line(
+            " [c] 继续 🚀 | [r] 重新开始 🔄 | [x] 重置 🗑️ | [Esc] 返回 ↩️ ",
+            palette,
+        ));
+    }
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        area,
+    );
 }
 
 /// 自由发文模态框：居中弹层，标题 + 多行正文 + 保存选项。
@@ -3637,14 +3724,7 @@ fn render_sidebar(
             } else {
                 "   "
             };
-            let mut label = set.name().to_string();
-            // 已存进度则在名称后追加「已完成 X/Y 组」
-            if let Some(p) = app.builtin_progress_for(*set) {
-                if p.completed_groups > 0 {
-                    let total = app.builtin_total_groups(*set, p.group_size as usize);
-                    label.push_str(&format!(" · 已完成 {}/{} 组", p.completed_groups, total));
-                }
-            }
+            let label = set.name().to_string();
             let mut line = Line::from(format!("{prefix}{label}"));
             if i == app.builtin_selection {
                 line = line.fg(palette.accent).bold();
@@ -3652,36 +3732,6 @@ fn render_sidebar(
                 line = line.fg(palette.fg);
             }
             lines.push(line);
-        }
-        // 续打弹窗覆盖层
-        if let Some((set, saved, total)) = &app.resume_prompt {
-            lines.push(Line::from(""));
-            if *saved >= *total {
-                lines.push(
-                    Line::from(format!("「{}」已全部完成 {} 组", set.name(), total))
-                        .fg(palette.warning)
-                        .bold(),
-                );
-                lines.push(
-                    Line::from("   [r] 重新开始   [x] 重置进度   [Esc] 返回")
-                        .fg(palette.muted),
-                );
-            } else {
-                lines.push(
-                    Line::from(format!(
-                        "「{}」已有进度：第 {}/{} 组",
-                        set.name(),
-                        saved,
-                        total
-                    ))
-                    .fg(palette.warning)
-                    .bold(),
-                );
-                lines.push(
-                    Line::from("   [c] 继续   [r] 重新开始   [x] 重置进度   [Esc] 返回")
-                        .fg(palette.muted),
-                );
-            }
         }
     } else {
         if app.paused {
@@ -6701,6 +6751,33 @@ mod tests {
         app.save_builtin_progress(app.session.total_groups());
         let done = app.builtin_progress_for(set).unwrap();
         assert_eq!(done.completed_groups as usize, app.session.total_groups());
+    }
+
+    #[test]
+    fn resume_prompt_popup_renders_in_separate_modal() {
+        let set = BUILTIN_SETS[6]; // yoyo 单字
+        let mut app = test_app(load_builtin_text(set));
+        // 制造进度：打完前两组
+        app.start_builtin_set(set, 0);
+        let gs = app.settings.group_size as usize;
+        let chars: Vec<char> = app.text.content.chars().collect();
+        let g1: String = chars[..gs].iter().collect();
+        let g2: String = chars[gs..2 * gs].iter().collect();
+        app.session.type_text(&g1);
+        app.session.type_text(&g2);
+        app.persist_builtin_progress_if_changed();
+        // 触发续打弹窗
+        app.builtin_selection = 6;
+        app.load_selected_builtin();
+        assert!(app.resume_prompt.is_some(), "有存档时应弹出续打选择");
+
+        // 弹窗应为独立模态层：含标题、赛文名、进度、按键提示（侧边栏不再内联展示）
+        let buf = render_buffer_text(&app, 100, 30);
+        assert!(buf.contains("续打进度"), "应渲染独立的续打弹窗标题");
+        assert!(buf.contains("yoyo单字"), "应显示赛文名");
+        assert!(buf.contains("已完成"), "应显示进度文案");
+        assert!(buf.contains("继续"), "应提供继续选项");
+        assert!(buf.contains("重置"), "应提供重置进度选项");
     }
 
     #[test]
