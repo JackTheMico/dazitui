@@ -6280,11 +6280,12 @@ fn code_hint_line_from_cells(cells: &[HintCell], theme: Theme) -> Line<'static> 
     Line::from(spans)
 }
 
-/// 遍码提示单元的手区配色：左手粉、右手黄；其余（双手并击/已打/未登录）用 muted。
+/// 遍码提示单元的手区配色：左手粉、右手黄（均取自当前主题，主题自适应）；
+/// 其余（双手并击/已打/未登录）用 muted。
 fn code_hint_hand_style(hand: HintHand, theme: Theme) -> Style {
     let c = match hand {
-        HintHand::Left => Color::Rgb(244, 114, 182), // 粉
-        HintHand::Right => Color::Rgb(250, 204, 21),  // 黄
+        HintHand::Left => color(theme.hand_left),  // 粉
+        HintHand::Right => color(theme.hand_right), // 黄
         _ => color(theme.muted),
     };
     Style::default().fg(c)

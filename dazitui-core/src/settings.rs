@@ -121,6 +121,10 @@ pub struct Theme {
     pub warn: Rgb,
     /// 次要文本（原灰）。
     pub muted: Rgb,
+    /// 遍码提示：左手单手码配色（原粉）。由各主题自行定义，保证在该主题背景上可读。
+    pub hand_left: Rgb,
+    /// 遍码提示：右手单手码配色（原黄）。由各主题自行定义，保证在该主题背景上可读。
+    pub hand_right: Rgb,
 }
 
 impl Theme {
@@ -134,6 +138,8 @@ impl Theme {
                 accent: Rgb(0x89, 0xb4, 0xfa),
                 warn: Rgb(0xf9, 0xe2, 0xaf),
                 muted: Rgb(0x6c, 0x70, 0x86),
+                hand_left: Rgb(0xf5, 0xc2, 0xe7),
+                hand_right: Rgb(0xf9, 0xe2, 0xaf),
             },
             ThemePreset::Cyberpunk => Self {
                 text: Rgb(240, 240, 240),
@@ -142,6 +148,8 @@ impl Theme {
                 accent: Rgb(0, 255, 255),
                 warn: Rgb(255, 230, 0),
                 muted: Rgb(100, 100, 140),
+                hand_left: Rgb(0xff, 0x5f, 0xa2),
+                hand_right: Rgb(0xff, 0xe6, 0x00),
             },
             ThemePreset::Nord => Self {
                 text: Rgb(236, 239, 244),
@@ -150,6 +158,8 @@ impl Theme {
                 accent: Rgb(136, 192, 208),
                 warn: Rgb(235, 203, 139),
                 muted: Rgb(76, 86, 106),
+                hand_left: Rgb(0xb4, 0x8e, 0xad),
+                hand_right: Rgb(0xeb, 0xcb, 0x8b),
             },
             ThemePreset::Dracula => Self {
                 text: Rgb(0xf8, 0xf8, 0xf2),
@@ -158,6 +168,8 @@ impl Theme {
                 accent: Rgb(0xbd, 0x93, 0xf9),
                 warn: Rgb(0xf1, 0xfa, 0x8c),
                 muted: Rgb(0x62, 0x72, 0xa4),
+                hand_left: Rgb(0xff, 0x79, 0xc6),
+                hand_right: Rgb(0xf1, 0xfa, 0x8c),
             },
             ThemePreset::Gruvbox => Self {
                 text: Rgb(0xeb, 0xdb, 0xb2),
@@ -166,6 +178,8 @@ impl Theme {
                 accent: Rgb(0x83, 0xa5, 0x98),
                 warn: Rgb(0xfa, 0xbd, 0x2f),
                 muted: Rgb(0x92, 0x83, 0x74),
+                hand_left: Rgb(0xb1, 0x62, 0x86),
+                hand_right: Rgb(0xfa, 0xbd, 0x2f),
             },
             ThemePreset::RosePine => Self {
                 text: Rgb(224, 222, 244),
@@ -174,6 +188,8 @@ impl Theme {
                 accent: Rgb(235, 188, 186),
                 warn: Rgb(246, 193, 119),
                 muted: Rgb(110, 106, 134),
+                hand_left: Rgb(0xeb, 0x6f, 0x92),
+                hand_right: Rgb(0xf6, 0xc1, 0x77),
             },
             ThemePreset::Kanagawa => Self {
                 text: Rgb(220, 215, 186),
@@ -182,6 +198,8 @@ impl Theme {
                 accent: Rgb(126, 156, 216),
                 warn: Rgb(255, 160, 102),
                 muted: Rgb(114, 113, 105),
+                hand_left: Rgb(0xf4, 0x72, 0xb6),
+                hand_right: Rgb(0xfa, 0xcc, 0x15),
             },
             ThemePreset::OneDark => Self {
                 text: Rgb(171, 178, 191),
@@ -190,6 +208,8 @@ impl Theme {
                 accent: Rgb(97, 175, 239),
                 warn: Rgb(229, 192, 123),
                 muted: Rgb(92, 99, 112),
+                hand_left: Rgb(0xc6, 0x78, 0xdd),
+                hand_right: Rgb(0xe5, 0xc0, 0x7b),
             },
         }
     }
