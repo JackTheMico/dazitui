@@ -352,6 +352,8 @@ pub struct Settings {
     pub heatmap_layout: HeatmapLayout,
     /// 内置赛文每组大小（单字赛文字数 / 词组赛文词数）。
     pub group_size: u8,
+    /// 遍码提示（编码提示）开关：开启后在对照区字词上方显示最少击数输入编码。
+    pub code_hint: bool,
     /// 各内置赛文的练习进度（跨会话保留），key 为赛文名。
     pub builtin_progress: HashMap<String, BuiltinProgress>,
 }
@@ -411,6 +413,7 @@ impl Default for Settings {
             scheme_dict_paths: HashMap::new(),
             heatmap_layout: HeatmapLayout::Staggered,
             group_size: Self::DEFAULT_GROUP_SIZE,
+            code_hint: false,
             builtin_progress: HashMap::new(),
         }
     }
@@ -459,7 +462,7 @@ impl SettingsStore {
             std::fs::create_dir_all(parent)?;
         }
         let mut content = format!(
-            "theme={}\nreference_ratio={}\nbold={}\nkeyboard_mode={}\nscheme={}\ninput_method={}\nheatmap_layout={}\ngroup_size={}\n",
+            "theme={}\nreference_ratio={}\nbold={}\nkeyboard_mode={}\nscheme={}\ninput_method={}\nheatmap_layout={}\ngroup_size={}\ncode_hint={}\n",
             settings.theme.as_str(),
             settings.reference_ratio,
             settings.bold,
@@ -468,6 +471,7 @@ impl SettingsStore {
             settings.input_method,
             settings.heatmap_layout.as_str(),
             settings.group_size,
+            settings.code_hint,
         );
         for (scheme, path) in &settings.scheme_dict_paths {
             content.push_str(&format!("scheme_dict.{}={}\n", scheme, path));
@@ -526,6 +530,7 @@ impl SettingsStore {
                     }
                 }
                 "bold" => settings.bold = value == "true",
+                "code_hint" => settings.code_hint = value == "true",
                 "font" => {} // 忽略已移除的 font 设置
                 "keyboard_mode" => {
                     if let Some(mode) = KeyboardMode::parse(value) {
@@ -724,6 +729,7 @@ mod tests {
             group_size: 10,
             scheme_dict_paths,
             heatmap_layout: HeatmapLayout::Ortholinear,
+            code_hint: false,
             builtin_progress: HashMap::new(),
         };
         store.save(&s).unwrap();
@@ -973,6 +979,36 @@ mod tests {
         // 缺省时回退到默认值 10
         std::fs::write(store.path(), "theme=default\n").unwrap();
         assert_eq!(store.load().group_size, 10);
+        let _ = std::fs::remove_file(store.path());
+    }
+
+    #[test]
+    fn store_code_hint_roundtrip() {
+        // T01：遍码提示开关写入后读出一致，缺省文件回退 false。
+        let store = SettingsStore::new(temp_path("code_hint_roundtrip"));
+
+        let on = Settings {
+            code_hint: true,
+            ..Default::default()
+        };
+        store.save(&on).unwrap();
+        assert_eq!(store.load().code_hint, true);
+
+        let off = Settings {
+            code_hint: false,
+            ..Default::default()
+        };
+        store.save(&off).unwrap();
+        assert_eq!(store.load().code_hint, false);
+
+        // 缺省（文件不存在）回退到默认 false。
+        let missing = SettingsStore::new(temp_path("code_hint_missing"));
+        assert!(!missing.load().code_hint);
+
+        // 损坏/未知值不会把开关误置为 true。
+        std::fs::write(store.path(), "theme=default\ncode_hint=maybe\n").unwrap();
+        assert!(!store.load().code_hint);
+
         let _ = std::fs::remove_file(store.path());
     }
 

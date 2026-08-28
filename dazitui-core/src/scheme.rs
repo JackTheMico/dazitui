@@ -20,6 +20,19 @@ pub struct SchemeDict {
     chord_algebra: Option<ChordAlgebra>,
 }
 
+/// 单个词组单位的编码提示结果（供渲染层逐词对齐）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeHint {
+    /// 对应的词组单位原文（回显用，便于渲染层逐词对齐）。
+    pub word: String,
+    /// 最优输入编码（逻辑码元：拼音/形码字母/并击逻辑码元）；未登录留空串。
+    pub code: String,
+    /// 该编码的击数（并击记 1 击，即每个逻辑码元算 1）；未登录为 0。
+    pub strokes: u32,
+    /// 是否未登录（码表未收录，提示留空）。
+    pub is_oov: bool,
+}
+
 impl std::str::FromStr for SchemeDict {
     type Err = std::convert::Infallible;
 
@@ -372,6 +385,98 @@ impl SchemeDict {
         }
 
         (total_strokes.max(1), all_keys)
+    }
+
+    /// 为已分词的文本逐词组单位计算「最少击数」最优输入编码提示。
+    ///
+    /// 规则（与 ADR 0008 决策一致）：
+    /// - 整词已登录：取击数最小编码；若其击数 ≤ 逐字击数之和则取整词码，否则逐字拼接；
+    /// - 整词未登录但各字均登录：逐字拼接各字最优编码；
+    /// - 任意字未登录（含整词未登录且含未登录字）：提示留空并标记 `is_oov`。
+    ///
+    /// 结果为可缓存结构，渲染层只需在载文/`reload_scheme_dict` 时调用一次，不在每帧重算。
+    pub fn build_code_hints(&self, words: &[String]) -> Vec<CodeHint> {
+        words
+            .iter()
+            .map(|w| self.build_hint_for_word(w))
+            .collect()
+    }
+
+    /// 计算单个词组单位的最优编码提示。
+    fn build_hint_for_word(&self, word: &str) -> CodeHint {
+        let word_best = self.best_code(word);
+        let char_parts: Vec<Option<(String, u32)>> = word
+            .chars()
+            .map(|c| self.best_code(&c.to_string()))
+            .collect();
+        let any_oov = char_parts.iter().any(|p| p.is_none());
+
+        if let Some((wc, ws)) = word_best {
+            // 整词已登录：优先整词，除非逐字明显更省且都能查到
+            if any_oov {
+                return CodeHint {
+                    word: word.to_string(),
+                    code: wc,
+                    strokes: ws,
+                    is_oov: false,
+                };
+            }
+            let char_sum: u32 = char_parts
+                .iter()
+                .map(|p| p.as_ref().map(|(_, s)| *s).unwrap_or(0))
+                .sum();
+            if ws <= char_sum {
+                return CodeHint {
+                    word: word.to_string(),
+                    code: wc,
+                    strokes: ws,
+                    is_oov: false,
+                };
+            }
+            let code: String = char_parts
+                .iter()
+                .map(|p| p.as_ref().map(|(c, _)| c.as_str()).unwrap_or(""))
+                .collect();
+            return CodeHint {
+                word: word.to_string(),
+                code,
+                strokes: char_sum,
+                is_oov: false,
+            };
+        }
+
+        // 整词未登录：各字均登录则逐字拼接，否则留空
+        if any_oov {
+            return CodeHint {
+                word: word.to_string(),
+                code: String::new(),
+                strokes: 0,
+                is_oov: true,
+            };
+        }
+        let code: String = char_parts
+            .iter()
+            .map(|p| p.as_ref().map(|(c, _)| c.as_str()).unwrap_or(""))
+            .collect();
+        let strokes: u32 = char_parts
+            .iter()
+            .map(|p| p.as_ref().map(|(_, s)| *s).unwrap_or(0))
+            .sum();
+        CodeHint {
+            word: word.to_string(),
+            code,
+            strokes,
+            is_oov: false,
+        }
+    }
+
+    /// 取某词条击数最小（并击记 1 击）的编码及其击数；未登录返回 `None`。
+    fn best_code(&self, word: &str) -> Option<(String, u32)> {
+        let codes = self.word_to_codes.get(word)?;
+        let best = codes
+            .iter()
+            .min_by_key(|c| Self::calculate_code_strokes(c))?;
+        Some((best.clone(), Self::calculate_code_strokes(best)))
     }
 
     /// 分解编码为物理按键序列。
@@ -1247,6 +1352,40 @@ algebra:
         let (strokes_en, keys_en) = dict.resolve_strokes_and_keys("hello");
         assert_eq!(strokes_en, 5);
         assert_eq!(keys_en, vec!["h", "e", "l", "l", "o"]);
+    }
+
+    #[test]
+    fn test_build_code_hints() {
+        // T02：给定分词文本 + SchemeDict，产出每词「最少击数」最优编码提示。
+        let tsv = "中国\tlgy\n中\tk\n国\tlgyi\n人民\twvww\n人\tw\n民\tnay\n中国人\tzhongguoren\n好\tvb\n好\tgood\n";
+        let dict = SchemeDict::parse(tsv);
+
+        let words: Vec<String> = ["中", "中国", "国民", "中国人", "人民", "好", "囧", "好x"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let hints = dict.build_code_hints(&words);
+        let get = |w: &str| hints.iter().find(|h| h.word == w).expect("应有该词提示");
+
+        // 单字直接命中
+        assert_eq!(get("中").code, "k");
+        // 整词优先：中国 lgy(3) <= 中(1)+国(4)=5 → 取整词
+        assert_eq!(get("中国").code, "lgy");
+        assert_eq!(get("中国").strokes, 3);
+        // 整词未登录、各字均登录 → 逐字拼接
+        assert_eq!(get("国民").code, "lgyinay");
+        // 整词击数更省时逐字：中国人 zhongguoren(12) > 逐字 6 → 拼接 klgyiw
+        assert_eq!(get("中国人").code, "klgyiw");
+        // 整词与逐字击数相等 → 取整词
+        assert_eq!(get("人民").code, "wvww");
+        // 多编码取最小击数：好 vb(2) < good(4)
+        assert_eq!(get("好").code, "vb");
+        // OOV：整词未登录且含未登录字 → 留空并标记 is_oov
+        assert_eq!(get("囧").code, "");
+        assert!(get("囧").is_oov);
+        // 混合：已知字 + 未登录字 → 留空并标记 is_oov
+        assert_eq!(get("好x").code, "");
+        assert!(get("好x").is_oov);
     }
 }
 

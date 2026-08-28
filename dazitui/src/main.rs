@@ -238,8 +238,9 @@ const FOCUS_KEYBOARD: usize = 3;
 const FOCUS_SCHEME: usize = 4;
 const FOCUS_INPUT_METHOD: usize = 5;
 const FOCUS_GROUP_SIZE: usize = 6;
+const FOCUS_CODE_HINT: usize = 7;
 /// 设置视图焦点项总数。
-const SETTINGS_FOCUS_COUNT: usize = 7;
+const SETTINGS_FOCUS_COUNT: usize = 8;
 
 /// 反查方案预设列表（顺序即轮转顺序）。
 /// 最后一项「自定义」表示用户自行输入任意方案名或文件路径。
@@ -926,6 +927,12 @@ impl App {
     /// 切换粗体开关并即时持久化。
     fn toggle_bold(&mut self) {
         self.settings.bold = !self.settings.bold;
+        let _ = self.settings_store.save(&self.settings);
+    }
+
+    /// 切换遍码提示开关并即时持久化。
+    fn toggle_code_hint(&mut self) {
+        self.settings.code_hint = !self.settings.code_hint;
         let _ = self.settings_store.save(&self.settings);
     }
 
@@ -1935,6 +1942,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                                 }
                                 FOCUS_RATIO => app.adjust_ratio(if forward { 5 } else { -5 }),
                                 FOCUS_BOLD => app.toggle_bold(),
+                                FOCUS_CODE_HINT => app.toggle_code_hint(),
                                 FOCUS_KEYBOARD => {
                                     if forward {
                                         app.next_keyboard_mode();
@@ -5184,6 +5192,12 @@ fn render_settings(frame: &mut Frame, app: &App) {
         focus == FOCUS_GROUP_SIZE,
         &palette,
     ));
+    lines.push(settings_row(
+        "遍码提示",
+        on_off(app.settings.code_hint),
+        focus == FOCUS_CODE_HINT,
+        &palette,
+    ));
 
     lines.push(Line::from(""));
     // 主题预览：用当前主题的对/错色渲染示意文字。
@@ -5193,7 +5207,7 @@ fn render_settings(frame: &mut Frame, app: &App) {
     lines.push(Line::from(""));
     lines.push(hint_bar_line(" jk 选择 | hl 调整 | Esc/q 返回 ", &palette));
 
-    let area = centered_rect(frame.area(), 60, 18);
+    let area = centered_rect(frame.area(), 60, 20);
     frame.render_widget(Clear, area);
     let settings_title = Line::from(vec![Span::styled(
         " 设置 ",
