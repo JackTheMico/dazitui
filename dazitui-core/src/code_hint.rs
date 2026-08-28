@@ -127,4 +127,20 @@ mod tests {
             "   lgyi"
         );
     }
+
+    #[test]
+    fn layout_overwide_chord_truncated_to_word_width() {
+        // T05：超宽并击码（如 wCsA，4 字符）在单字（CJK 宽 2）提示区内按词宽截断为 2 列。
+        let words = vec!["中".to_string()];
+        let hints = vec![hint("wCsA")];
+        assert_eq!(layout_code_hint_line(&words, &hints, &[]), "wC");
+    }
+
+    #[test]
+    fn layout_chord_centered_in_wide_word_width() {
+        // T05：3 码并击 wCs 在双字（CJK 宽 4）提示区内居中为 "wCs "（右补 1 空格）。
+        let words = vec!["世界".to_string()];
+        let hints = vec![hint("wCs")];
+        assert_eq!(layout_code_hint_line(&words, &hints, &[]), "wCs ");
+    }
 }

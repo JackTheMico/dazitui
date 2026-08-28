@@ -470,12 +470,30 @@ impl SchemeDict {
         }
     }
 
-    /// 取某词条击数最小（并击记 1 击）的编码及其击数；未登录返回 `None`。
+    /// 单手前缀形式（`_` 左手 / `+` 右手 / `-` 其它）：并击方案下由单手逐键输入，
+    /// 字典中永远以带前缀的派生形式出现；无前缀者即双手并击的规范形式。
+    fn has_hand_prefix(code: &str) -> bool {
+        code.starts_with('_') || code.starts_with('+') || code.starts_with('-')
+    }
+
+    /// 取某词条「并击方案下优先双手并击形式、其次最少击数」的编码及其击数；未登录返回 `None`。
+    ///
+    /// 并击方案（`chord_algebra` 已载入）下，同一字词的字典常同时含无前缀的双手并击规范形式
+    /// 与带 `_`/`+` 前缀的单手派生形式。择优键：
+    ///   (是否单手前缀, 击数, 码长) —— 优先无前缀的双手并击形式，击数相同时取更少击数。
+    /// 非并击方案退化为「最少击数」择优（与旧行为一致）。
+    /// 返回的 `strokes` 仍用 `calculate_code_strokes`（与练习统计一致）。
     fn best_code(&self, word: &str) -> Option<(String, u32)> {
         let codes = self.word_to_codes.get(word)?;
-        let best = codes
-            .iter()
-            .min_by_key(|c| Self::calculate_code_strokes(c))?;
+        let is_chord = self.chord_algebra.is_some();
+        let best = codes.iter().min_by_key(|c| {
+            (
+                // 并击方案：单手派生形式（带前缀）排在后
+                (is_chord && Self::has_hand_prefix(c)) as u8,
+                Self::calculate_code_strokes(c),
+                c.len(),
+            )
+        })?;
         Some((best.clone(), Self::calculate_code_strokes(best)))
     }
 
@@ -1386,6 +1404,37 @@ algebra:
         // 混合：已知字 + 未登录字 → 留空并标记 is_oov
         assert_eq!(get("好x").code, "");
         assert!(get("好x").is_oov);
+    }
+
+    #[test]
+    fn build_code_hints_prefers_two_hand_chord_over_one_hand_derived() {
+        // T05：yoyo-pure 风格字典同时含「单手派生形式」(_/+ 前缀，逐键) 与
+        // 「双手并击形式」(无前缀、左右手混排，计 1 击)。编码提示应优先显示双手并击形式。
+        let dict_str = "---\nname: yoyo-pure\n...\n\
+的\t_d\t92123018\n的\td.O\t0\n\
+是\t_w\t60632202\n是\twCs\t0\n\
+有\t+e\t33869044\n有\teHy\t0\n\
+就\t+s\t26406172\n就\tsE:\t0\n\
+可以\txkhr\t0\n";
+        // 并击方案：应用层 load_from_file 会载入 chord_algebra；单元夹具以 default 代数模拟。
+        let mut dict = SchemeDict::parse(dict_str);
+        dict.set_chord_algebra(ChordAlgebra::default());
+
+        let words: Vec<String> = ["是", "有", "就", "可以"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let hints = dict.build_code_hints(&words);
+        let get = |w: &str| hints.iter().find(|h| h.word == w).expect("应有该词提示");
+
+        // 单字 3 码：双手并击 wCs 优先于单手 _w
+        assert_eq!(get("是").code, "wCs", "应优先双手并击 wCs 而非单手 _w");
+        // 有：双手并击 eHy 优先于单手 +e
+        assert_eq!(get("有").code, "eHy", "应优先双手并击 eHy 而非单手 +e");
+        // 就：双手并击 sE: 优先于单手 +s
+        assert_eq!(get("就").code, "sE:", "应优先双手并击 sE: 而非单手 +s");
+        // 词语 4 码：直接显示
+        assert_eq!(get("可以").code, "xkhr");
     }
 }
 
