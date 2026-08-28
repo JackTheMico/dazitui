@@ -476,21 +476,21 @@ impl SchemeDict {
         code.starts_with('_') || code.starts_with('+') || code.starts_with('-')
     }
 
-    /// 取某词条「并击方案下优先双手并击形式、其次最少击数」的编码及其击数；未登录返回 `None`。
+    /// 取某词条「优先简码（击数最少）、其次并击/全码」的编码及其击数；未登录返回 `None`。
     ///
     /// 并击方案（`chord_algebra` 已载入）下，同一字词的字典常同时含无前缀的双手并击规范形式
-    /// 与带 `_`/`+` 前缀的单手派生形式。择优键：
-    ///   (是否单手前缀, 击数, 码长) —— 优先无前缀的双手并击形式，击数相同时取更少击数。
-    /// 非并击方案退化为「最少击数」择优（与旧行为一致）。
+    /// 与带 `_`/`+` 前缀的单手派生简码。择优键：
+    ///   (击数, 是否单手前缀, 码长) —— 优先击数最少的简码；击数相同时保留无前缀的双手并击形式
+    ///   （避免展示带手区修饰符的派生串）。非并击方案退化为「最少击数」择优（与旧行为一致）。
     /// 返回的 `strokes` 仍用 `calculate_code_strokes`（与练习统计一致）。
     fn best_code(&self, word: &str) -> Option<(String, u32)> {
         let codes = self.word_to_codes.get(word)?;
         let is_chord = self.chord_algebra.is_some();
         let best = codes.iter().min_by_key(|c| {
             (
-                // 并击方案：单手派生形式（带前缀）排在后
-                (is_chord && Self::has_hand_prefix(c)) as u8,
                 Self::calculate_code_strokes(c),
+                // 并击方案：单手派生形式（带前缀）在击数相同时排在后
+                (is_chord && Self::has_hand_prefix(c)) as u8,
                 c.len(),
             )
         })?;
@@ -1454,9 +1454,10 @@ algebra:
     }
 
     #[test]
-    fn build_code_hints_prefers_two_hand_chord_over_one_hand_derived() {
-        // T05：yoyo-pure 风格字典同时含「单手派生形式」(_/+ 前缀，逐键) 与
-        // 「双手并击形式」(无前缀、左右手混排，计 1 击)。编码提示应优先显示双手并击形式。
+    fn build_code_hints_prefers_jianma_shortest_over_full_chord() {
+        // yoyo-pure 风格字典同时含「单手派生简码」(_/+ 前缀，逐键，击数最少) 与
+        // 「双手并击形式」(无前缀、左右手混排，击数较多)。编码提示应优先显示简码
+        // （击数最少的那个），无简码（如词语 4 码）才回退到并击/全码。
         let dict_str = "---\nname: yoyo-pure\n...\n\
 的\t_d\t92123018\n的\td.O\t0\n\
 是\t_w\t60632202\n是\twCs\t0\n\
@@ -1474,14 +1475,26 @@ algebra:
         let hints = dict.build_code_hints(&words);
         let get = |w: &str| hints.iter().find(|h| h.word == w).expect("应有该词提示");
 
-        // 单字 3 码：双手并击 wCs 优先于单手 _w
-        assert_eq!(get("是").code, "wCs", "应优先双手并击 wCs 而非单手 _w");
-        // 有：双手并击 eHy 优先于单手 +e
-        assert_eq!(get("有").code, "eHy", "应优先双手并击 eHy 而非单手 +e");
-        // 就：双手并击 sE: 优先于单手 +s
-        assert_eq!(get("就").code, "sE:", "应优先双手并击 sE: 而非单手 +s");
-        // 词语 4 码：直接显示
+        // 单字：简码（单手 1 击）优先于双手并击全码（3 击）
+        assert_eq!(get("是").code, "_w", "应优先单手简码 _w 而非双手 wCs");
+        // 有：简码 +e（1 击）优先于并击 eHy（3 击）
+        assert_eq!(get("有").code, "+e", "应优先单手简码 +e 而非并击 eHy");
+        // 就：简码 +s（1 击）优先于并击 sE:（3 击）
+        assert_eq!(get("就").code, "+s", "应优先单手简码 +s 而非并击 sE:");
+        // 词语 4 码（无更短简码）：直接显示
         assert_eq!(get("可以").code, "xkhr");
+    }
+
+    #[test]
+    fn build_code_hints_jianma_is_shortest_code_tiebreak_keeps_two_hand() {
+        // 当简码与并击形式击数相同（都为 1 击）时，保留无前缀的双手并击形式作为提示，
+        // 避免展示带手区修饰符的派生串。
+        let dict_str = "---\nname: yoyo-pure\n...\n\
+山\t_a\t100\n山\ta\t0\n";
+        let mut dict = SchemeDict::parse(dict_str);
+        dict.set_chord_algebra(ChordAlgebra::default());
+        let hints = dict.build_code_hints(&["山".to_string()]);
+        assert_eq!(hints[0].code, "a", "击数相同应保留无前缀双手形式 a");
     }
 }
 

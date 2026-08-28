@@ -46,10 +46,18 @@ fn format_hint_cell(code: &str, target_width: usize) -> String {
     )
 }
 
+/// 去掉编码的手区修饰符前缀（`_` 左手 / `+` 右手 / `-` 其它），仅保留实际按键。
+///
+/// 简码（单手派生形式）与并击规范形式均可能带此前缀，提示区只展示用户真正要按的键。
+fn strip_hand_prefix(code: &str) -> &str {
+    code.strip_prefix(['_', '+', '-']).unwrap_or(code)
+}
+
 /// 内置赛文对照区双行词格：生成「提示行」字符串。
 ///
 /// `words` 为本页正文词（与 `hints` 同序），每个提示按对应词的可视列宽截断/居中，
-/// 词间以单空格分隔，使提示行与正文行（同样以单空格分词）逐词对齐。
+/// 词间以单空格分隔，使提示行与正文行（同样以单空格分词）逐词对齐。提示码会先去掉
+/// 手区修饰符前缀（如单手简码 `_b` → `b`），仅显示实际按键。
 ///
 /// `typed_mask[i]` 为真表示该词已全部正确上屏，其提示留空（仍按词宽占位，不影响对齐）。
 pub fn layout_code_hint_line(words: &[String], hints: &[CodeHint], typed_mask: &[bool]) -> String {
@@ -62,7 +70,10 @@ pub fn layout_code_hint_line(words: &[String], hints: &[CodeHint], typed_mask: &
             let code = if typed {
                 ""
             } else {
-                hints.get(i).map(|h| h.code.as_str()).unwrap_or("")
+                hints
+                    .get(i)
+                    .map(|h| strip_hand_prefix(&h.code))
+                    .unwrap_or("")
             };
             format_hint_cell(code, target)
         })
@@ -205,6 +216,21 @@ mod tests {
         let words = vec!["中".to_string()];
         let hints = vec![hint("wCsA")];
         assert_eq!(layout_code_hint_line(&words, &hints, &[]), "wC");
+    }
+
+    #[test]
+    fn layout_jianma_strips_hand_prefix_for_display() {
+        // 简码（单手派生形式）带手区修饰符 _/+/-；提示区只显示实际按键，去掉前缀。
+        // 「中」(宽2) 简码 _b → 去掉前缀 "b"，居中宽2（奇宽补右侧空格）→ "b "。
+        let words = vec!["中".to_string()];
+        let hints = vec![hint("_b")];
+        assert_eq!(layout_code_hint_line(&words, &hints, &[]), "b ");
+        // 右手简码 +e 同样去掉前缀 → "e "。
+        let hints2 = vec![hint("+e")];
+        assert_eq!(layout_code_hint_line(&words, &hints2, &[]), "e ");
+        // 无前缀并击码 wCs 不受影响（超宽截断为 2 列）。
+        let hints3 = vec![hint("wCs")];
+        assert_eq!(layout_code_hint_line(&words, &hints3, &[]), "wC");
     }
 
     #[test]
