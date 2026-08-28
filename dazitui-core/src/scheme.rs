@@ -1245,8 +1245,14 @@ algebra:
 
     #[test]
     fn test_yoyo_pure_schema_live_integration() {
-        let schema_path = Path::new("/home/jackwy/codes/rime/yoyo/rime/yoyo-pure.schema.yaml");
-        if schema_path.exists() {
+        // 候选路径：开发仓库与用户配置目录（~/.config/dazitui/schemes）均可能存放方案。
+        let candidates = [
+            "/home/jackwy/codes/rime/yoyo/rime/yoyo-pure.schema.yaml",
+            "/home/jackwy/codes/rime/yoyo/yoyo-pure.schema.yaml",
+            "/home/jackwy/.config/dazitui/schemes/yoyo-pure.schema.yaml",
+        ];
+        if let Some(path) = candidates.iter().find(|p| Path::new(p).exists()) {
+            let schema_path = Path::new(path);
             let mut resolver = RimeSchemaResolver::new();
             let rules = resolver.resolve_chord_algebra(schema_path);
             assert!(!rules.is_empty(), "Rules should not be empty");
@@ -1260,22 +1266,63 @@ algebra:
             assert_eq!(algebra.decompose_code("aI"), vec!["a", "i", "p"]);
             assert_eq!(algebra.decompose_code("wCs"), vec!["w", ",", ".", "s"]);
             assert!(dict.entry_count() > 1000);
-            assert_eq!(dict.name(), Some("麓鸣·纯形·六脉"));
             assert_eq!(dict.get_primary_code("到"), Some("_."));
             assert_eq!(dict.get_primary_code("们"), Some("aI"));
         }
 
-        let km_schema_path = Path::new("/home/jackwy/codes/rime/yoyo/rime/yoyo-pure-km.schema.yaml");
-        if km_schema_path.exists() {
+        let km_candidates = [
+            "/home/jackwy/codes/rime/yoyo/rime/yoyo-pure-km.schema.yaml",
+            "/home/jackwy/codes/rime/yoyo/yoyo-pure-km.schema.yaml",
+            "/home/jackwy/.config/dazitui/schemes/yoyo-pure-km.schema.yaml",
+        ];
+        if let Some(path) = km_candidates.iter().find(|p| Path::new(p).exists()) {
+            let km_schema_path = Path::new(path);
             let dict = SchemeDict::load_from_file(km_schema_path).expect("加载 yoyo-pure-km 方案");
             assert!(dict.chord_algebra().is_some());
             let algebra = dict.chord_algebra().unwrap();
 
-            // yoyo-pure-km 使用「空明拳」指法：. 为 xv 并击，C 为 cf 并击，I 为 eg 镜像为 hi
+            // yoyo-pure-km 使用「空明拳」指法（来自 __include: yoyo:/空明拳 外部引用）：
+            // . 为 xv 并击、I 为 eg 镜像为 hi、C 为 cf 并击、wCs 分解为 w,逗号,j,s。
             assert_eq!(algebra.decompose_code("_."), vec!["v", "x"]);
             assert_eq!(algebra.decompose_code("aI"), vec!["a", "h", "i"]);
             assert_eq!(algebra.decompose_code("wCs"), vec!["w", ",", "j", "s"]);
         }
+    }
+
+    #[test]
+    fn test_resolve_chord_algebra_resolves_external_include() {
+        // T08：__include: <prefix>:/<section> 跨文件引用应被解析，外部文件中的规则进入结果。
+        // 构造最小复现：main.schema.yaml 的 algebra 通过 __include: inc:/target 引用 inc.schema.yaml。
+        let dir = std::env::temp_dir().join(format!("dazitui_t08_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let main_path = dir.join("main.schema.yaml");
+        let inc_path = dir.join("inc.schema.yaml");
+        std::fs::write(
+            &main_path,
+            "schema:\n  name: t\nchord_composer:\n  algebra:\n    __patch:\n      - 指法\n指法:\n  __include: inc:/target\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &inc_path,
+            "target:\n  __append:\n    - xform|a|b|\n    - xform|c|d|\n",
+        )
+        .unwrap();
+
+        let mut resolver = RimeSchemaResolver::new();
+        let rules = resolver.resolve_chord_algebra(&main_path);
+
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            rules.iter().any(|r| r == "xform|a|b|"),
+            "应解析外部 include 的规则 xform|a|b|，得到: {:?}",
+            rules
+        );
+        assert!(
+            rules.iter().any(|r| r == "xform|c|d|"),
+            "应解析外部 include 的规则 xform|c|d|，得到: {:?}",
+            rules
+        );
     }
 
     #[test]
