@@ -126,29 +126,116 @@ impl SchemeDict {
             }
         }
 
-        // 构建「需追加 ' 提交符」的短码集合：仅针对「无手区前缀」的纯双拼码。
-        // 若同一字词同时含短码 c 与更长码 d（均为无前缀码）、且 d 以 c 为严格前缀
-        // （如 文化 vw⊂vwah），则 c 需键入 ' 提交候选（次选）。
-        // 单手简码（_/+ 前缀）与双手并击全码分属不同输入方式，不补 '。
-        let mut prefix_commit_codes = HashSet::new();
-        for codes in dict.word_to_codes.values() {
+        dict.rebuild_prefix_commit_codes();
+        dict
+    }
+
+    /// 提取 Rime 词典 frontmatter（`---` … `---`/`...` 之间）文本，用于解析 `import_tables` 等元信息。
+    fn extract_dict_frontmatter(content: &str) -> String {
+        let mut buf = String::new();
+        let mut in_header = false;
+        let mut opened = false;
+        for line in content.lines() {
+            let t = line.trim();
+            if t == "---" {
+                if !opened {
+                    opened = true;
+                    in_header = true;
+                    continue;
+                }
+                break;
+            }
+            if in_header {
+                if t == "..." {
+                    break;
+                }
+                buf.push_str(line);
+                buf.push('\n');
+            }
+        }
+        buf
+    }
+
+    /// 解析 Rime 词典的 `import_tables` 列表，返回被导入词典的逻辑名（如 `yoyo_kf`）。
+    fn extract_import_tables(content: &str) -> Vec<String> {
+        let fm = Self::extract_dict_frontmatter(content);
+        if fm.trim().is_empty() {
+            return Vec::new();
+        }
+        let doc = parse_rime_yaml(&fm);
+        let mut out = Vec::new();
+        if let Some(YamlValue::List(items)) = doc.get("import_tables") {
+            for it in items {
+                if let Some(s) = it.as_str() {
+                    out.push(s.to_string());
+                }
+            }
+        }
+        out
+    }
+
+    /// 递归加载词典及其 `import_tables` 引用的兄弟词典，合并词条。
+    ///
+    /// `visited` 用规范路径去重，避免循环导入导致无限递归。导入文件缺失时静默跳过
+    /// （与 Rime 宽松语义一致），不影响主词典已收录的词条。
+    fn load_dict_with_imports(
+        path: &Path,
+        visited: &mut HashSet<PathBuf>,
+    ) -> io::Result<Self> {
+        let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        if visited.contains(&canon) {
+            return Ok(Self::default());
+        }
+        visited.insert(canon);
+
+        let content = std::fs::read_to_string(path)?;
+        let mut dict = Self::parse(&content);
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        for name in Self::extract_import_tables(&content) {
+            let import_path = parent.join(format!("{name}.dict.yaml"));
+            if import_path.exists() {
+                if let Ok(child) = Self::load_dict_with_imports(&import_path, visited) {
+                    dict.merge(&child);
+                }
+            }
+        }
+        Ok(dict)
+    }
+
+    /// 将 `other` 的词条合并进自身：相同词的编码列表追加尚未存在的编码（去重）。
+    fn merge(&mut self, other: &Self) {
+        for (word, codes) in &other.word_to_codes {
+            let entry = self.word_to_codes.entry(word.clone()).or_default();
+            for c in codes {
+                if !entry.contains(c) {
+                    entry.push(c.clone());
+                }
+            }
+        }
+        self.rebuild_prefix_commit_codes();
+    }
+
+    /// 依据当前 `word_to_codes` 重建「需追加 `'` 提交符」的短码集合：
+    /// 仅针对「无手区前缀」的纯双拼码；若同一字词同时含短码 c 与更长码 d（均为无前缀码）、
+    /// 且 d 以 c 为严格前缀（如 文化 `vw`⊂`vwah`），则 c 需键入 `'` 提交候选（次选）。
+    /// 单手简码（`_`/`+` 前缀）与双手并击全码分属不同输入方式，不补 `'`。
+    fn rebuild_prefix_commit_codes(&mut self) {
+        let mut set = HashSet::new();
+        for codes in self.word_to_codes.values() {
             let unprefixed: Vec<&str> = codes
                 .iter()
-                .filter(|c| {
-                    !c.starts_with('_') && !c.starts_with('+') && !c.starts_with('-')
-                })
+                .filter(|c| !c.starts_with('_') && !c.starts_with('+') && !c.starts_with('-'))
                 .map(|c| c.as_str())
                 .collect();
             for &ci in &unprefixed {
                 for &cj in &unprefixed {
                     if ci.len() < cj.len() && cj.starts_with(ci) {
-                        prefix_commit_codes.insert(ci.to_string());
+                        set.insert(ci.to_string());
                     }
                 }
             }
         }
-        dict.prefix_commit_codes = prefix_commit_codes;
-        dict
+        self.prefix_commit_codes = set;
     }
 
     /// 获取关联的并击代数指法规则引擎。
@@ -199,8 +286,8 @@ impl SchemeDict {
             candidate_dicts.push(parent_dir.join(format!("{schema_stem}.txt")));
 
             let mut dict = if let Some(dict_path) = candidate_dicts.into_iter().find(|p| p.exists()) {
-                let content = std::fs::read_to_string(dict_path)?;
-                Self::parse(&content)
+                let mut visited = HashSet::new();
+                Self::load_dict_with_imports(&dict_path, &mut visited)?
             } else {
                 Self::default()
             };
@@ -214,15 +301,9 @@ impl SchemeDict {
             return Ok(dict);
         }
 
-        // 加载词典文本
-        let file = File::open(path)?;
-        let reader = BufReader::new(file);
-        let mut content = String::new();
-        for line in reader.lines() {
-            content.push_str(&line?);
-            content.push('\n');
-        }
-        let mut dict = Self::parse(&content);
+        // 加载词典文本（含 import_tables 导入的兄弟词典合并）
+        let mut visited = HashSet::new();
+        let mut dict = Self::load_dict_with_imports(path, &mut visited)?;
 
         // 尝试自动绑定同目录同名 schema.yaml
         let stem = if file_name.ends_with(".dict.yaml") {
@@ -1177,6 +1258,38 @@ mod tests {
         assert_eq!(dict.get_primary_code("为"), Some("O<O"));
         assert_eq!(dict.get_primary_code("就"), Some("sE:"));
     }
+
+    #[test]
+    fn test_import_tables_merges_sibling_dict() {
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!("dazitui_import_test_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let main_path = dir.join("main.dict.yaml");
+        let sub_path = dir.join("sub.dict.yaml");
+
+        // 主词典引用 sub，且自身不含「文化遗产」词条
+        let main = "---\nname: main\nimport_tables:\n  - sub\n...\n\n文\tvw\t100\n化\tah\t100\n";
+        // 被导入词典含整词「文化遗产」与单字「遗/产」
+        let sub = "遗\tBGp\t100\n产\tCy\t100\n文化遗产\tvaBC\t100\n";
+        fs::write(&main_path, main).unwrap();
+        fs::write(&sub_path, sub).unwrap();
+
+        let mut visited = std::collections::HashSet::new();
+        let dict = SchemeDict::load_dict_with_imports(&main_path, &mut visited).unwrap();
+
+        // 主词典词条保留
+        assert_eq!(dict.get_primary_code("文"), Some("vw"));
+        // 导入词典词条合并进来
+        assert_eq!(dict.get_primary_code("遗"), Some("BGp"));
+        assert_eq!(dict.get_primary_code("产"), Some("Cy"));
+        // 整词「文化遗产」来自被导入词典，不再退化为逐字拼接
+        let hints = dict.build_code_hints(&["文化遗产".to_string()]);
+        assert_eq!(hints[0].code, "vaBC");
+        assert!(!hints[0].is_oov);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
 
     #[test]
     fn test_yaml_parser_basic_mapping_and_list() {
