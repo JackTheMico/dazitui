@@ -17,7 +17,9 @@ pub use db::{
     MistypedCharStat, MistypedWordStat, SessionRecord, StatsDb,
 };
 pub use lttb::lttb_downsample;
-pub use code_hint::{layout_code_hint_grid, layout_code_hint_line, pack_words_by_width};
+pub use code_hint::{
+    HintCell, HintHand, layout_code_hint_grid, layout_code_hint_line, pack_words_by_width,
+};
 pub use scheme::{ChordAlgebra, CodeHint, RimeSchemaResolver, SchemeDict, YamlValue, parse_rime_yaml};
 pub use segmenter::{WordIndex, WordToken, prewarm_segmenter};
 pub use session::{CharStatus, ErrorPoint, ErrorType, GROUP_SIZE, Session, Stats, TypeResult};

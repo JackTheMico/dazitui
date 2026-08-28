@@ -14,7 +14,8 @@ use dazitui_core::{
     CodeHint, CompetitionType, DbTask, DbWorker,
     ErrorRecordItem, ErrorType, HeatmapLayout, KeyboardMode, KeypressRecordItem, LoadError,
     LoadOptions, Rgb, SchemeDict, Session, SessionRecord, Settings, SettingsStore, Stats, StatsDb,
-    Text, TextSource, Theme, TokenStore, layout_code_hint_line, pack_words_by_width,
+    Text, TextSource, Theme, TokenStore, HintCell, HintHand, layout_code_hint_line,
+    pack_words_by_width,
     env_credentials,
     format_stats_share_text, format_time, key_accuracy_pct, word_ratio_pct,
     is_auth_failure, load_builtin_text, load_builtin_text_shuffled, load_text_from_clipboard,
@@ -6262,8 +6263,31 @@ fn code_hint_overlay_line(
         typed_mask.push(all_correct);
     }
     let hints: Vec<CodeHint> = dict.build_code_hints(&words);
-    let hint_str = layout_code_hint_line(&words, &hints, &typed_mask);
-    Some(Line::from(hint_str).fg(color(theme.muted)))
+    let cells = layout_code_hint_line(&words, &hints, &typed_mask);
+    Some(code_hint_line_from_cells(&cells, theme))
+}
+
+/// 将提示单元（已去皮手区前缀、携手区归属）拼为带色 `Line`：
+/// 左手粉、右手黄，其余（双手并击/已打/未登录）用 muted。
+fn code_hint_line_from_cells(cells: &[HintCell], theme: Theme) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(cells.len() * 2);
+    for (i, cell) in cells.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::styled(cell.text.clone(), code_hint_hand_style(cell.hand, theme)));
+    }
+    Line::from(spans)
+}
+
+/// 遍码提示单元的手区配色：左手粉、右手黄；其余（双手并击/已打/未登录）用 muted。
+fn code_hint_hand_style(hand: HintHand, theme: Theme) -> Style {
+    let c = match hand {
+        HintHand::Left => Color::Rgb(244, 114, 182), // 粉
+        HintHand::Right => Color::Rgb(250, 204, 21),  // 黄
+        _ => color(theme.muted),
+    };
+    Style::default().fg(c)
 }
 
 /// 非内置长文（离线/自由/剪贴板/在线）开启遍码提示时，按词边界锁步折行渲染「双行词格」。
@@ -6338,8 +6362,8 @@ fn code_hint_grid_text(
         let row_words: Vec<String> = row.iter().map(|&i| words[i].clone()).collect();
         let row_hints: Vec<CodeHint> = row.iter().map(|&i| hints[i].clone()).collect();
         let row_typed: Vec<bool> = row.iter().map(|&i| typed_mask[i]).collect();
-        let hint_str = layout_code_hint_line(&row_words, &row_hints, &row_typed);
-        text_lines.push_line(Line::from(hint_str).fg(color(theme.muted)));
+        let cells = layout_code_hint_line(&row_words, &row_hints, &row_typed);
+        text_lines.push_line(code_hint_line_from_cells(&cells, theme));
 
         // 正文行：本行词单元按跟打状态着色（每词间单空格分隔，与提示行锁步）。
         let mut spans: Vec<Span<'static>> = Vec::new();
@@ -8121,8 +8145,11 @@ mod tests {
             rendered.contains("lgy"),
             "提示行应含首词「中国」的编码 lgy，得到: {rendered:?}"
         );
-        // 提示行为单行（与正文行逐词对齐，不自动折行）
-        assert_eq!(line.spans.len(), 1, "提示行应为单行");
+        // 提示行为单行（与正文行逐词对齐，不自动折行）：不含换行符。
+        assert!(
+            !line.spans.iter().any(|s| s.content.contains('\n')),
+            "提示行应为单行（无换行）"
+        );
 
         // 未配置方案时不生成提示行
         assert!(
