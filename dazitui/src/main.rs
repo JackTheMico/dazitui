@@ -3149,9 +3149,9 @@ fn ui(frame: &mut Frame, app: &App) {
         }
 
         let is_builtin = matches!(app.text.source, TextSource::Builtin { .. });
-        // 非内置长文 + 开启提示 + 已配置方案：走双行词格（按词边界锁步折行）路径。
-        let use_code_hint_grid =
-            app.settings.code_hint && !is_builtin && app.scheme_dict.is_some();
+        let dict_ok = code_hint_dict_usable(app.scheme_dict.as_ref());
+        // 非内置长文 + 开启提示 + 已配置可用词典：走双行词格（按词边界锁步折行）路径。
+        let use_code_hint_grid = app.settings.code_hint && !is_builtin && dict_ok;
 
         let ref_inner_width = ref_area.width.saturating_sub(2);
         let ref_inner_height = ref_area.height.saturating_sub(2);
@@ -3187,15 +3187,22 @@ fn ui(frame: &mut Frame, app: &App) {
         } else {
             original_line(&app.session, &app.text, app.theme(), app.settings.bold)
         };
-        // 遍码提示（编码提示）：内置词组赛文在正文行之上插入单行提示（单页，由 Paragraph 按词宽折行）。
+        // 遍码提示（编码提示）：开启时，有可用词典走正常提示路径，否则显示占位引导。
         if app.settings.code_hint {
-            if let Some(hint_line) = code_hint_overlay_line(
-                &app.session,
-                &app.text,
-                app.scheme_dict.as_ref(),
-                app.theme(),
-            ) {
-                ref_text.lines.insert(0, hint_line);
+            if dict_ok {
+                // 内置词组赛文：正文行之上插入单行提示（单页，由 Paragraph 按词宽折行）。
+                if let Some(hint_line) = code_hint_overlay_line(
+                    &app.session,
+                    &app.text,
+                    app.scheme_dict.as_ref(),
+                    app.theme(),
+                ) {
+                    ref_text.lines.insert(0, hint_line);
+                }
+            } else {
+                // 无可用词典（未配置或仅 .schema.yaml 规则无 .dict.yaml 词条）：
+                // 对照区顶部显示占位提示，不空白、不崩溃。
+                ref_text.lines.insert(0, code_hint_placeholder_line(app.theme()));
             }
         }
         frame.render_widget(
@@ -6360,6 +6367,20 @@ fn code_hint_grid_text(
     Some(text_lines)
 }
 
+/// 当前方案是否具备可用词典（用于遍码提示）：须已载入且含至少一个词条。
+///
+/// `None`（未配置方案）或仅 `.schema.yaml` 规则而无 `.dict.yaml` 词条（`entry_count()==0`）
+/// 均视为无可用词典，此时应显示占位提示而非空白/崩溃。
+fn code_hint_dict_usable(dict: Option<&SchemeDict>) -> bool {
+    dict.is_some_and(|d| d.entry_count() > 0)
+}
+
+/// 遍码提示开启但方案无可用词典时，对照区顶部显示的占位提示（引导用户载入词典）。
+fn code_hint_placeholder_line(theme: Theme) -> Line<'static> {
+    Line::from("遍码提示：未配置方案词典（请在设置中载入含词条的 .dict.yaml）")
+        .fg(color(theme.muted))
+}
+
 /// 跟打区：将当前页指定数量词的已打字符按对/错着色，词间插入空格 span。
 fn build_word_type_spans(
     display: &[(char, CharStatus)],
@@ -8253,6 +8274,42 @@ mod tests {
     }
 
     #[test]
+    fn code_hint_dict_usable_detects_none_and_empty() {
+        // T07：未配置方案（None）或仅 .schema.yaml 规则无 .dict.yaml 词条（entry_count==0）
+        // 均视为无可用词典，应显示占位而非空白/崩溃。
+        assert!(
+            !code_hint_dict_usable(None),
+            "未配置方案应视为无可用词典"
+        );
+        let empty = SchemeDict::parse("");
+        assert_eq!(empty.entry_count(), 0);
+        assert!(
+            !code_hint_dict_usable(Some(&empty)),
+            "空词典（无词条）应视为无可用词典"
+        );
+        let real = SchemeDict::parse("中国\tlgy\n中\tk\n");
+        assert!(real.entry_count() > 0);
+        assert!(
+            code_hint_dict_usable(Some(&real)),
+            "含词条的词典应可用"
+        );
+    }
+
+    #[test]
+    fn code_hint_placeholder_shows_guide_text() {
+        // T07：无可用词典时，对照区提示区应显示明确占位（提及词典并引导配置/载入）。
+        let theme = Theme::preset(ThemePreset::CatppuccinMocha);
+        let line = code_hint_placeholder_line(theme);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("词典"), "占位应提及词典，得到: {:?}", text);
+        assert!(
+            text.contains("未配置") || text.contains("未载入") || text.contains("未加载"),
+            "占位应引导配置/载入词典，得到: {:?}",
+            text
+        );
+    }
+
+    #[test]
     fn original_line_word_set_advances_page_after_10_words() {
         // 词组赛文对照区：10 个词全对后翻到第 2 组，显示第 11-20 词。
         let theme = Theme::preset(ThemePreset::CatppuccinMocha);
@@ -8531,7 +8588,7 @@ mod tests {
         let lines = upload_lines(
             &UploadState::Success {
                 ranking: Some("5".into()),
-                share_text: "极速杯 第5名 · WPM 85.2".into(),
+                share_text: "极速杯 第5名《极速杯第100期》 · 🚀WPM 85.2 · ⌨️击键 3.5 · 📏码长 2.8 · ✅正确字数 40/40 · ❌错字 0 · ↩️回改 1 · 🔢键数 140 · 🎯键准 97.29% · 💬打词率 0.00% · ⏱️用时 01:25.230 · 虎码 🖥️dazitui".into(),
             },
             theme,
         );
@@ -9127,7 +9184,7 @@ mod tests {
             stats: app.session.finish(Duration::from_secs(4)),
             upload: UploadState::Success {
                 ranking: Some("5".into()),
-                share_text: "极速杯 第5名 · WPM 85.2 · 击键 3.5 · 码长 2.8".into(),
+                share_text: "极速杯 第5名《极速杯第100期》 · 🚀WPM 85.2 · ⌨️击键 3.5 · 📏码长 2.8 · ✅正确字数 40/40 · ❌错字 0 · ↩️回改 1 · 🔢键数 140 · 🎯键准 97.29% · 💬打词率 0.00% · ⏱️用时 01:25.230 · 虎码 🖥️dazitui".into(),
             },
             elapsed: Duration::from_secs(4),
         };
