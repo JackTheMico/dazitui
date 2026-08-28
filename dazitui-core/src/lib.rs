@@ -491,10 +491,43 @@ fn input_method_suffix(input_method: &str) -> String {
     }
 }
 
+/// 52dazi 官方键准（击键准确率）百分比：
+/// `(总击数 - 退格数 - 回改次数 * 码长) / 总击数 * 100`，与 `online/share.rs` 上传字段口径一致。
+/// 退格数优先取按键频率中的 `Backspace`，回退到回改次数。
+pub fn key_accuracy_pct(stats: &Stats) -> f64 {
+    let total_keys: u32 = stats.key_frequency.iter().map(|(_, n)| n).sum();
+    let backspace: u32 = stats
+        .key_frequency
+        .iter()
+        .find(|(k, _)| k == "Backspace")
+        .map(|(_, n)| *n)
+        .unwrap_or(stats.edits);
+    let strokes = if stats.total_strokes > 0 {
+        stats.total_strokes
+    } else {
+        total_keys
+    };
+    if stats.typed_chars == 0 || strokes == 0 {
+        return 0.0;
+    }
+    let wasted_keys = backspace as f64 + (stats.edits as f64) * stats.key_length;
+    let valid_keys = (strokes as f64 - wasted_keys).max(0.0);
+    ((valid_keys / strokes as f64) * 100.0).clamp(0.0, 100.0)
+}
+
+/// 52dazi 官方打词率百分比：`打词字符数 / 赛文总字数 * 100`。
+pub fn word_ratio_pct(text: &Text, stats: &Stats) -> f64 {
+    let total_chars = text.content.chars().count();
+    if total_chars == 0 {
+        return 0.0;
+    }
+    (stats.phrase_chars as f64 / total_chars as f64 * 100.0).clamp(0.0, 100.0)
+}
+
 /// 把非在线跟打的统计结果格式化为单行分享文本（自由发文/离线赛文完成后复制到剪贴板）。
 ///
-/// 格式：`<来源>《<标题>》 · WPM 85.2 · 击键 3.5 · 码长 2.8 · 正确字数 40/42 · 错字 3 · 用时 01:25.230 · <输入法>`；
-/// `input_method` 为空时省略末尾输入法段。
+/// 每个指标前加 emoji，并补充 回改 / 键数 / 键准 / 打词率；
+/// 末尾保留输入法名并固定追加设备 `🖥️dazitui`。
 pub fn format_stats_share_text(
     text: &Text,
     stats: &Stats,
@@ -509,8 +542,16 @@ pub fn format_stats_share_text(
         TextSource::Online { competition_type } => competition_type.name(),
     };
     let total_chars = text.content.chars().count();
+    let strokes = if stats.total_strokes > 0 {
+        stats.total_strokes
+    } else {
+        stats.key_frequency.iter().map(|(_, n)| n).sum()
+    };
+    let accuracy = key_accuracy_pct(stats);
+    let word_ratio = word_ratio_pct(text, stats);
+    let device_suffix = format!("{}{}", input_method_suffix(input_method), " 🖥️dazitui");
     format!(
-        "{source}《{}》 · WPM {:.1} · 击键 {:.1} · 码长 {:.1} · 正确字数 {}/{} · 错字 {} · 用时 {}{}",
+        "{source}《{}》 · 🚀WPM {:.1} · ⌨️击键 {:.1} · 📏码长 {:.1} · ✅正确字数 {}/{} · ❌错字 {} · ↩️回改 {} · 🔢键数 {} · 🎯键准 {:.2}% · 💬打词率 {:.2}% · ⏱️用时 {}{}",
         text.title,
         stats.wpm,
         stats.kps,
@@ -518,8 +559,12 @@ pub fn format_stats_share_text(
         stats.correct_chars,
         total_chars,
         stats.wrong_total,
+        stats.edits,
+        strokes,
+        accuracy,
+        word_ratio,
         format_time(elapsed),
-        input_method_suffix(input_method)
+        device_suffix
     )
 }
 
@@ -1023,7 +1068,7 @@ mod tests {
         let s = format_stats_share_text(&text, &stats, Duration::from_secs_f64(85.23), "虎码");
         assert_eq!(
             s,
-            "离线赛文《背影节选》 · WPM 85.2 · 击键 3.5 · 码长 2.8 · 正确字数 3/4 · 错字 1 · 用时 01:25.230 · 虎码"
+            "离线赛文《背影节选》 · 🚀WPM 85.2 · ⌨️击键 3.5 · 📏码长 2.8 · ✅正确字数 3/4 · ❌错字 1 · ↩️回改 0 · 🔢键数 140 · 🎯键准 100.00% · 💬打词率 0.00% · ⏱️用时 01:25.230 · 虎码 🖥️dazitui"
         );
     }
 
@@ -1040,7 +1085,7 @@ mod tests {
         let s = format_stats_share_text(&text, &stats, Duration::from_secs(60), "");
         assert_eq!(
             s,
-            "自由发文《日常练习》 · WPM 85.2 · 击键 3.5 · 码长 2.8 · 正确字数 3/4 · 错字 1 · 用时 01:00.000"
+            "自由发文《日常练习》 · 🚀WPM 85.2 · ⌨️击键 3.5 · 📏码长 2.8 · ✅正确字数 3/4 · ❌错字 1 · ↩️回改 0 · 🔢键数 140 · 🎯键准 100.00% · 💬打词率 0.00% · ⏱️用时 01:00.000 🖥️dazitui"
         );
     }
 }

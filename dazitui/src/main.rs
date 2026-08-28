@@ -14,6 +14,7 @@ use dazitui_core::{
     ErrorRecordItem, ErrorType, HeatmapLayout, KeyboardMode, KeypressRecordItem, LoadError,
     LoadOptions, Rgb, SchemeDict, Session, SessionRecord, Settings, SettingsStore, Stats, StatsDb,
     Text, TextSource, Theme, TokenStore, env_credentials, format_stats_share_text, format_time,
+    key_accuracy_pct, word_ratio_pct,
     is_auth_failure, load_builtin_text, load_builtin_text_shuffled, load_text_from_clipboard,
     load_text_from_file, load_text_from_string, lttb_downsample, osc52_clipboard,
     prewarm_segmenter, save_text_to_file,
@@ -2700,9 +2701,16 @@ fn write_clipboard(text: &str) {
     let _ = crossterm::execute!(std::io::stdout(), Print(seq));
 }
 
-/// 完成后自动复制统计结果到剪贴板的赛文来源：自由发文与离线赛文。
+/// 完成后自动复制统计结果到剪贴板的赛文来源：全部赛文来源。
 fn copies_stats_to_clipboard(source: TextSource) -> bool {
-    matches!(source, TextSource::Custom | TextSource::File)
+    matches!(
+        source,
+        TextSource::Custom
+            | TextSource::File
+            | TextSource::Builtin { .. }
+            | TextSource::Online { .. }
+            | TextSource::Clipboard
+    )
 }
 
 /// 焦点在设置项间循环移动（向上为负、向下为正）。
@@ -5391,23 +5399,30 @@ fn render_result_view(
     );
 
     // 1. 顶部成绩摘要
+    let strokes = if stats.total_strokes > 0 {
+        stats.total_strokes
+    } else {
+        stats.key_frequency.iter().map(|(_, n)| n).sum()
+    };
+    let accuracy = key_accuracy_pct(stats);
+    let word_ratio = word_ratio_pct(&app.text, stats);
     let mut summary_lines = vec![Line::from(vec![
-        Span::raw(" WPM: "),
+        Span::raw(" 🚀WPM: "),
         Span::styled(
             format!("{:.1}", stats.wpm),
             Style::default().bold().fg(palette.accent),
         ),
-        Span::raw("   击键: "),
+        Span::raw("   ⌨️击键: "),
         Span::styled(
             format!("{:.2}", stats.kps),
             Style::default().bold().fg(palette.accent),
         ),
-        Span::raw("   码长: "),
+        Span::raw("   📏码长: "),
         Span::styled(
             format!("{:.2}", stats.key_length),
             Style::default().bold().fg(palette.success),
         ),
-        Span::raw("   正确字数: "),
+        Span::raw("   ✅正确字数: "),
         Span::styled(
             format!(
                 "{}/{}",
@@ -5416,7 +5431,7 @@ fn render_result_view(
             ),
             Style::default().bold().fg(palette.success),
         ),
-        Span::raw("   错字: "),
+        Span::raw("   ❌错字: "),
         Span::styled(
             format!(
                 "{} (不一致 {} + 回改 {})",
@@ -5428,7 +5443,27 @@ fn render_result_view(
                 palette.success
             }),
         ),
-        Span::raw("   用时: "),
+        Span::raw("   ↩️回改: "),
+        Span::styled(
+            format!("{}", stats.edits),
+            Style::default().bold().fg(palette.fg),
+        ),
+        Span::raw("   🔢键数: "),
+        Span::styled(
+            format!("{}", strokes),
+            Style::default().bold().fg(palette.fg),
+        ),
+        Span::raw("   🎯键准: "),
+        Span::styled(
+            format!("{:.2}%", accuracy),
+            Style::default().bold().fg(palette.accent),
+        ),
+        Span::raw("   💬打词率: "),
+        Span::styled(
+            format!("{:.2}%", word_ratio),
+            Style::default().bold().fg(palette.accent),
+        ),
+        Span::raw("   ⏱️用时: "),
         Span::styled(format_time(elapsed), Style::default().bold().fg(palette.fg)),
     ])];
     if !stats.edit_details.is_empty() {
@@ -5830,11 +5865,9 @@ fn upload_lines(upload: &UploadState, theme: Theme) -> Vec<Line<'static>> {
     match upload {
         UploadState::NotApplicable { copied_stats } => match copied_stats {
             None => vec![],
-            Some(stats_text) => vec![
-                Line::from(""),
-                Line::from(format!(" 统计: {stats_text}")).fg(color(theme.accent)),
-                Line::from(" 已复制到剪贴板").fg(color(theme.muted)),
-            ],
+            // 顶部摘要已完整展示各项指标（含 emoji），整段分享文本仅复制到剪贴板，
+            // 此处不再重复展示，只保留「已复制」提示。
+            Some(_) => vec![Line::from(" 已复制到剪贴板").fg(color(theme.muted))],
         },
         UploadState::Uploading => vec![
             Line::from(""),
@@ -7816,7 +7849,8 @@ mod tests {
         let theme = Theme::preset(ThemePreset::CatppuccinMocha);
         // 离线未复制：不显示上传状态。
         assert!(upload_lines(&UploadState::NotApplicable { copied_stats: None }, theme).is_empty());
-        // 离线已复制统计（自由发文/离线赛文）：统计行 + 已复制提示。
+        // 离线已复制统计（自由发文/离线赛文）：不再重复展示整段统计文本（顶部摘要已含），
+        // 仅保留「已复制到剪贴板」提示。
         let lines = upload_lines(
             &UploadState::NotApplicable {
                 copied_stats: Some("自由发文《日常》 · WPM 85.2".into()),
@@ -7824,7 +7858,7 @@ mod tests {
             theme,
         );
         let text: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
-        assert!(text.iter().any(|s| s.contains("统计: 自由发文《日常》")));
+        assert!(!text.iter().any(|s| s.contains("统计: 自由发文《日常》")));
         assert!(text.iter().any(|s| s.contains("已复制到剪贴板")));
         // 上传中。
         let lines = upload_lines(&UploadState::Uploading, theme);
@@ -8032,16 +8066,16 @@ mod tests {
                 ..
             } if s.starts_with("自由发文《随笔》")
         ));
-        // 内置/剪贴板来源：不复制。
+        // 内置/剪贴板来源：复制统计结果。
         let mut app = test_app(builtin_text("你好"));
         app.session.type_text("你好");
         app.finish_typing();
         assert!(matches!(
             &app.state,
             AppState::Finished {
-                upload: UploadState::NotApplicable { copied_stats: None },
+                upload: UploadState::NotApplicable { copied_stats: Some(s) },
                 ..
-            }
+            } if s.starts_with("常用单字前五百") && s.contains("WPM")
         ));
         let mut app = test_app(Text {
             title: "剪贴板赛文".into(),
@@ -8055,9 +8089,9 @@ mod tests {
         assert!(matches!(
             &app.state,
             AppState::Finished {
-                upload: UploadState::NotApplicable { copied_stats: None },
+                upload: UploadState::NotApplicable { copied_stats: Some(s) },
                 ..
-            }
+            } if s.starts_with("剪贴板") && s.contains("WPM")
         ));
         // 在线：进入成绩视图并置为「上传中」，返回成绩与用时。
         let mut app = test_app(online_text("你好"));
@@ -8076,11 +8110,11 @@ mod tests {
     fn copies_stats_to_clipboard_scopes_to_custom_and_file() {
         assert!(copies_stats_to_clipboard(TextSource::File));
         assert!(copies_stats_to_clipboard(TextSource::Custom));
-        assert!(!copies_stats_to_clipboard(TextSource::Clipboard));
-        assert!(!copies_stats_to_clipboard(TextSource::Builtin {
+        assert!(copies_stats_to_clipboard(TextSource::Clipboard));
+        assert!(copies_stats_to_clipboard(TextSource::Builtin {
             set: BUILTIN_SETS[0]
         }));
-        assert!(!copies_stats_to_clipboard(TextSource::Online {
+        assert!(copies_stats_to_clipboard(TextSource::Online {
             competition_type: CompetitionType::Jisu
         }));
     }
@@ -8407,14 +8441,15 @@ mod tests {
 
     #[test]
     fn render_result_view_shows_copied_stats_feedback() {
-        // 离线赛文完成后：成绩视图应显示「统计: …」与「已复制到剪贴板」反馈行。
+        // 离线赛文完成后：成绩视图不再重复展示整段统计文本（顶部摘要已含），
+        // 但应保留「已复制到剪贴板」反馈行。
         let mut app = test_app(file_text("你好世界"));
         app.session.type_text_at("你", Duration::from_secs(1));
         app.session.type_text_at("好", Duration::from_secs(2));
         app.finish_typing();
 
         let content = render_buffer_text(&app, 100, 30);
-        assert!(content.contains("统计:离线赛文《t》"), "应显示统计分享文本");
+        assert!(!content.contains("统计:离线赛文《t》"), "不应重复展示整段统计文本");
         assert!(content.contains("已复制到剪贴板"), "应显示已复制提示");
     }
 
