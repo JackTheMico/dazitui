@@ -4372,21 +4372,6 @@ fn render_wpm_trend_tab(
         ),
     ]);
 
-    if history_points.is_empty() {
-        let empty_msg = vec![
-            Line::from(""),
-            Line::from(Span::styled(
-                " 暂无有效跟打历史记录。完成跟打练习并进入成绩视图后，系统将在此自动绘制速度演进折线图与平滑趋势线。",
-                Style::default().fg(palette.muted),
-            )),
-        ];
-        frame.render_widget(
-            Paragraph::new(empty_msg).block(themed_block(palette, true).title(chart_title)),
-            chart_area,
-        );
-        return;
-    }
-
     let mut raw_points: Vec<(f64, f64)> = history_points
         .iter()
         .enumerate()
@@ -4491,6 +4476,22 @@ fn render_wpm_trend_tab(
         );
 
     frame.render_widget(chart, chart_area);
+
+    // 无历史数据时坐标轴（含单位标题）仍应渲染；在绘图区居中提示用户，不覆盖块标题。
+    if history_points.is_empty() {
+        let [_, center, _] = Layout::vertical([
+            Constraint::Min(0),
+            Constraint::Length(2),
+            Constraint::Min(0),
+        ])
+        .areas(chart_area);
+        let empty_msg = Paragraph::new(Line::from(Span::styled(
+            "暂无有效跟打历史记录。完成跟打练习后，系统将在此自动绘制速度演进折线图。",
+            Style::default().fg(palette.muted),
+        )))
+        .alignment(ratatui::layout::Alignment::Center);
+        frame.render_widget(empty_msg, center);
+    }
 }
 
 /// Tab 2: 键位热力图分析（标准斜列 ANSI 60% 与直列矩阵 4x12 切换，方案反查与物理击键切换，对数平滑着色）。
