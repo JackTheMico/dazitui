@@ -119,7 +119,7 @@ resultPostData: function(t, e, a) {
 | **持久化设置 (`settings.rs`)** | 目前包含 `theme`, `reference_ratio`, `bold`, `font` | 包含 `input_method`（或 `input_method_name`） |
 | **设置存储文件** | `~/.config/dazitui/settings` (极简 key=value 格式) | IndexedDB (key=value/json) |
 | **设置视图 (`main.rs`)** | 目前有 4 个焦点项（主题/占比/粗体/字体） | 成绩设置中可配置输入法 |
-| **剪贴板分享 (`share.rs`)** | `format_share_text` 包含 速度/击键/码长 | 可选包含输入法名称 |
+| **剪贴板分享 (`lib.rs`)** | `format_stats_share_text` 统一富格式，含 速度/击键/码长/正确字数/错字/回改/键数/键准/打词率/用时，在线比赛额外追加排名 | 可选包含输入法名称 |
 
 ---
 
@@ -157,7 +157,7 @@ resultPostData: function(t, e, a) {
   - 方案 B（完整交互）：在 Settings 视图中按 Enter/编辑键弹窗或进入行编辑模式，输入法名称可直接在 TUI 中输入/修改并即时保存。
 
 #### 4) 剪贴板分享文本（可选联动）
-- `format_share_text` 可在有配置 `input_method` 时附加展示（如 `极速杯 第5名 · WPM 85.2 · 击键 3.5 · 码长 2.8 · 虎码`）。
+- `format_stats_share_text` 统一所有来源（离线/自由发文/剪贴板/内置/在线比赛）的复制文本口径，在线比赛上传成功时额外在来源名后追加排名（如 `极速杯 第5名《...》 · 🚀WPM 85.2 · ... · 🎯键准 97.29% · ... · 虎码 🖥️dazitui`）。
 
 ---
 

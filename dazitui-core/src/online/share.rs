@@ -5,7 +5,7 @@ use std::time::Duration;
 use base64::Engine;
 use serde_json::Value;
 
-use crate::{Stats, Text, TextSource, format_time, input_method_suffix};
+use crate::{Stats, Text, format_time};
 
 /// 52dazi.cn 上传字段。
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -41,33 +41,6 @@ pub fn to_upload_stats(stats: &Stats, elapsed: Duration) -> UploadStats {
         keystrokes,
         key_length,
     }
-}
-
-/// 分享文本：`极速杯 第5名 · WPM 85.2 · 击键 3.5 · 码长 2.8`。
-///
-/// `rank` 为 `None` 时省略排名（如离线赛文）。
-/// `input_method` 非空时在末尾追加 ` · <输入法>`。
-pub fn format_share_text(
-    source: &TextSource,
-    rank: Option<u32>,
-    stats: &UploadStats,
-    input_method: &str,
-) -> String {
-    let name = match source {
-        TextSource::File => "本地",
-        TextSource::Custom => "自由发文",
-        TextSource::Clipboard => "剪贴板",
-        TextSource::Builtin { set } => set.name(),
-        TextSource::Online { competition_type } => competition_type.name(),
-    };
-    let rank_part = rank.map(|r| format!(" 第{r}名")).unwrap_or_default();
-    format!(
-        "{name}{rank_part} · WPM {:.1} · 击键 {:.1} · 码长 {:.1}{}",
-        stats.speed,
-        stats.keystrokes,
-        stats.key_length,
-        input_method_suffix(input_method)
-    )
 }
 
 /// 构造 52dazi.cn 上传请求体（业务字段，公共字段由 `client.upload_result` 自动合并）。
@@ -145,7 +118,7 @@ pub fn osc52_clipboard(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::CompetitionType;
+    use crate::{CompetitionType, TextSource};
 
     fn sample_stats() -> Stats {
         Stats {
@@ -191,32 +164,6 @@ mod tests {
         stats.typed_chars = 0;
         let up = to_upload_stats(&stats, Duration::from_secs(10));
         assert_eq!(up.key_length, 0.0);
-    }
-
-    #[test]
-    fn share_text_formats_full_line() {
-        let up = UploadStats {
-            speed: 85.2,
-            keystrokes: 3.5,
-            key_length: 2.8,
-        };
-        let source = TextSource::Online {
-            competition_type: CompetitionType::Jisu,
-        };
-        let text = format_share_text(&source, Some(5), &up, "");
-        assert_eq!(text, "极速杯 第5名 · WPM 85.2 · 击键 3.5 · 码长 2.8");
-    }
-
-    #[test]
-    fn share_text_omits_rank_when_none() {
-        let up = UploadStats {
-            speed: 85.2,
-            keystrokes: 3.5,
-            key_length: 2.8,
-        };
-        let source = TextSource::File;
-        let text = format_share_text(&source, None, &up, "");
-        assert_eq!(text, "本地 · WPM 85.2 · 击键 3.5 · 码长 2.8");
     }
 
     #[test]
@@ -398,32 +345,6 @@ mod tests {
         assert_eq!(seq, "\x1b]52;c;5L2g5aW9\x07");
         // 空文本也是合法序列
         assert_eq!(osc52_clipboard(""), "\x1b]52;c;\x07");
-    }
-
-    #[test]
-    fn share_text_appends_input_method_when_configured() {
-        let up = UploadStats {
-            speed: 85.2,
-            keystrokes: 3.5,
-            key_length: 2.8,
-        };
-        let source = TextSource::Online {
-            competition_type: CompetitionType::Jisu,
-        };
-        let text = format_share_text(&source, Some(5), &up, "虎码");
-        assert_eq!(text, "极速杯 第5名 · WPM 85.2 · 击键 3.5 · 码长 2.8 · 虎码");
-    }
-
-    #[test]
-    fn share_text_no_suffix_when_no_input_method() {
-        let up = UploadStats {
-            speed: 85.2,
-            keystrokes: 3.5,
-            key_length: 2.8,
-        };
-        let source = TextSource::File;
-        let text = format_share_text(&source, None, &up, "");
-        assert_eq!(text, "本地 · WPM 85.2 · 击键 3.5 · 码长 2.8");
     }
 
     #[test]

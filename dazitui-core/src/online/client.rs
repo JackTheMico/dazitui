@@ -432,8 +432,10 @@ impl ApiClient {
         }?;
         let ranking = rank_res.ranking.clone();
         let rank_num = ranking.as_deref().and_then(|s| s.parse::<u32>().ok());
+        // 与离线赛文统一口径：在线比赛上传成功复制的分享文本同样包含
+        // 键准 / 回改 / 键数 / 打词率等完整指标，仅在来源名后追加排名。
         let share_text =
-            super::share::format_share_text(&text.source, rank_num, &upload_stats, input_method);
+            crate::format_stats_share_text(text, stats, elapsed, input_method, rank_num);
         Ok(UploadOutcome {
             ranking,
             share_text,
