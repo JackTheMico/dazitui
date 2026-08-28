@@ -4,7 +4,7 @@
 //! 支持自动解析 chord_composer.algebra 规则（展开 __include 宏、__patch 补丁、左右手镜像与并击码元映射），
 //! 将汉字编码精准逆向还原为物理按键列表（例如麓鸣并击、空明码并击、虎码、五笔、小鹤音形等）。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -18,6 +18,10 @@ pub struct SchemeDict {
     word_to_codes: HashMap<String, Vec<String>>,
     /// 并击代数指法规则逆向引擎（若方案提供了 .schema.yaml 中的 chord_composer.algebra）
     chord_algebra: Option<ChordAlgebra>,
+    /// 需要追加 `'` 提交符的编码集合（剥离手区前缀后的逻辑码）。
+    /// 规则：某字词同时含「短码 c」与「长码 d」且 d 以 c 为严格前缀（如 文化 `vw`⊂`vwah`），
+    /// 则短码 c 需键入 `'` 才能提交该候选，提示区据此补 `'`。
+    prefix_commit_codes: HashSet<String>,
 }
 
 /// 单个词组单位的编码提示结果（供渲染层逐词对齐）。
@@ -122,6 +126,28 @@ impl SchemeDict {
             }
         }
 
+        // 构建「需追加 ' 提交符」的短码集合：仅针对「无手区前缀」的纯双拼码。
+        // 若同一字词同时含短码 c 与更长码 d（均为无前缀码）、且 d 以 c 为严格前缀
+        // （如 文化 vw⊂vwah），则 c 需键入 ' 提交候选（次选）。
+        // 单手简码（_/+ 前缀）与双手并击全码分属不同输入方式，不补 '。
+        let mut prefix_commit_codes = HashSet::new();
+        for codes in dict.word_to_codes.values() {
+            let unprefixed: Vec<&str> = codes
+                .iter()
+                .filter(|c| {
+                    !c.starts_with('_') && !c.starts_with('+') && !c.starts_with('-')
+                })
+                .map(|c| c.as_str())
+                .collect();
+            for &ci in &unprefixed {
+                for &cj in &unprefixed {
+                    if ci.len() < cj.len() && cj.starts_with(ci) {
+                        prefix_commit_codes.insert(ci.to_string());
+                    }
+                }
+            }
+        }
+        dict.prefix_commit_codes = prefix_commit_codes;
         dict
     }
 
@@ -416,7 +442,7 @@ impl SchemeDict {
             if any_oov {
                 return CodeHint {
                     word: word.to_string(),
-                    code: wc,
+                    code: self.apply_commit_terminator(wc),
                     strokes: ws,
                     is_oov: false,
                 };
@@ -428,7 +454,7 @@ impl SchemeDict {
             if ws <= char_sum {
                 return CodeHint {
                     word: word.to_string(),
-                    code: wc,
+                    code: self.apply_commit_terminator(wc),
                     strokes: ws,
                     is_oov: false,
                 };
@@ -439,7 +465,7 @@ impl SchemeDict {
                 .collect();
             return CodeHint {
                 word: word.to_string(),
-                code,
+                code: self.apply_commit_terminator(code),
                 strokes: char_sum,
                 is_oov: false,
             };
@@ -464,7 +490,7 @@ impl SchemeDict {
             .sum();
         CodeHint {
             word: word.to_string(),
-            code,
+            code: self.apply_commit_terminator(code),
             strokes,
             is_oov: false,
         }
@@ -474,6 +500,18 @@ impl SchemeDict {
     /// 字典中永远以带前缀的派生形式出现；无前缀者即双手并击的规范形式。
     fn has_hand_prefix(code: &str) -> bool {
         code.starts_with('_') || code.starts_with('+') || code.starts_with('-')
+    }
+
+    /// 若编码（剥离手区前缀后）属于「需追加 `'` 提交符」集合，则在码尾追加 `'`。
+    /// 用于 yoyo 双拼中短码为长码严格前缀的字词（如 文化 `vw`⊂`vwah`），
+    /// 提示用户键入 `'` 提交该候选（次选）。
+    fn apply_commit_terminator(&self, code: String) -> String {
+        let stripped = code.strip_prefix(['_', '+', '-']).unwrap_or(&code);
+        if self.prefix_commit_codes.contains(stripped) {
+            format!("{code}'")
+        } else {
+            code
+        }
     }
 
     /// 取某词条「优先简码（击数最少）、其次并击/全码」的编码及其击数；未登录返回 `None`。
@@ -1451,6 +1489,25 @@ algebra:
         // 混合：已知字 + 未登录字 → 留空并标记 is_oov
         assert_eq!(get("好x").code, "");
         assert!(get("好x").is_oov);
+    }
+
+    #[test]
+    fn build_code_hints_appends_commit_apostrophe_for_prefix_code() {
+        // yoyo 双拼：某字词同时含「短码 vw」与「长码 vwah」且长码以短码为严格前缀
+        // （文化 vw⊂vwah），则短码需键入 ' 提交该候选（次选），提示应显示 "vw'"。
+        // 短码本身已是最优（击数最少），不影响择优；仅补 ' 提交符。
+        let dict_str = "文化\tvw\t2924455\n文化\tvwah\t0\n遗产\tBGCy\t231136\n中\tk\t100\n";
+        let dict = SchemeDict::parse(dict_str);
+
+        let hints = dict.build_code_hints(&["文化".to_string(), "遗产".to_string(), "中".to_string()]);
+        let get = |w: &str| hints.iter().find(|h| h.word == w).expect("应有该词提示");
+
+        // 文化：短码 vw 是长码 vwah 的前缀 → 补 ' 提交符
+        assert_eq!(get("文化").code, "vw'");
+        // 遗产：BGCy 无更长前缀码 → 不补 '
+        assert_eq!(get("遗产").code, "BGCy");
+        // 中：单码 k 无前缀关系 → 不补 '
+        assert_eq!(get("中").code, "k");
     }
 
     #[test]
