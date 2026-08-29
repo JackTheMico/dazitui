@@ -3,9 +3,9 @@
 //! 在载文时对赛文建立每个字符位置到词汇词条的映射 (CharIndex -> WordToken)。
 //! 支持内置词组赛文原生词边界与通用/在线文章 Jieba 分词索引。
 
+use jieba_rs::Jieba;
 use std::collections::HashMap;
 use std::sync::LazyLock;
-use jieba_rs::Jieba;
 
 static JIEBA: LazyLock<Jieba> = LazyLock::new(Jieba::new);
 

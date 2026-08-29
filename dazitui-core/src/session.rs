@@ -1121,14 +1121,14 @@ mod tests {
         session.type_text_with_strokes_at("一二", 2, Duration::from_secs_f64(1.0));
         let m1 = session.realtime_metrics(Duration::from_secs_f64(1.0));
         assert_eq!(m1.cumulative_wpm, 120.0); // 2 字 / 1s * 60 = 120
-        assert_eq!(m1.cumulative_kps, 2.0);   // 2 击 / 1s = 2.0
-        assert_eq!(m1.key_length, 1.0);       // 2 击 / 2 字 = 1.0
+        assert_eq!(m1.cumulative_kps, 2.0); // 2 击 / 1s = 2.0
+        assert_eq!(m1.key_length, 1.0); // 2 击 / 2 字 = 1.0
 
         // 2.0s: 打 2 字（2 击）
         session.type_text_with_strokes_at("三四", 2, Duration::from_secs_f64(2.0));
         let m2 = session.realtime_metrics(Duration::from_secs_f64(2.0));
         assert_eq!(m2.cumulative_wpm, 120.0); // 4 字 / 2s * 60 = 120
-        assert_eq!(m2.cumulative_kps, 2.0);   // 4 击 / 2s = 2.0
+        assert_eq!(m2.cumulative_kps, 2.0); // 4 击 / 2s = 2.0
     }
 
     #[test]
@@ -1164,7 +1164,8 @@ mod tests {
     #[test]
     fn custom_group_size_single_chars() {
         // 12 字赛文，每组 5 字
-        let mut session = Session::new_gated_with_words_and_size("一二三四五六七八九十一二", true, &[], 5);
+        let mut session =
+            Session::new_gated_with_words_and_size("一二三四五六七八九十一二", true, &[], 5);
         assert_eq!(session.group_size(), 5);
         assert_eq!(session.total_groups(), 3); // 5 + 5 + 2 = 3 组
         assert_eq!(session.completed_groups(), 0);
@@ -1224,5 +1225,3 @@ mod tests {
         assert!(session.is_complete());
     }
 }
-
-

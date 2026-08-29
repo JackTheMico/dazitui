@@ -13,7 +13,7 @@ use std::thread::{self, JoinHandle};
 use std::time::SystemTime;
 
 use rand::Rng;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 
 /// 数据库操作错误。
 #[derive(Debug)]
@@ -361,15 +361,18 @@ impl StatsDb {
         )?;
 
         // 向前兼容现有数据库迁移
-        let _ = self
-            .conn
-            .execute("ALTER TABLE sessions ADD COLUMN kps REAL NOT NULL DEFAULT 0.0", []);
-        let _ = self
-            .conn
-            .execute("ALTER TABLE sessions ADD COLUMN key_length REAL NOT NULL DEFAULT 0.0", []);
-        let _ = self
-            .conn
-            .execute("ALTER TABLE sessions ADD COLUMN total_strokes INTEGER NOT NULL DEFAULT 0", []);
+        let _ = self.conn.execute(
+            "ALTER TABLE sessions ADD COLUMN kps REAL NOT NULL DEFAULT 0.0",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE sessions ADD COLUMN key_length REAL NOT NULL DEFAULT 0.0",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE sessions ADD COLUMN total_strokes INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
 
         // 清理历史异常与极端损坏记录（例如因输入法瞬间上屏导致 duration_secs < 0.5s 或 WPM/KPS 异常爆炸）
         let _ = self.conn.execute(
@@ -1000,17 +1003,8 @@ mod tests {
         let mut db = StatsDb::open_in_memory().expect("in-memory db create");
         assert_eq!(db.get_session_count().unwrap(), 0);
 
-        let session = SessionRecord::new(
-            60.0,
-            85.5,
-            0.98,
-            120,
-            2,
-            1,
-            122,
-            "常用单字前五百",
-            "虎码",
-        );
+        let session =
+            SessionRecord::new(60.0, 85.5, 0.98, 120, 2, 1, 122, "常用单字前五百", "虎码");
         let errors = vec![
             ErrorRecordItem::new(
                 &session.id,
@@ -1101,17 +1095,8 @@ mod tests {
     fn test_rolling_wpm_calculation() {
         let mut db = StatsDb::open_in_memory().unwrap();
         for i in 1..=5 {
-            let mut s = SessionRecord::new(
-                60.0,
-                (i * 10) as f64,
-                0.99,
-                100,
-                0,
-                0,
-                100,
-                "test",
-                "全拼",
-            );
+            let mut s =
+                SessionRecord::new(60.0, (i * 10) as f64, 0.99, 100, 0, 0, 100, "test", "全拼");
             s.created_at = format!("2026-08-24 10:00:0{i}");
             db.insert_session_full(&s, &[], &[]).unwrap();
         }
@@ -1170,17 +1155,7 @@ mod tests {
     #[test]
     fn test_db_worker_async_pipeline() {
         let (worker, shared_db) = DbWorker::start_in_memory().unwrap();
-        let session = SessionRecord::new(
-            50.0,
-            92.0,
-            0.99,
-            100,
-            1,
-            0,
-            101,
-            "异步测试",
-            "虎码",
-        );
+        let session = SessionRecord::new(50.0, 92.0, 0.99, 100, 1, 0, 101, "异步测试", "虎码");
         worker
             .send(DbTask::SaveSession {
                 session,
@@ -1203,9 +1178,33 @@ mod tests {
         let mut db = StatsDb::open_in_memory().unwrap();
         let session = SessionRecord::new(60.0, 80.0, 0.95, 100, 5, 2, 105, "测试文章", "全拼");
         let errors = vec![
-            ErrorRecordItem::new(&session.id, 1.0, 1, Some('你'), Some('好'), Some("你好".to_string()), "Mismatch"),
-            ErrorRecordItem::new(&session.id, 2.0, 2, Some('你'), Some('各'), Some("你好".to_string()), "Mismatch"),
-            ErrorRecordItem::new(&session.id, 3.0, 3, Some('他'), Some('它'), Some("他们".to_string()), "Mismatch"),
+            ErrorRecordItem::new(
+                &session.id,
+                1.0,
+                1,
+                Some('你'),
+                Some('好'),
+                Some("你好".to_string()),
+                "Mismatch",
+            ),
+            ErrorRecordItem::new(
+                &session.id,
+                2.0,
+                2,
+                Some('你'),
+                Some('各'),
+                Some("你好".to_string()),
+                "Mismatch",
+            ),
+            ErrorRecordItem::new(
+                &session.id,
+                3.0,
+                3,
+                Some('他'),
+                Some('它'),
+                Some("他们".to_string()),
+                "Mismatch",
+            ),
         ];
         db.insert_session_full(&session, &errors, &[]).unwrap();
 
@@ -1239,10 +1238,42 @@ mod tests {
         let mut db = StatsDb::open_in_memory().unwrap();
         let session = SessionRecord::new(60.0, 80.0, 0.95, 100, 5, 2, 105, "测试文章", "全拼");
         let errors = vec![
-            ErrorRecordItem::new(&session.id, 1.0, 1, Some('，'), Some('。'), Some("，".to_string()), "Mismatch"),
-            ErrorRecordItem::new(&session.id, 2.0, 2, Some('！'), Some('？'), Some("！".to_string()), "Mismatch"),
-            ErrorRecordItem::new(&session.id, 3.0, 3, Some(','), Some('.'), Some(",".to_string()), "Mismatch"),
-            ErrorRecordItem::new(&session.id, 4.0, 4, Some('字'), Some('子'), Some("汉字".to_string()), "Mismatch"),
+            ErrorRecordItem::new(
+                &session.id,
+                1.0,
+                1,
+                Some('，'),
+                Some('。'),
+                Some("，".to_string()),
+                "Mismatch",
+            ),
+            ErrorRecordItem::new(
+                &session.id,
+                2.0,
+                2,
+                Some('！'),
+                Some('？'),
+                Some("！".to_string()),
+                "Mismatch",
+            ),
+            ErrorRecordItem::new(
+                &session.id,
+                3.0,
+                3,
+                Some(','),
+                Some('.'),
+                Some(",".to_string()),
+                "Mismatch",
+            ),
+            ErrorRecordItem::new(
+                &session.id,
+                4.0,
+                4,
+                Some('字'),
+                Some('子'),
+                Some("汉字".to_string()),
+                "Mismatch",
+            ),
         ];
         db.insert_session_full(&session, &errors, &[]).unwrap();
 

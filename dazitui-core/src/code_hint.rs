@@ -80,12 +80,7 @@ fn format_hint_cell(code: &str, target_width: usize) -> String {
     let pad = target_width - code_width;
     let left = pad / 2;
     let right = pad - left;
-    format!(
-        "{}{}{}",
-        " ".repeat(left),
-        code,
-        " ".repeat(right)
-    )
+    format!("{}{}{}", " ".repeat(left), code, " ".repeat(right))
 }
 
 /// 去掉编码的手区修饰符前缀（`_` 左手 / `+` 右手 / `-` 其它）与空格并击前缀 `%`，
@@ -195,15 +190,12 @@ pub fn layout_code_hint_grid(
             let row_hints: Vec<CodeHint> = row
                 .iter()
                 .map(|&i| {
-                    hints
-                        .get(i)
-                        .cloned()
-                        .unwrap_or_else(|| CodeHint {
-                            word: String::new(),
-                            code: String::new(),
-                            strokes: 0,
-                            is_oov: true,
-                        })
+                    hints.get(i).cloned().unwrap_or_else(|| CodeHint {
+                        word: String::new(),
+                        code: String::new(),
+                        strokes: 0,
+                        is_oov: true,
+                    })
                 })
                 .collect();
             let row_typed: Vec<bool> = row
@@ -245,7 +237,10 @@ mod tests {
         // 单字「中」可视宽 2，提示 "k" 居中 → 定宽 2、右侧补 1 空格。
         let words = vec!["中".to_string()];
         let hints = vec![hint("k")];
-        assert_eq!(cells_text(&layout_code_hint_line(&words, &hints, &[])), "k ");
+        assert_eq!(
+            cells_text(&layout_code_hint_line(&words, &hints, &[])),
+            "k "
+        );
     }
 
     #[test]
@@ -270,7 +265,10 @@ mod tests {
             strokes: 0,
             is_oov: true,
         }];
-        assert_eq!(cells_text(&layout_code_hint_line(&words, &hints, &[])), "  ");
+        assert_eq!(
+            cells_text(&layout_code_hint_line(&words, &hints, &[])),
+            "  "
+        );
     }
 
     #[test]
