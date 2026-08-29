@@ -434,6 +434,10 @@ impl SchemeDict {
         if code.is_empty() {
             return 0;
         }
+        // 空格并击简词（% 前缀）一击上屏：无论码元数一律记 1 击。
+        if code.starts_with('%') {
+            return 1;
+        }
         code
             .chars()
             .filter(|&c| c != '_' && c != '+' && c != '-' && c != '\'' && c != '/' && !c.is_whitespace())
@@ -589,6 +593,10 @@ impl SchemeDict {
     /// 用于 yoyo 双拼中短码为长码严格前缀的字词（如 文化 `vw`⊂`vwah`），
     /// 提示用户键入 `'` 提交该候选（次选）。
     fn apply_commit_terminator(&self, code: String) -> String {
+        // 空格并击简词（% 前缀）一击上屏，无需 ' 提交符，也不应被追加。
+        if code.starts_with('%') {
+            return code;
+        }
         let stripped = code.strip_prefix(['_', '+', '-']).unwrap_or(&code);
         if self.prefix_commit_codes.contains(stripped) {
             format!("{code}'")
@@ -626,10 +634,20 @@ impl SchemeDict {
         let codes = self.word_to_codes.get(word)?;
         let is_chord = self.chord_algebra.is_some();
         let best = codes.iter().min_by_key(|c| {
+            let pref = if is_chord {
+                if c.starts_with('%') {
+                    0 // 空格并击简词：最优先（一击上屏）
+                } else if Self::has_hand_prefix(c) {
+                    2 // 单手简码：最不优先（避免展示带手区修饰符的派生串）
+                } else {
+                    1 // 双手并击/全码
+                }
+            } else {
+                0
+            };
             (
                 Self::calculate_code_strokes(c),
-                // 并击方案：单手派生形式（带前缀）在击数相同时排在后
-                (is_chord && Self::has_hand_prefix(c)) as u8,
+                pref,
                 c.len(),
             )
         })?;
@@ -1251,8 +1269,8 @@ fn is_likely_code(s: &str) -> bool {
             c.is_ascii_alphanumeric()
                 || matches!(
                     c,
-                    '+' | '/' | '-' | '_' | ';' | ':' | '<' | '>' | '?' | '.' | ',' | '\'' | '='
-                )
+                        '+' | '/' | '-' | '_' | ';' | ':' | '<' | '>' | '?' | '.' | ',' | '\'' | '=' | '%'
+                    )
         })
 }
 
@@ -1706,6 +1724,39 @@ algebra:
         dict.set_chord_algebra(ChordAlgebra::default());
         let hints = dict.build_code_hints(&["山".to_string()]);
         assert_eq!(hints[0].code, "a", "击数相同应保留无前缀双手形式 a");
+    }
+
+    #[test]
+    fn build_code_hints_prefers_space_chord_brief() {
+        // yoyo-pure-km 空格并击简词（% 前缀）一击上屏：应优先于更长并击/全码，
+        // 且击数记为 1，显示带 % 前缀的规范码（渲染层去皮并加空格标记）。
+        let dict_str = "---\nname: yoyo-pure\n...\n\
+这种\t%_v\t273350\n这种\tzkwi\t0\n";
+        let mut dict = SchemeDict::parse(dict_str);
+        dict.set_chord_algebra(ChordAlgebra::default());
+        let hints = dict.build_code_hints(&["这种".to_string()]);
+        assert_eq!(hints[0].code, "%_v", "应优先空格并击简词 %_v");
+        assert_eq!(hints[0].strokes, 1, "空格并击简词击数应为 1");
+    }
+
+    #[test]
+    fn build_code_hints_space_chord_brief_wins_over_single_hand_jianma() {
+        // 同一字词同时存在单手简码（_/+ 前缀，无空格）与空格并击简词（% 前缀）时，
+        // 词提优先展示空格并击简词（% 为最优先 brief）。
+        let dict_str = "---\nname: yoyo-pure\n...\n\
+可以\t_v\t100\n可以\t%_v\t0\n";
+        let mut dict = SchemeDict::parse(dict_str);
+        dict.set_chord_algebra(ChordAlgebra::default());
+        let hints = dict.build_code_hints(&["可以".to_string()]);
+        assert_eq!(hints[0].code, "%_v", "应优先空格并击简词 %_v 而非单手简码 _v");
+    }
+
+    #[test]
+    fn calculate_code_strokes_space_chord_is_one() {
+        // 空格并击简词（% 前缀）一律记 1 击，不按码元数累加。
+        assert_eq!(SchemeDict::calculate_code_strokes("%_v"), 1);
+        assert_eq!(SchemeDict::calculate_code_strokes("%+X"), 1);
+        assert_eq!(SchemeDict::calculate_code_strokes("%XY"), 1);
     }
 }
 

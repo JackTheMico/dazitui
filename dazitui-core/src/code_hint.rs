@@ -4,6 +4,9 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::scheme::CodeHint;
 
+/// 空格并击简词在提示区附加的空格键标记（U+2423 OPEN BOX），宽度 1、跨终端可读。
+const SPACE_CHORD_MARK: char = '␣';
+
 /// 简码/并击码的手区归属，用于提示区配色（左手粉、右手黄、双手并击青）。
 ///
 /// 由编码的前导手区修饰符推断：`_` 左手、`+` 右手、`-` 其它；无前缀（双手并击或普通码）为
@@ -27,12 +30,16 @@ pub struct HintCell {
 }
 
 /// 由编码推断其手区归属（用于提示区左右手/双手并击配色）。
+///
+/// 空格并击简词以 `%` 为前缀（`%XY` 双手+空格 / `%_X` 左手+空格 / `%+X` 右手+空格），
+/// 手区归属由 `%` 之后的字符推断（与无 `%` 的并击码一致）。
 pub fn hand_of_code(code: &str) -> HintHand {
-    if code.starts_with('_') {
+    let c = code.strip_prefix('%').unwrap_or(code);
+    if c.starts_with('_') {
         HintHand::Left
-    } else if code.starts_with('+') {
+    } else if c.starts_with('+') {
         HintHand::Right
-    } else if code.starts_with('-') {
+    } else if c.starts_with('-') {
         HintHand::Other
     } else {
         HintHand::TwoHand
@@ -81,11 +88,14 @@ fn format_hint_cell(code: &str, target_width: usize) -> String {
     )
 }
 
-/// 去掉编码的手区修饰符前缀（`_` 左手 / `+` 右手 / `-` 其它），仅保留实际按键。
+/// 去掉编码的手区修饰符前缀（`_` 左手 / `+` 右手 / `-` 其它）与空格并击前缀 `%`，
+/// 仅保留实际按键。
 ///
-/// 简码（单手派生形式）与并击规范形式均可能带此前缀，提示区只展示用户真正要按的键。
+/// 简码（单手派生形式）与并击规范形式均可能带此前缀，空格并击简词另带 `%` 前缀，
+/// 提示区只展示用户真正要按的键（空格键由 `SPACE_CHORD_MARK` 另行标记）。
 fn strip_hand_prefix(code: &str) -> &str {
-    code.strip_prefix(['_', '+', '-']).unwrap_or(code)
+    let c = code.strip_prefix('%').unwrap_or(code);
+    c.strip_prefix(['_', '+', '-']).unwrap_or(c)
 }
 
 /// 内置赛文对照区双行词格：生成本页「提示行」的逐词渲染单元。
@@ -116,9 +126,13 @@ pub fn layout_code_hint_line(
             match hints.get(i) {
                 Some(h) => {
                     let hand = hand_of_code(&h.code);
-                    let code = strip_hand_prefix(&h.code);
+                    let mut code = strip_hand_prefix(&h.code).to_string();
+                    // 空格并击简词：在按键序列后附加空格键标记，提示用户需按住空格。
+                    if h.code.starts_with('%') {
+                        code.push(SPACE_CHORD_MARK);
+                    }
                     HintCell {
-                        text: format_hint_cell(code, target),
+                        text: format_hint_cell(&code, target),
                         hand,
                     }
                 }
@@ -303,6 +317,40 @@ mod tests {
         let cells3 = layout_code_hint_line(&words, &hints3, &[]);
         assert_eq!(cells_text(&cells3), "wC");
         assert_eq!(cells3[0].hand, HintHand::TwoHand);
+    }
+
+    #[test]
+    fn layout_space_chord_strips_percent_adds_space_mark_and_assigns_hand() {
+        // 空格并击简词（% 前缀）：提示区去掉 % 与手区前缀，仅显示实际按键，并在末尾
+        // 附加空格键标记 ␣；手区归属据 % 后字符推断（左手 Left / 右手 Right / 无 TwoHand）。
+        // 单字「中」(宽2)：%_v（左手+空格）→ "v␣"（宽2），手区 Left。
+        let words = vec!["中".to_string()];
+        let hints = vec![hint("%_v")];
+        let cells = layout_code_hint_line(&words, &hints, &[]);
+        assert_eq!(cells_text(&cells), "v␣");
+        assert_eq!(cells[0].hand, HintHand::Left);
+        // %+X（右手+空格）→ "X␣"，手区 Right。
+        let hints2 = vec![hint("%+X")];
+        let cells2 = layout_code_hint_line(&words, &hints2, &[]);
+        assert_eq!(cells_text(&cells2), "X␣");
+        assert_eq!(cells2[0].hand, HintHand::Right);
+        // 双字「世界」(宽4)：%XY（双手+空格）→ "XY␣"（宽3，居中宽4→"XY␣ "），手区 TwoHand。
+        let words3 = vec!["世界".to_string()];
+        let hints3 = vec![hint("%XY")];
+        let cells3 = layout_code_hint_line(&words3, &hints3, &[]);
+        assert_eq!(cells_text(&cells3), "XY␣ ");
+        assert_eq!(cells3[0].hand, HintHand::TwoHand);
+    }
+
+    #[test]
+    fn hand_of_code_recognizes_space_chord_prefix() {
+        // hand_of_code 应透过 % 前缀推断手区：%_X→Left、%+X→Right、%-X→Other、%XY→TwoHand。
+        assert_eq!(hand_of_code("%_v"), HintHand::Left);
+        assert_eq!(hand_of_code("%+X"), HintHand::Right);
+        assert_eq!(hand_of_code("%-X"), HintHand::Other);
+        assert_eq!(hand_of_code("%XY"), HintHand::TwoHand);
+        // 无 % 时行为不变。
+        assert_eq!(hand_of_code("wCs"), HintHand::TwoHand);
     }
 
     #[test]
