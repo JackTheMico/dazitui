@@ -325,12 +325,6 @@ fn scheme_current_label(app: &App) -> String {
     format!("{s}（自定义）")
 }
 
-/// 反查方案设置项的显示标签（旧式简易回退，单测引用）。
-#[allow(dead_code)]
-fn scheme_display(s: &str) -> &str {
-    if s.is_empty() { "无" } else { s }
-}
-
 /// 输入法预设列表（顺序即轮转顺序）。
 /// 最后一项「自定义」表示用户自行输入任意名称。
 const INPUT_METHOD_PRESETS: &[&str] = &[
@@ -937,6 +931,14 @@ impl App {
         };
         app.reload_scheme_dict();
         app
+    }
+
+    /// 进入设置视图：刷新「已发现方案」列表（按当前 fcitx5 部署目录），再切到 Settings 状态。
+    ///
+    /// 满足 spec #82 Out-of-Scope「打开设置时按当时目录刷新」——新部署的方案立即可见。
+    fn enter_settings(&mut self) {
+        self.discovered = discover_schemes(&default_rime_data_dir());
+        self.state = AppState::Settings;
     }
 
     /// 根据当前选中的 `schema_id` 重新加载方案码表（异步、非阻塞）。
@@ -1932,7 +1934,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                             continue;
                         }
                         if is_open_settings(key) {
-                            app.state = AppState::Settings;
+                            app.enter_settings();
                             continue;
                         }
                         if is_open_sponsor(key) {
@@ -1990,7 +1992,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                     }
                     AppState::Browsing => {
                         if is_open_settings(key) {
-                            app.state = AppState::Settings;
+                            app.enter_settings();
                             continue;
                         }
                         match key.code {
@@ -2051,7 +2053,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                             continue;
                         }
                         if is_open_settings(key) {
-                            app.state = AppState::Settings;
+                            app.enter_settings();
                             continue;
                         }
                         match key.code {
@@ -2184,7 +2186,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                     },
                     AppState::Stats(ref mut stats_state) => {
                         if is_open_settings(key) {
-                            app.state = AppState::Settings;
+                            app.enter_settings();
                             continue;
                         }
                         match key.code {
@@ -2536,7 +2538,7 @@ fn activate_sidebar_menu_item<B: ratatui::backend::Backend>(
         SidebarMenuItem::Stats => {
             app.state = AppState::Stats(StatsViewState::new(app.settings.heatmap_layout));
         }
-        SidebarMenuItem::Settings => app.state = AppState::Settings,
+        SidebarMenuItem::Settings => app.enter_settings(),
         SidebarMenuItem::Sponsor => app.open_sponsor(),
         SidebarMenuItem::Login => app.open_login(),
     }
@@ -2908,7 +2910,7 @@ fn handle_finished_key(app: &mut App, key: KeyEvent) -> bool {
         return true;
     }
     if is_open_settings(key) {
-        app.state = AppState::Settings;
+        app.enter_settings();
         return true;
     }
     if is_open_login(key) {
@@ -4772,37 +4774,34 @@ fn render_heatmap_tab(
             .and_then(|d| d.get_key_press_totals(Some(true)).ok())
             .unwrap_or_default(),
         HeatmapSource::SchemeProjected => {
-            let custom_paths = &app.settings.scheme_dict_paths;
-            let scheme_name = &app.settings.scheme;
-            if let Some(path) =
-                resolve_scheme_path_via_discovery(scheme_name, &app.discovered, custom_paths)
-            {
-                if let Ok(dict) = SchemeDict::load_from_file(&path) {
-                    scheme_dict_loaded = true;
-                    loaded_scheme_name = dict.name().unwrap_or(scheme_name).to_string();
-                    dict_path_display = path.display().to_string();
-                    let sessions = db
-                        .as_ref()
-                        .and_then(|d| d.get_all_sessions().ok())
-                        .unwrap_or_default();
-                    let mut counts = std::collections::HashMap::new();
-                    for s in sessions {
-                        let proj = dict.project_text_to_keys(&s.text_title);
-                        for (k, v) in proj {
-                            *counts.entry(k).or_insert(0) += v;
-                        }
+            // 复用已加载/缓存的码表，避免每次绘制都重新解析（51MB 空明拳会卡死）。
+            if let Some(dict) = &app.scheme_dict {
+                scheme_dict_loaded = true;
+                loaded_scheme_name = dict.name().unwrap_or(&app.settings.scheme).to_string();
+                let scheme_id = &app.settings.scheme;
+                dict_path_display = app
+                    .discovered
+                    .iter()
+                    .find(|d| &d.id == scheme_id)
+                    .map(|d| d.path.display().to_string())
+                    .unwrap_or_else(|| scheme_id.clone());
+                let sessions = db
+                    .as_ref()
+                    .and_then(|d| d.get_all_sessions().ok())
+                    .unwrap_or_default();
+                let mut counts = std::collections::HashMap::new();
+                for s in sessions {
+                    let proj = dict.project_text_to_keys(&s.text_title);
+                    for (k, v) in proj {
+                        *counts.entry(k).or_insert(0) += v;
                     }
-                    if counts.is_empty() {
-                        db.as_ref()
-                            .and_then(|d| d.get_key_press_totals(Some(true)).ok())
-                            .unwrap_or_default()
-                    } else {
-                        counts
-                    }
-                } else {
+                }
+                if counts.is_empty() {
                     db.as_ref()
                         .and_then(|d| d.get_key_press_totals(Some(true)).ok())
                         .unwrap_or_default()
+                } else {
+                    counts
                 }
             } else {
                 db.as_ref()
@@ -7701,10 +7700,6 @@ mod tests {
 
     #[test]
     fn scheme_display_and_cycling_tests() {
-        // scheme_display 简易回退仍可用。
-        assert_eq!(scheme_display(""), "无");
-        assert_eq!(scheme_display("yoyo-pure"), "yoyo-pure");
-
         // 选项式轮转：无 + [yoyo-pure, kongmingma] + 自定义。
         let discovered = vec![
             SchemeInfo {
@@ -9936,7 +9931,7 @@ mod tests {
     #[test]
     fn settings_view_theme_cycling_and_preview_render() {
         let mut app = test_app(file_text("测试设置"));
-        app.state = AppState::Settings;
+        app.enter_settings();
         app.settings_focus = FOCUS_THEME;
 
         for preset in ThemePreset::ALL {
@@ -10000,7 +9995,7 @@ mod tests {
         terminal.draw(|f| ui(f, &app)).unwrap();
 
         // 2. 打开设置
-        app.state = AppState::Settings;
+        app.enter_settings();
         let backend2 = ratatui::backend::TestBackend::new(80, 24);
         let mut terminal2 = ratatui::Terminal::new(backend2).unwrap();
         terminal2.draw(|f| ui(f, &app)).unwrap();
@@ -11095,7 +11090,7 @@ mod tests {
         )
         .unwrap();
         let mut app = test_app(text);
-        app.state = AppState::Settings;
+        app.enter_settings();
         app.settings_focus = FOCUS_INPUT_METHOD;
         app.text_setting_modal = Some(TextSettingModal::new(
             TextSettingTarget::InputMethod,
@@ -11580,7 +11575,7 @@ mod tests {
         assert_eq!(app.builtin_selection, 0);
 
         // 3. Settings 状态 Vim 键位 (j/k 移动焦点, h/l 调整数值)
-        app.state = AppState::Settings;
+        app.enter_settings();
         app.settings_focus = FOCUS_THEME;
         app.settings_focus = move_focus(app.settings_focus, 1);
         assert_eq!(app.settings_focus, FOCUS_RATIO);
@@ -11887,7 +11882,7 @@ mod tests {
             None,
         );
 
-        app.state = AppState::Settings;
+        app.enter_settings();
         app.settings_focus = FOCUS_GROUP_SIZE;
 
         let backend = ratatui::backend::TestBackend::new(100, 30);

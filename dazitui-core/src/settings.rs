@@ -454,6 +454,10 @@ impl Default for Settings {
 /// 用于向后兼容「旧版把文件路径写入 scheme 字段」的配置文件。
 pub fn normalize_scheme_to_id(raw: &str) -> String {
     let raw = raw.trim();
+    // 若本身就是已存在的文件路径（如 dev-repo 自定义方案），保留原样以便直接定位。
+    if Path::new(raw).is_file() {
+        return raw.to_string();
+    }
     if let Some(stem) = raw.strip_suffix(".schema.yaml") {
         // 可能是完整路径或文件名，统一取文件 stem（无扩展名）。
         let name = Path::new(stem)
