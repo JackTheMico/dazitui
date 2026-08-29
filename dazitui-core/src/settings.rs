@@ -307,10 +307,7 @@ pub enum HeatmapLayout {
 
 impl HeatmapLayout {
     /// 全部模式。
-    pub const ALL: [HeatmapLayout; 2] = [
-        HeatmapLayout::Staggered,
-        HeatmapLayout::Ortholinear,
-    ];
+    pub const ALL: [HeatmapLayout; 2] = [HeatmapLayout::Staggered, HeatmapLayout::Ortholinear];
 
     /// 布局显示名。
     pub fn label(&self) -> &'static str {
@@ -371,7 +368,8 @@ pub struct Settings {
     pub bold: bool,
     /// 实时键盘显示模式。
     pub keyboard_mode: KeyboardMode,
-    /// 本地码表与指法方案名称或文件路径（用于反查与实时键盘指法映射）。
+    /// 当前反查方案 `schema_id`（如 `yoyo-pure`），对应 fcitx5 部署目录中的 `<id>.schema.yaml`。
+    /// 空串表示「无反查」。自动发现到的方案下拉选中后即时写入此字段。
     pub scheme: String,
     /// 输入法名称（上传与分享携带）；空串表示不配置（显示「无」）。
     /// 最多 20 字符（遵守 52dazi 协议限制）。
@@ -447,6 +445,24 @@ impl Default for Settings {
             builtin_progress: HashMap::new(),
         }
     }
+}
+
+/// 将存储的 `scheme` 值规范化为 `schema_id`：
+/// - 若以 `.schema.yaml` 结尾（可能是完整路径或文件名），取文件名 stem 作为 id；
+/// - 否则原样返回（假定已是 `schema_id` 或旧式 preset 名）。
+///
+/// 用于向后兼容「旧版把文件路径写入 scheme 字段」的配置文件。
+pub fn normalize_scheme_to_id(raw: &str) -> String {
+    let raw = raw.trim();
+    if let Some(stem) = raw.strip_suffix(".schema.yaml") {
+        // 可能是完整路径或文件名，统一取文件 stem（无扩展名）。
+        let name = Path::new(stem)
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_else(|| stem.to_string());
+        return name;
+    }
+    raw.to_string()
 }
 
 /// 字体开关对应的字号（pt）。
@@ -531,7 +547,9 @@ impl SettingsStore {
             if let Some(rest) = line.strip_prefix("builtin_progress.") {
                 if let Some((name, val)) = rest.split_once('=') {
                     if let Some((cg, gs)) = val.split_once(',') {
-                        if let (Ok(cg), Ok(gs)) = (cg.trim().parse::<u32>(), gs.trim().parse::<u8>()) {
+                        if let (Ok(cg), Ok(gs)) =
+                            (cg.trim().parse::<u32>(), gs.trim().parse::<u8>())
+                        {
                             settings.builtin_progress.insert(
                                 name.trim().to_string(),
                                 BuiltinProgress {
@@ -689,10 +707,7 @@ mod tests {
             ThemePreset::parse("CYBERPUNK"),
             Some(ThemePreset::Cyberpunk)
         );
-        assert_eq!(
-            ThemePreset::parse("neon"),
-            Some(ThemePreset::Cyberpunk)
-        );
+        assert_eq!(ThemePreset::parse("neon"), Some(ThemePreset::Cyberpunk));
         assert_eq!(
             ThemePreset::parse("TOKYO_NIGHT"),
             Some(ThemePreset::CatppuccinMocha)
@@ -748,7 +763,10 @@ mod tests {
     fn store_roundtrip() {
         let store = SettingsStore::new(temp_path("roundtrip"));
         let mut scheme_dict_paths = HashMap::new();
-        scheme_dict_paths.insert("麓鸣·空明·并击".to_string(), "/path/to/luming.txt".to_string());
+        scheme_dict_paths.insert(
+            "麓鸣·空明·并击".to_string(),
+            "/path/to/luming.txt".to_string(),
+        );
         let s = Settings {
             theme: ThemePreset::Dracula,
             reference_ratio: 70,
@@ -899,11 +917,23 @@ mod tests {
         assert_eq!(KeyboardMode::parse("off"), Some(KeyboardMode::Off));
         assert_eq!(KeyboardMode::parse("none"), Some(KeyboardMode::Off));
         assert_eq!(KeyboardMode::parse("false"), Some(KeyboardMode::Off));
-        assert_eq!(KeyboardMode::parse("staggered"), Some(KeyboardMode::Staggered));
-        assert_eq!(KeyboardMode::parse("standard"), Some(KeyboardMode::Staggered));
+        assert_eq!(
+            KeyboardMode::parse("staggered"),
+            Some(KeyboardMode::Staggered)
+        );
+        assert_eq!(
+            KeyboardMode::parse("standard"),
+            Some(KeyboardMode::Staggered)
+        );
         assert_eq!(KeyboardMode::parse("ansi"), Some(KeyboardMode::Staggered));
-        assert_eq!(KeyboardMode::parse("ortholinear"), Some(KeyboardMode::Ortholinear));
-        assert_eq!(KeyboardMode::parse("planck"), Some(KeyboardMode::Ortholinear));
+        assert_eq!(
+            KeyboardMode::parse("ortholinear"),
+            Some(KeyboardMode::Ortholinear)
+        );
+        assert_eq!(
+            KeyboardMode::parse("planck"),
+            Some(KeyboardMode::Ortholinear)
+        );
         assert_eq!(KeyboardMode::parse("invalid"), None);
     }
 
@@ -948,11 +978,23 @@ mod tests {
         for layout in HeatmapLayout::ALL {
             assert_eq!(HeatmapLayout::parse(layout.as_str()), Some(layout));
         }
-        assert_eq!(HeatmapLayout::parse("standard"), Some(HeatmapLayout::Staggered));
+        assert_eq!(
+            HeatmapLayout::parse("standard"),
+            Some(HeatmapLayout::Staggered)
+        );
         assert_eq!(HeatmapLayout::parse("ansi"), Some(HeatmapLayout::Staggered));
-        assert_eq!(HeatmapLayout::parse("ortho"), Some(HeatmapLayout::Ortholinear));
-        assert_eq!(HeatmapLayout::parse("matrix"), Some(HeatmapLayout::Ortholinear));
-        assert_eq!(HeatmapLayout::parse("planck"), Some(HeatmapLayout::Ortholinear));
+        assert_eq!(
+            HeatmapLayout::parse("ortho"),
+            Some(HeatmapLayout::Ortholinear)
+        );
+        assert_eq!(
+            HeatmapLayout::parse("matrix"),
+            Some(HeatmapLayout::Ortholinear)
+        );
+        assert_eq!(
+            HeatmapLayout::parse("planck"),
+            Some(HeatmapLayout::Ortholinear)
+        );
         assert_eq!(HeatmapLayout::parse("invalid"), None);
     }
 
@@ -1055,7 +1097,10 @@ mod tests {
         );
         store.save(&s).unwrap();
         let loaded = store.load();
-        let p = loaded.builtin_progress.get("yoyo 单字").expect("进度应被持久化");
+        let p = loaded
+            .builtin_progress
+            .get("yoyo 单字")
+            .expect("进度应被持久化");
         assert_eq!(p.completed_groups, 37);
         assert_eq!(p.group_size, 20);
 
@@ -1064,6 +1109,41 @@ mod tests {
         s2.builtin_progress.remove("yoyo 单字");
         store.save(&s2).unwrap();
         assert!(store.load().builtin_progress.is_empty());
+        let _ = std::fs::remove_file(store.path());
+    }
+
+    #[test]
+    fn normalize_scheme_to_id_strips_schema_yaml_suffix() {
+        // 旧版把完整路径写入 scheme：应规范化为文件名 stem（schema_id）。
+        assert_eq!(
+            normalize_scheme_to_id("/home/user/schemes/yoyo-pure.schema.yaml"),
+            "yoyo-pure"
+        );
+        assert_eq!(normalize_scheme_to_id("yoyo-pure.schema.yaml"), "yoyo-pure");
+        // 已是 id 或 preset 名：原样返回
+        assert_eq!(normalize_scheme_to_id("yoyo-pure"), "yoyo-pure");
+        assert_eq!(normalize_scheme_to_id("虎码"), "虎码");
+        // 空白被裁剪
+        assert_eq!(
+            normalize_scheme_to_id("  yoyo-pure.schema.yaml  "),
+            "yoyo-pure"
+        );
+        // 空串保持空
+        assert_eq!(normalize_scheme_to_id(""), "");
+    }
+
+    #[test]
+    fn store_scheme_persists_schema_id() {
+        // scheme 字段现在存 schema_id，序列化/反序列化一致。
+        let store = SettingsStore::new(temp_path("scheme_id_roundtrip"));
+        let s = Settings {
+            scheme: "yoyo-pure-km".to_string(),
+            ..Default::default()
+        };
+        store.save(&s).unwrap();
+        let loaded = store.load();
+        assert_eq!(loaded.scheme, "yoyo-pure-km");
+        // 旧配置中 scheme 为路径时，归一化在 App 层完成；存储层只保证字符串原样往返。
         let _ = std::fs::remove_file(store.path());
     }
 }

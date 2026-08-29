@@ -12,20 +12,23 @@ mod settings;
 #[cfg(feature = "online")]
 mod online;
 
+pub use code_hint::{
+    HintCell, HintHand, layout_code_hint_grid, layout_code_hint_line, pack_words_by_width,
+};
 pub use db::{
     DbError, DbTask, DbWorker, ErrorRecordItem, GlobalStatsSummary, KeypressRecordItem,
     MistypedCharStat, MistypedWordStat, SessionRecord, StatsDb,
 };
 pub use lttb::lttb_downsample;
-pub use code_hint::{
-    HintCell, HintHand, layout_code_hint_grid, layout_code_hint_line, pack_words_by_width,
+pub use scheme::{
+    ChordAlgebra, CodeHint, RimeSchemaResolver, SchemeDict, SchemeInfo, YamlValue,
+    default_rime_data_dir, discover_schemes, parse_rime_yaml, resolve_scheme_path_via_discovery,
 };
-pub use scheme::{ChordAlgebra, CodeHint, RimeSchemaResolver, SchemeDict, YamlValue, parse_rime_yaml};
 pub use segmenter::{WordIndex, WordToken, prewarm_segmenter};
 pub use session::{CharStatus, ErrorPoint, ErrorType, GROUP_SIZE, Session, Stats, TypeResult};
 pub use settings::{
-    BuiltinProgress, FONT_SIZE_PT, HeatmapLayout, KeyboardMode, Rgb, Settings, SettingsStore, Theme,
-    ThemePreset, osc_font_size_sequence,
+    BuiltinProgress, FONT_SIZE_PT, HeatmapLayout, KeyboardMode, Rgb, Settings, SettingsStore,
+    Theme, ThemePreset, normalize_scheme_to_id, osc_font_size_sequence,
 };
 
 #[cfg(feature = "online")]
@@ -1076,7 +1079,8 @@ mod tests {
             shuffled: false,
         };
         let stats = sample_stats();
-        let s = format_stats_share_text(&text, &stats, Duration::from_secs_f64(85.23), "虎码", None);
+        let s =
+            format_stats_share_text(&text, &stats, Duration::from_secs_f64(85.23), "虎码", None);
         assert_eq!(
             s,
             "离线赛文《背影节选》 · 🚀WPM 85.2 · ⌨️击键 3.5 · 📏码长 2.8 · ✅正确字数 3/4 · ❌错字 1 · ↩️回改 0 · 🔢键数 140 · 🎯键准 100.00% · 💬打词率 0.00% · ⏱️用时 01:25.230 · 虎码 🖥️dazitui"

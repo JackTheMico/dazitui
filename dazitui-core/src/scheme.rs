@@ -177,10 +177,7 @@ impl SchemeDict {
     ///
     /// `visited` 用规范路径去重，避免循环导入导致无限递归。导入文件缺失时静默跳过
     /// （与 Rime 宽松语义一致），不影响主词典已收录的词条。
-    fn load_dict_with_imports(
-        path: &Path,
-        visited: &mut HashSet<PathBuf>,
-    ) -> io::Result<Self> {
+    fn load_dict_with_imports(path: &Path, visited: &mut HashSet<PathBuf>) -> io::Result<Self> {
         let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         if visited.contains(&canon) {
             return Ok(Self::default());
@@ -284,7 +281,8 @@ impl SchemeDict {
             candidate_dicts.push(parent_dir.join(format!("{schema_stem}.dict.yaml")));
             candidate_dicts.push(parent_dir.join(format!("{schema_stem}.txt")));
 
-            let mut dict = if let Some(dict_path) = candidate_dicts.into_iter().find(|p| p.exists()) {
+            let mut dict = if let Some(dict_path) = candidate_dicts.into_iter().find(|p| p.exists())
+            {
                 let mut visited = HashSet::new();
                 Self::load_dict_with_imports(&dict_path, &mut visited)?
             } else {
@@ -376,7 +374,9 @@ impl SchemeDict {
                     .unwrap_or_else(|| PathBuf::from("."));
                 home.join(".local").join("share")
             });
-        let home_dir = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+        let home_dir = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
 
         // dazitui 自带目录
         search_dirs.push(config_home.join("dazitui").join("schemes"));
@@ -422,7 +422,10 @@ impl SchemeDict {
 
     /// 反查指定汉字或词组的首选击键序列（或并击组合）。
     pub fn get_primary_code(&self, word: &str) -> Option<&str> {
-        self.word_to_codes.get(word).and_then(|c| c.first()).map(|s| s.as_str())
+        self.word_to_codes
+            .get(word)
+            .and_then(|c| c.first())
+            .map(|s| s.as_str())
     }
 
     /// 计算指定编码的实际物理击数（Stroke Count）。
@@ -438,9 +441,10 @@ impl SchemeDict {
         if code.starts_with('%') {
             return 1;
         }
-        code
-            .chars()
-            .filter(|&c| c != '_' && c != '+' && c != '-' && c != '\'' && c != '/' && !c.is_whitespace())
+        code.chars()
+            .filter(|&c| {
+                c != '_' && c != '+' && c != '-' && c != '\'' && c != '/' && !c.is_whitespace()
+            })
             .count() as u32
     }
 
@@ -507,10 +511,7 @@ impl SchemeDict {
     ///
     /// 结果为可缓存结构，渲染层只需在载文/`reload_scheme_dict` 时调用一次，不在每帧重算。
     pub fn build_code_hints(&self, words: &[String]) -> Vec<CodeHint> {
-        words
-            .iter()
-            .map(|w| self.build_hint_for_word(w))
-            .collect()
+        words.iter().map(|w| self.build_hint_for_word(w)).collect()
     }
 
     /// 计算单个词组单位的最优编码提示。
@@ -645,11 +646,7 @@ impl SchemeDict {
             } else {
                 0
             };
-            (
-                Self::calculate_code_strokes(c),
-                pref,
-                c.len(),
-            )
+            (Self::calculate_code_strokes(c), pref, c.len())
         })?;
         Some((best.clone(), Self::calculate_code_strokes(best)))
     }
@@ -734,10 +731,26 @@ impl ChordAlgebra {
     /// 初始化标准 QWERTY 左右手对称镜像映射默认基线。
     fn init_default_mirrors(&mut self) {
         let pairs = [
-            ('6', '5'), ('7', '4'), ('8', '3'), ('9', '2'), ('0', '1'),
-            ('y', 't'), ('u', 'r'), ('i', 'e'), ('o', 'w'), ('p', 'q'),
-            ('h', 'g'), ('j', 'f'), ('k', 'd'), ('l', 's'), (';', 'a'),
-            ('n', 'b'), ('m', 'v'), (',', 'c'), ('.', 'x'), ('/', 'z'),
+            ('6', '5'),
+            ('7', '4'),
+            ('8', '3'),
+            ('9', '2'),
+            ('0', '1'),
+            ('y', 't'),
+            ('u', 'r'),
+            ('i', 'e'),
+            ('o', 'w'),
+            ('p', 'q'),
+            ('h', 'g'),
+            ('j', 'f'),
+            ('k', 'd'),
+            ('l', 's'),
+            (';', 'a'),
+            ('n', 'b'),
+            ('m', 'v'),
+            (',', 'c'),
+            ('.', 'x'),
+            ('/', 'z'),
         ];
         for (r, l) in pairs {
             self.mirror_right_to_left.insert(r, l);
@@ -766,7 +779,10 @@ impl ChordAlgebra {
                 // 2. 码元并击规则：例如 `xform|xv|.|` 或 `xform|esf|Q|`
                 else if rep_chars.len() == 1 && pat_chars.len() >= 2 {
                     let symbol = rep_chars[0];
-                    let mut keys: Vec<String> = pat_chars.iter().map(|c| c.to_ascii_lowercase().to_string()).collect();
+                    let mut keys: Vec<String> = pat_chars
+                        .iter()
+                        .map(|c| c.to_ascii_lowercase().to_string())
+                        .collect();
                     keys.sort();
                     algebra.symbol_to_keys.entry(symbol).or_insert(keys);
                 }
@@ -795,7 +811,11 @@ impl ChordAlgebra {
         } else if c.is_ascii_alphanumeric() || c.is_ascii_punctuation() {
             let base_c = c.to_ascii_lowercase();
             if is_right_hand {
-                let mirrored = self.mirror_left_to_right.get(&base_c).copied().unwrap_or(base_c);
+                let mirrored = self
+                    .mirror_left_to_right
+                    .get(&base_c)
+                    .copied()
+                    .unwrap_or(base_c);
                 keys.push(mirrored.to_string());
             } else {
                 keys.push(base_c.to_string());
@@ -1006,7 +1026,8 @@ impl<'a> YamlParser<'a> {
                 if val_part.is_empty() {
                     let next_indent = self.peek_indent();
                     if next_indent > indent {
-                        let is_list = self.lines[self.pos].1.starts_with("- ") || self.lines[self.pos].1 == "-";
+                        let is_list = self.lines[self.pos].1.starts_with("- ")
+                            || self.lines[self.pos].1 == "-";
                         let val = if is_list {
                             YamlValue::List(self.parse_list(next_indent))
                         } else {
@@ -1055,7 +1076,8 @@ impl<'a> YamlParser<'a> {
             if item_str.is_empty() {
                 let next_indent = self.peek_indent();
                 if next_indent > indent {
-                    let is_list = self.lines[self.pos].1.starts_with("- ") || self.lines[self.pos].1 == "-";
+                    let is_list =
+                        self.lines[self.pos].1.starts_with("- ") || self.lines[self.pos].1 == "-";
                     let val = if is_list {
                         YamlValue::List(self.parse_list(next_indent))
                     } else {
@@ -1076,7 +1098,8 @@ impl<'a> YamlParser<'a> {
                 let item_sub_indent = indent + 1;
                 while self.pos < self.lines.len() {
                     let (sub_indent, sub_line) = self.lines[self.pos];
-                    if sub_indent < item_sub_indent || sub_line.starts_with("- ") || sub_line == "-" {
+                    if sub_indent < item_sub_indent || sub_line.starts_with("- ") || sub_line == "-"
+                    {
                         break;
                     }
                     if let Some(sub_colon) = sub_line.find(':') {
@@ -1113,7 +1136,10 @@ fn strip_yaml_comment(line: &str) -> &str {
         } else if in_quote && c == quote_char {
             in_quote = false;
             quote_char = ' ';
-        } else if !in_quote && c == '#' && (idx == 0 || line[..idx].ends_with(|ws: char| ws.is_whitespace())) {
+        } else if !in_quote
+            && c == '#'
+            && (idx == 0 || line[..idx].ends_with(|ws: char| ws.is_whitespace()))
+        {
             return &line[..idx];
         }
     }
@@ -1154,24 +1180,34 @@ impl RimeSchemaResolver {
 
     /// 解析指定 schema 文件中定义的 chord_composer.algebra 完整展开规则列表。
     pub fn resolve_chord_algebra(&mut self, schema_path: &Path) -> Vec<String> {
-        let base_dir = schema_path
-            .parent()
-            .unwrap_or(Path::new("."))
-            .to_path_buf();
+        let base_dir = schema_path.parent().unwrap_or(Path::new(".")).to_path_buf();
         if self.load_doc(schema_path).is_err() {
             return Vec::new();
         }
 
-        let canonical = schema_path.canonicalize().unwrap_or_else(|_| schema_path.to_path_buf());
-        let doc = self.docs.get(&canonical).cloned().unwrap_or_else(|| YamlValue::Mapping(Vec::new()));
+        let canonical = schema_path
+            .canonicalize()
+            .unwrap_or_else(|_| schema_path.to_path_buf());
+        let doc = self
+            .docs
+            .get(&canonical)
+            .cloned()
+            .unwrap_or_else(|| YamlValue::Mapping(Vec::new()));
 
         let mut rules = Vec::new();
         let mut visited = Vec::new();
 
         // 查找 chord_composer/algebra 或 __patch 下的 chord_composer/algebra
-        if let Some(algebra_node) = doc.get("chord_composer/algebra").or_else(|| doc.get("__patch/chord_composer/algebra")) {
+        if let Some(algebra_node) = doc
+            .get("chord_composer/algebra")
+            .or_else(|| doc.get("__patch/chord_composer/algebra"))
+        {
             self.resolve_node_rules(&doc, algebra_node, &base_dir, &mut rules, &mut visited);
-        } else if let Some(alg) = doc.get("__patch").and_then(|p| p.get("chord_composer")).and_then(|cc| cc.get("algebra")) {
+        } else if let Some(alg) = doc
+            .get("__patch")
+            .and_then(|p| p.get("chord_composer"))
+            .and_then(|cc| cc.get("algebra"))
+        {
             self.resolve_node_rules(&doc, alg, &base_dir, &mut rules, &mut visited);
         }
 
@@ -1189,7 +1225,10 @@ impl RimeSchemaResolver {
         match node {
             YamlValue::String(s) => {
                 let trimmed = s.trim();
-                if trimmed.starts_with("xform") || trimmed.starts_with("derive") || trimmed.starts_with("erase") {
+                if trimmed.starts_with("xform")
+                    || trimmed.starts_with("derive")
+                    || trimmed.starts_with("erase")
+                {
                     rules.push(trimmed.to_string());
                 } else if !trimmed.is_empty() {
                     self.resolve_target_reference(current_doc, trimmed, base_dir, rules, visited);
@@ -1206,7 +1245,13 @@ impl RimeSchemaResolver {
                         self.resolve_node_rules(current_doc, v, base_dir, rules, visited);
                     } else if k == "__include" {
                         if let Some(target) = v.as_str() {
-                            self.resolve_target_reference(current_doc, target, base_dir, rules, visited);
+                            self.resolve_target_reference(
+                                current_doc,
+                                target,
+                                base_dir,
+                                rules,
+                                visited,
+                            );
                         } else {
                             self.resolve_node_rules(current_doc, v, base_dir, rules, visited);
                         }
@@ -1269,9 +1314,125 @@ fn is_likely_code(s: &str) -> bool {
             c.is_ascii_alphanumeric()
                 || matches!(
                     c,
-                        '+' | '/' | '-' | '_' | ';' | ':' | '<' | '>' | '?' | '.' | ',' | '\'' | '=' | '%'
-                    )
+                    '+' | '/'
+                        | '-'
+                        | '_'
+                        | ';'
+                        | ':'
+                        | '<'
+                        | '>'
+                        | '?'
+                        | '.'
+                        | ','
+                        | '\''
+                        | '='
+                        | '%'
+                )
         })
+}
+
+/// 自动发现到的输入方案元信息（用于设置下拉与首启默认）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemeInfo {
+    /// schema_id：`.schema.yaml` 文件名去掉后缀后的标识（如 `yoyo-pure`）。
+    pub id: String,
+    /// 展示名称：取自 `schema/name`（如 `麓鸣纯形·六脉`）。
+    pub display_name: String,
+    /// `.schema.yaml` 文件路径（随附词典 `id.dict.yaml` 同目录）。
+    pub path: PathBuf,
+}
+
+impl SchemeInfo {
+    /// 下拉列表显示标签：`display_name (id)`，例如 `麓鸣纯形·六脉 (yoyo-pure)`。
+    pub fn display_label(&self) -> String {
+        format!("{} ({})", self.display_name, self.id)
+    }
+}
+
+/// 扫描 `data_dir` 下所有 `*.schema.yaml`，仅返回含顶层 `schema/name` 的真·输入方案。
+///
+/// 排除规则：
+/// - Rime 配置文件（`default/weasel/symbols/punctuation/user/installation/key_bindings/yoyo` 等）
+///   本身以 `.yaml` 结尾而非 `.schema.yaml`，被后缀过滤排除；
+/// - 无 `schema/name` 的 patch/片段 `.schema.yaml` 文件（如仅含 `__patch` 的片段）被 `extract_schema_name` 排除。
+///
+/// 返回按 `id` 升序排列，便于下拉展示与稳定测试断言。目录不可读时返回空向量（不抛错）。
+pub fn discover_schemes(data_dir: &Path) -> Vec<SchemeInfo> {
+    let mut out = Vec::new();
+    let entries = match std::fs::read_dir(data_dir) {
+        Ok(entries) => entries,
+        Err(_) => return out,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let file_name = match path.file_name().and_then(|f| f.to_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+        if !file_name.ends_with(".schema.yaml") {
+            continue;
+        }
+        // 必须含顶层 schema/name 才视为真方案（patch/片段无此字段则跳过）。
+        let name = match SchemeDict::extract_schema_name(&path) {
+            Some(n) => n,
+            None => continue,
+        };
+        let id = file_name
+            .strip_suffix(".schema.yaml")
+            .unwrap_or(file_name)
+            .to_string();
+        out.push(SchemeInfo {
+            id,
+            display_name: name,
+            path,
+        });
+    }
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out
+}
+
+/// 默认 Rime 用户部署目录（fcitx5）：`$XDG_DATA_HOME/fcitx5/rime`，
+/// 回退 `~/.local/share/fcitx5/rime`。与 `resolve_scheme_path` 的搜索目录保持一致。
+pub fn default_rime_data_dir() -> PathBuf {
+    let data_home = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".local")
+                .join("share")
+        });
+    data_home.join("fcitx5").join("rime")
+}
+
+/// 依据 `schema_id` 定位输入方案 `.schema.yaml` 路径，优先级：
+/// 1. 自动发现结果中 `id` 精确匹配；
+/// 2. 自定义映射 `custom_paths[id]`（存在性校验）；
+/// 3. 旧式多目录解析（向后兼容 preset 名 / 文件路径，见 `resolve_scheme_path`）。
+///
+/// 返回 `None` 表示找不到任何匹配（含空 id）。该函数为纯函数，可在无 TUI 环境下单测。
+pub fn resolve_scheme_path_via_discovery(
+    id: &str,
+    discovered: &[SchemeInfo],
+    custom_paths: &HashMap<String, String>,
+) -> Option<PathBuf> {
+    if id.is_empty() {
+        return None;
+    }
+    // 1. 自动发现结果精确匹配
+    if let Some(info) = discovered.iter().find(|s| s.id == id) {
+        return Some(info.path.clone());
+    }
+    // 2. 自定义映射
+    if let Some(p) = custom_paths.get(id) {
+        let path = PathBuf::from(p);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    // 3. 旧式多目录解析（向后兼容）
+    SchemeDict::resolve_scheme_path(id, custom_paths)
 }
 
 #[cfg(test)]
@@ -1328,7 +1489,6 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-
     #[test]
     fn test_yaml_parser_basic_mapping_and_list() {
         let yaml = r#"
@@ -1341,8 +1501,14 @@ algebra:
   - xform|esf|Q|
 "#;
         let parsed = parse_rime_yaml(yaml);
-        assert_eq!(parsed.get("schema/name").and_then(|v| v.as_str()), Some("测试方案"));
-        assert_eq!(parsed.get("schema/schema_id").and_then(|v| v.as_str()), Some("test"));
+        assert_eq!(
+            parsed.get("schema/name").and_then(|v| v.as_str()),
+            Some("测试方案")
+        );
+        assert_eq!(
+            parsed.get("schema/schema_id").and_then(|v| v.as_str()),
+            Some("test")
+        );
         let alg = parsed.get("algebra").and_then(|v| v.as_list()).unwrap();
         assert_eq!(alg.len(), 3);
         assert_eq!(alg[0].as_str(), Some("xform|y|t|"));
@@ -1522,7 +1688,10 @@ algebra:
         let yaml_content = "schema:\n  name: \"演示方案·六脉\"\n  schema_id: demo\n\nchord_composer:\n  algebra:\n    - xform|xv|.|";
         std::fs::write(&schema_file, yaml_content).unwrap();
 
-        assert_eq!(SchemeDict::extract_schema_name(&schema_file), Some("演示方案·六脉".to_string()));
+        assert_eq!(
+            SchemeDict::extract_schema_name(&schema_file),
+            Some("演示方案·六脉".to_string())
+        );
 
         // 直接路径解析
         let mut custom = HashMap::new();
@@ -1530,7 +1699,10 @@ algebra:
         assert_eq!(resolved, Some(schema_file.clone()));
 
         // 自定义别名映射解析
-        custom.insert("my_demo".to_string(), schema_file.to_str().unwrap().to_string());
+        custom.insert(
+            "my_demo".to_string(),
+            schema_file.to_str().unwrap().to_string(),
+        );
         let resolved_alias = SchemeDict::resolve_scheme_path("my_demo", &custom);
         assert_eq!(resolved_alias, Some(schema_file));
     }
@@ -1540,7 +1712,8 @@ algebra:
         let yaml = "__patch:\n  translator/dictionary: my-dict\n";
         let doc = parse_rime_yaml(yaml);
         assert_eq!(
-            doc.get("__patch/translator/dictionary").and_then(|v| v.as_str()),
+            doc.get("__patch/translator/dictionary")
+                .and_then(|v| v.as_str()),
             Some("my-dict")
         );
     }
@@ -1650,7 +1823,8 @@ algebra:
         let dict_str = "文化\tvw\t2924455\n文化\tvwah\t0\n遗产\tBGCy\t231136\n中\tk\t100\n";
         let dict = SchemeDict::parse(dict_str);
 
-        let hints = dict.build_code_hints(&["文化".to_string(), "遗产".to_string(), "中".to_string()]);
+        let hints =
+            dict.build_code_hints(&["文化".to_string(), "遗产".to_string(), "中".to_string()]);
         let get = |w: &str| hints.iter().find(|h| h.word == w).expect("应有该词提示");
 
         // 文化：短码 vw 是长码 vwah 的前缀 → 补 ' 提交符
@@ -1704,7 +1878,8 @@ algebra:
         let mut dict = SchemeDict::parse(dict_str);
         dict.set_chord_algebra(ChordAlgebra::default());
 
-        let hints = dict.build_code_hints(&["方言".to_string(), "方".to_string(), "言".to_string()]);
+        let hints =
+            dict.build_code_hints(&["方言".to_string(), "方".to_string(), "言".to_string()]);
         let get = |w: &str| hints.iter().find(|h| h.word == w).expect("应有该词提示");
 
         // 整词已登录：直接显示词典整词码 <fuy（而非退化混合码 <uy）
@@ -1748,7 +1923,10 @@ algebra:
         let mut dict = SchemeDict::parse(dict_str);
         dict.set_chord_algebra(ChordAlgebra::default());
         let hints = dict.build_code_hints(&["可以".to_string()]);
-        assert_eq!(hints[0].code, "%_v", "应优先空格并击简词 %_v 而非单手简码 _v");
+        assert_eq!(
+            hints[0].code, "%_v",
+            "应优先空格并击简词 %_v 而非单手简码 _v"
+        );
     }
 
     #[test]
@@ -1758,5 +1936,154 @@ algebra:
         assert_eq!(SchemeDict::calculate_code_strokes("%+X"), 1);
         assert_eq!(SchemeDict::calculate_code_strokes("%XY"), 1);
     }
-}
 
+    #[test]
+    fn scheme_info_display_label() {
+        let info = SchemeInfo {
+            id: "yoyo-pure".to_string(),
+            display_name: "麓鸣纯形·六脉".to_string(),
+            path: PathBuf::from("/x/yoyo-pure.schema.yaml"),
+        };
+        assert_eq!(info.display_label(), "麓鸣纯形·六脉 (yoyo-pure)");
+    }
+
+    #[test]
+    fn discover_schemes_excludes_config_and_patch_files() {
+        // T83：临时目录含「真方案 + 配置文件 + patch 文件 + dict 文件」，
+        // discover_schemes 只返回含顶层 schema/name 的真·输入方案。
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!("dazitui_discover_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // 真方案 A（schema/name 缩进形式）
+        let a = dir.join("yoyo-pure.schema.yaml");
+        fs::write(&a, "schema:\n  name: 麓鸣纯形·六脉\nschema_id: yoyo-pure\n").unwrap();
+        // 真方案 B（schema/name 扁平形式）
+        let b = dir.join("kongmingma.schema.yaml");
+        fs::write(&b, "schema/name: 空明码\n").unwrap();
+
+        // 配置文件：.yaml 非 .schema.yaml —— 即便含 schema/name 也应被后缀过滤排除
+        let cfg = dir.join("default.yaml");
+        fs::write(&cfg, "schema/name: 默认\n").unwrap();
+        let weasel = dir.join("weasel.yaml");
+        fs::write(&weasel, "schema:\n  name: 小狼毫\n").unwrap();
+        // patch / 片段：.schema.yaml 但无 schema/name
+        let patch = dir.join("yoyo.schema.yaml");
+        fs::write(&patch, "__patch:\n  translator/dictionary: yoyo\n").unwrap();
+        // 普通词典不算 schema
+        let dict = dir.join("yoyo-pure.dict.yaml");
+        fs::write(&dict, "---\nname: yoyo-pure\n...\n\n我\tq\n").unwrap();
+
+        let schemes = discover_schemes(&dir);
+        let ids: Vec<&str> = schemes.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["kongmingma", "yoyo-pure"],
+            "只应发现两个真方案，按 id 排序"
+        );
+
+        // SchemeInfo 字段正确
+        let yoyo = schemes.iter().find(|s| s.id == "yoyo-pure").unwrap();
+        assert_eq!(yoyo.display_name, "麓鸣纯形·六脉");
+        assert_eq!(yoyo.path, a);
+        assert_eq!(yoyo.display_label(), "麓鸣纯形·六脉 (yoyo-pure)");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn discover_schemes_live_real_fcitx5_matches_expected() {
+        // T83：对真实 ~/.local/share/fcitx5/rime 实跑核对，避免 yoyo.yaml 等被漏判或误收。
+        // 仅当本机存在 fcitx5/rime 目录时实跑，避免无环境时 CI 报错。
+        let data_home = std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                std::env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join(".local")
+                    .join("share")
+            });
+        let rime_dir = data_home.join("fcitx5").join("rime");
+        if !rime_dir.exists() {
+            return;
+        }
+        let schemes = discover_schemes(&rime_dir);
+        let ids: Vec<&str> = schemes.iter().map(|s| s.id.as_str()).collect();
+
+        // 已知确定性子集必须存在
+        for expected in ["yoyo-pure", "kongmingma", "english", "yoyo-yx"] {
+            assert!(
+                ids.contains(&expected),
+                "应发现真实方案 {expected}，实际发现: {ids:?}"
+            );
+        }
+        // 绝不应把配置文件误收为方案
+        for forbidden in [
+            "default",
+            "weasel",
+            "symbols",
+            "punctuation",
+            "user",
+            "installation",
+            "key_bindings",
+            "yoyo",
+        ] {
+            assert!(
+                !ids.contains(&forbidden),
+                "不应把配置文件 {forbidden} 误收为方案，实际: {ids:?}"
+            );
+        }
+        assert!(
+            schemes.len() >= 13,
+            "至少应发现 13 个真实方案，实际 {} 个: {ids:?}",
+            schemes.len()
+        );
+        // 每个发现的方案都必须带展示名且路径存在
+        for s in &schemes {
+            assert!(!s.display_name.is_empty(), "方案 {} 缺少展示名", s.id);
+            assert!(s.path.exists(), "方案 {} 的 schema 路径不存在", s.id);
+        }
+    }
+
+    #[test]
+    fn resolve_scheme_path_via_discovery_prefers_discovered_then_custom() {
+        // T85：id 解析优先级——发现结果精确匹配 > 自定义映射 > 旧式多目录解析。
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!("dazitui_resolve_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let schema = dir.join("yoyo-pure.schema.yaml");
+        fs::write(&schema, "schema:\n  name: 麓鸣纯形·六脉\n").unwrap();
+        let custom_file = dir.join("my-custom.schema.yaml");
+        fs::write(&custom_file, "schema:\n  name: 自定义\n").unwrap();
+
+        let discovered = discover_schemes(&dir);
+        let mut custom = HashMap::new();
+        custom.insert(
+            "my-custom".to_string(),
+            custom_file.to_string_lossy().into_owned(),
+        );
+
+        // 1. 发现结果精确匹配
+        assert_eq!(
+            resolve_scheme_path_via_discovery("yoyo-pure", &discovered, &custom),
+            Some(schema.clone())
+        );
+        // 2. 自定义映射
+        assert_eq!(
+            resolve_scheme_path_via_discovery("my-custom", &discovered, &custom),
+            Some(custom_file.clone())
+        );
+        // 3. 空 id 返回 None
+        assert_eq!(
+            resolve_scheme_path_via_discovery("", &discovered, &custom),
+            None
+        );
+        // 4. 未知 id 回退旧式解析（可能 None，不应 panic）
+        let _ = resolve_scheme_path_via_discovery("does-not-exist", &discovered, &custom);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
