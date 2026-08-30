@@ -13307,3 +13307,301 @@ mod scheme_switch_watch_tests {
         );
     }
 }
+
+/// 热监控外部行为回归测试（issue #99）：全程使用临时目录 fixture，
+/// 避开 live fcitx5/rime，保证 hermetic 与可移植；最高测试缝为每帧 `poll_scheme_loader`。
+#[cfg(test)]
+mod scheme_hot_reload_regression_tests {
+    use super::*;
+    use dazitui_core::{ApiClient, SchemeDict, SchemeInfo, SettingsStore, TextSource, TokenStore};
+    use std::time::Duration;
+
+    fn tmp(suffix: &str) -> PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("dazitui-reg-{stamp}-{suffix}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn file_text(content: &str) -> Text {
+        Text {
+            title: "t".into(),
+            content: content.into(),
+            source: TextSource::File,
+            word_boundaries: None,
+            shuffled: false,
+        }
+    }
+
+    /// 最小 App，指向单个临时方案（避开本机真实 fcitx5 方案）。
+    fn app_with_scheme(schema_path: PathBuf) -> App {
+        let token_dir = tmp("tok");
+        let settings_dir = tmp("set");
+        let mut app = App::new_with(
+            file_text("练习"),
+            TokenStore::new(token_dir.join("token")),
+            ApiClient::with_base_url_and_store(
+                "http://127.0.0.1:1",
+                Some(TokenStore::new(token_dir.join("token"))),
+            ),
+            SettingsStore::new(settings_dir.join("settings")),
+            None,
+        );
+        app.settings.scheme = "demo".to_string();
+        app.discovered = vec![SchemeInfo {
+            id: "demo".to_string(),
+            display_name: "Demo".to_string(),
+            path: schema_path,
+        }];
+        app
+    }
+
+    /// 最小 App，指向多个临时方案（用于切方案场景）。
+    fn app_with_schemes(schemas: &[(String, PathBuf)]) -> App {
+        let token_dir = tmp("tok");
+        let settings_dir = tmp("set");
+        let mut app = App::new_with(
+            file_text("练习"),
+            TokenStore::new(token_dir.join("token")),
+            ApiClient::with_base_url_and_store(
+                "http://127.0.0.1:1",
+                Some(TokenStore::new(token_dir.join("token"))),
+            ),
+            SettingsStore::new(settings_dir.join("settings")),
+            None,
+        );
+        app.settings.scheme = String::new();
+        app.discovered = schemas
+            .iter()
+            .map(|(id, p)| SchemeInfo {
+                id: id.clone(),
+                display_name: id.clone(),
+                path: p.clone(),
+            })
+            .collect();
+        app
+    }
+
+    /// 同步等待当前方案首次加载完成（不触发热监控）。
+    fn load_initial(app: &mut App) -> bool {
+        app.reload_scheme_dict();
+        for _ in 0..30 {
+            app.poll_scheme_loader();
+            if app.scheme_dict.is_some() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        false
+    }
+
+    /// 驱动热重载循环（每帧：先检测改动，再消费异步结果），直到 `pred` 满足。
+    fn drive_hot_reload(app: &mut App, pred: impl Fn(&App) -> bool) -> bool {
+        for _ in 0..80 {
+            app.poll_scheme_hot_reload();
+            std::thread::sleep(Duration::from_millis(50));
+            app.poll_scheme_loader();
+            if pred(app) {
+                return true;
+            }
+        }
+        false
+    }
+
+    // (1) 变更被 watch 文件 → 确实触发重新加载且 scheme_dict 更新
+    #[test]
+    fn regression_watched_file_change_triggers_reload() {
+        let dir = tmp("r1");
+        let schema = dir.join("demo.schema.yaml");
+        let dict = dir.join("demo.dict.yaml");
+        std::fs::write(&schema, "schema:\n  name: Demo\n  schema_id: demo\n").unwrap();
+        std::fs::write(&dict, "---\nname: demo\n...\n\n文\tvw\n").unwrap();
+
+        let mut app = app_with_scheme(schema.clone());
+        assert!(load_initial(&mut app), "初始加载应成功");
+        assert_eq!(
+            app.scheme_dict
+                .as_ref()
+                .and_then(|d| d.get_primary_code("文")),
+            Some("vw")
+        );
+
+        std::fs::write(&dict, "---\nname: demo\n...\n\n文\tvw\n新\txx\n").unwrap();
+
+        let ok = drive_hot_reload(&mut app, |a| {
+            a.scheme_dict
+                .as_ref()
+                .and_then(|d| d.get_primary_code("新"))
+                == Some("xx")
+        });
+        assert!(
+            ok,
+            "(1) 变更被 watch 文件应触发热重载并使新词条生效"
+        );
+    }
+
+    // (2) 部署坏 YAML → 旧方案被保留
+    #[test]
+    fn regression_bad_deploy_keeps_old_scheme() {
+        let dir = tmp("r2");
+        let schema = dir.join("demo.schema.yaml");
+        let dict = dir.join("demo.dict.yaml");
+        std::fs::write(&schema, "schema:\n  name: Demo\n  schema_id: demo\n").unwrap();
+        std::fs::write(&dict, "---\nname: demo\n...\n\n文\tvw\n").unwrap();
+
+        let mut app = app_with_scheme(schema.clone());
+        assert!(load_initial(&mut app), "初始加载应成功");
+
+        // 坏部署：词典文件换成同名目录，使后台读取失败
+        std::fs::remove_file(&dict).unwrap();
+        std::fs::create_dir(&dict).unwrap();
+
+        let failed = drive_hot_reload(&mut app, |a| a.scheme_reload_error.is_some());
+        assert!(failed, "(2) 坏部署应失败并报错");
+        assert_eq!(
+            app.scheme_dict
+                .as_ref()
+                .and_then(|d| d.get_primary_code("文")),
+            Some("vw"),
+            "(2) 失败应保留旧方案"
+        );
+
+        // 修复部署
+        std::fs::remove_dir(&dict).unwrap();
+        std::fs::write(&dict, "---\nname: demo\n...\n\n文\tvw\n新\txx\n").unwrap();
+        let recovered = drive_hot_reload(&mut app, |a| {
+            a.scheme_dict
+                .as_ref()
+                .and_then(|d| d.get_primary_code("新"))
+                == Some("xx")
+        });
+        assert!(recovered, "(2) 修复后应成功重载");
+        assert!(app.scheme_reload_error.is_none(), "(2) 成功应清除错误");
+    }
+
+    // (3) scheme_cache 驱逐确实强制了重新派发（非命中旧缓存）
+    #[test]
+    fn regression_cache_eviction_forces_redispatch() {
+        let dir = tmp("r3");
+        let schema = dir.join("demo.schema.yaml");
+        let dict = dir.join("demo.dict.yaml");
+        std::fs::write(&schema, "schema:\n  name: Demo\n  schema_id: demo\n").unwrap();
+        std::fs::write(&dict, "---\nname: demo\n...\n\n文\tvw\n").unwrap();
+
+        let mut app = app_with_scheme(schema.clone());
+        assert!(load_initial(&mut app), "初始加载应成功");
+        // 缓存已填充当前方案
+        assert!(app.scheme_cache.contains_key("demo"));
+
+        // 注入一条「陈旧伪造」缓存：若热重载命中旧缓存，scheme_dict 会错误包含该词条
+        let mut stale = SchemeDict::default();
+        stale.add_entry("缓存", "stale");
+        app.scheme_cache.insert("demo".to_string(), stale);
+
+        // 修改磁盘文件：新增「新→xx」
+        std::fs::write(&dict, "---\nname: demo\n...\n\n文\tvw\n新\txx\n").unwrap();
+
+        let ok = drive_hot_reload(&mut app, |a| {
+            a.scheme_dict
+                .as_ref()
+                .and_then(|d| d.get_primary_code("新"))
+                == Some("xx")
+        });
+        assert!(
+            ok,
+            "(3) 热重载应重新派发并从磁盘读取新内容"
+        );
+
+        // 断言 scheme_dict 来自磁盘（含新词条），且未命中陈旧伪造缓存
+        assert_eq!(
+            app.scheme_dict
+                .as_ref()
+                .and_then(|d| d.get_primary_code("新")),
+            Some("xx")
+        );
+        assert!(
+            app.scheme_dict
+                .as_ref()
+                .and_then(|d| d.get_primary_code("缓存"))
+                .is_none(),
+            "(3) 热重载不应命中被驱逐前的陈旧缓存"
+        );
+
+        // 断言缓存已被驱逐并重新派发填充为磁盘内容
+        let cached = app
+            .scheme_cache
+            .get("demo")
+            .expect("(3) 缓存应被重新填充");
+        assert_eq!(cached.get_primary_code("新"), Some("xx"));
+        assert!(
+            cached.get_primary_code("缓存").is_none(),
+            "(3) 重新填充的缓存不应含陈旧伪造词条"
+        );
+    }
+
+    // (4) 切方案时 watch 闭包随之切换
+    #[test]
+    fn regression_switch_scheme_switches_watch_closure() {
+        let dir = tmp("r4");
+        let d_schema = dir.join("demo.schema.yaml");
+        let d_dict = dir.join("demo.dict.yaml");
+        std::fs::write(&d_schema, "schema:\n  name: Demo\n  schema_id: demo\n").unwrap();
+        std::fs::write(&d_dict, "---\nname: demo\n...\n\n文\tvw\n").unwrap();
+        let a_schema = dir.join("alt.schema.yaml");
+        let a_dict = dir.join("alt.dict.yaml");
+        std::fs::write(&a_schema, "schema:\n  name: Alt\n  schema_id: alt\n").unwrap();
+        std::fs::write(&a_dict, "---\nname: alt\n...\n\n字\tqq\n").unwrap();
+
+        let mut app = app_with_schemes(&[
+            ("demo".to_string(), d_schema.clone()),
+            ("alt".to_string(), a_schema.clone()),
+        ]);
+
+        app.settings.scheme = "demo".to_string();
+        app.reload_scheme_dict();
+        let mut demo_loaded = false;
+        for _ in 0..30 {
+            app.poll_scheme_loader();
+            if app
+                .scheme_watch_paths
+                .as_ref()
+                .map(|p| p.contains(&d_dict))
+                .unwrap_or(false)
+            {
+                demo_loaded = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(demo_loaded, "(4) demo 应加载并监控其源文件");
+
+        // 切到 alt
+        app.settings.scheme = "alt".to_string();
+        app.reload_scheme_dict();
+        let mut alt_loaded = false;
+        for _ in 0..30 {
+            app.poll_scheme_loader();
+            if app
+                .scheme_watch_paths
+                .as_ref()
+                .map(|p| p.contains(&a_dict))
+                .unwrap_or(false)
+            {
+                alt_loaded = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(alt_loaded, "(4) 切到 alt 应重建监控闭包到 alt 源文件");
+        assert!(
+            app.scheme_watch_paths
+                .as_ref()
+                .map(|p| !p.contains(&d_dict))
+                .unwrap_or(false),
+            "(4) 切方案后不应再监控原 demo 文件"
+        );
+    }
+}
