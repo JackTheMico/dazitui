@@ -245,6 +245,12 @@ const FOCUS_CODE_HINT: usize = 7;
 /// 设置视图焦点项总数。
 const SETTINGS_FOCUS_COUNT: usize = 8;
 
+/// 成绩视图「错字时间线」一屏最多可见的错字条数（超出部分滚动查看）。
+const ERROR_TIMELINE_VISIBLE: usize = 8;
+
+/// 极小终端降级展示时「错字时间线」并进成绩摘要块的可见条数。
+const ERROR_TIMELINE_COMPACT_ROWS: usize = 3;
+
 /// 预设中「自定义」项的标签（哨兵值，选中即打开文本弹窗）。
 const SCHEME_CUSTOM: &str = "自定义";
 
@@ -412,17 +418,15 @@ const SIDEBAR_MENU_ITEMS: &[SidebarMenuItem] = &[
 /// 成绩视图里的成绩上传状态（在线赛文完成跟打后自动上传）。
 #[derive(Debug, Clone, PartialEq)]
 enum UploadState {
-    /// 非在线赛文：无需上传；`copied_stats` 为完成时已复制到剪贴板的统计分享文本（自由发文/离线赛文）。
+    /// 非在线赛文：无需上传；`copied_stats` 非空表示完成时已把统计分享文本复制到剪贴板（自由发文/离线赛文）。
     NotApplicable { copied_stats: Option<String> },
     /// 上传中（同步网络请求期间）。
     Uploading,
-    /// 上传成功：结构化排名（`None` = 服务器未返回）+ 已复制的分享文本。
-    Success {
-        ranking: Option<String>,
-        share_text: String,
-    },
+    /// 上传成功：结构化排名（`None` = 服务器未返回）。
+    /// 分享文本已在上传成功时写入剪贴板，成绩视图不再重复展示（顶部摘要已含全部指标）。
+    Success { ranking: Option<String> },
     /// 上传失败：友好文案 + 是否需要重新登录 + 原始服务器错误（次要信息）。
-    /// `copied_stats` 为失败时已复制到剪贴板的统计分享文本（成绩不因网络问题丢失）。
+    /// `copied_stats` 非空表示失败时已把统计分享文本复制到剪贴板（成绩不因网络问题丢失）。
     Failed {
         message: String,
         need_relogin: bool,
@@ -676,6 +680,10 @@ struct App {
     settings_store: SettingsStore,
     /// 设置视图当前焦点项（FOCUS_THEME/FOCUS_RATIO/FOCUS_BOLD/FOCUS_KEYBOARD/FOCUS_SCHEME/FOCUS_INPUT_METHOD）。
     settings_focus: usize,
+    /// 成绩视图「错字时间线」当前选中项下标（每次进入成绩视图重置为 0）。
+    error_point_selected: usize,
+    /// 成绩视图「错字时间线」滚动偏移，始终跟随选中项保持在可见窗口内。
+    error_point_scroll: usize,
     /// 内置赛文浏览中的乱序开关（`true` = 载入时打乱顺序）。
     builtin_shuffle: bool,
     /// 内置赛文浏览器预览缓存 `(title, body)`。
@@ -903,6 +911,8 @@ impl App {
             browse_selection: 0,
             builtin_selection: 0,
             browse_error: None,
+            error_point_selected: 0,
+            error_point_scroll: 0,
             token_store,
             token,
             logged_in,
@@ -931,6 +941,44 @@ impl App {
         };
         app.reload_scheme_dict();
         app
+    }
+
+    /// 成绩视图「错字时间线」的错字条目数；非成绩视图返回 `None`。
+    fn error_point_count(&self) -> Option<usize> {
+        match &self.state {
+            AppState::Finished { stats, .. } => Some(stats.error_points.len()),
+            _ => None,
+        }
+    }
+
+    /// 成绩视图「错字时间线」：选中项相对当前位置偏移 `delta` 条（正负均可），并同步滚动窗口。
+    ///
+    /// 越界自动夹取到首/末条；非成绩视图或无错字时无操作。
+    fn move_error_point(&mut self, delta: isize) {
+        let Some(total) = self.error_point_count() else {
+            return;
+        };
+        if total == 0 {
+            return;
+        }
+        let current = self.error_point_selected.min(total - 1) as isize;
+        let next = (current + delta).clamp(0, total as isize - 1) as usize;
+        self.error_point_selected = next;
+        self.error_point_scroll =
+            clamp_error_scroll(next, self.error_point_scroll, total, ERROR_TIMELINE_VISIBLE);
+    }
+
+    /// 成绩视图「错字时间线」：直接选中第 `idx` 条（越界夹取到首/末条）。
+    fn select_error_point(&mut self, idx: usize) {
+        let Some(total) = self.error_point_count() else {
+            return;
+        };
+        if total == 0 {
+            return;
+        }
+        let target = idx.min(total - 1) as isize;
+        let current = self.error_point_selected.min(total - 1) as isize;
+        self.move_error_point(target - current);
     }
 
     /// 进入设置视图：刷新「已发现方案」列表（按当前 fcitx5 部署目录），再切到 Settings 状态。
@@ -1237,6 +1285,9 @@ impl App {
             self.accumulated_elapsed
         };
         let stats = self.session.finish(elapsed);
+        // 新一轮成绩：错字时间线从头开始选中。
+        self.error_point_selected = 0;
+        self.error_point_scroll = 0;
 
         // 异步持久化有效练习流水到 SQLite 数据库（过滤字数为0或用时 < 0.5s 的瞬时/无效跟打，防止脏数据污染）
         if let Some(worker) = &self.db_worker
@@ -1597,10 +1648,10 @@ impl App {
             .upload_session(&self.text, stats, elapsed, &self.settings.input_method)
         {
             Ok(outcome) => {
+                // 分享文本只写入剪贴板：成绩视图顶部摘要已展示全部指标，不再重复渲染。
                 write_clipboard(&outcome.share_text);
                 UploadState::Success {
                     ranking: outcome.ranking,
-                    share_text: outcome.share_text,
                 }
             }
             Err(e) => {
@@ -2886,6 +2937,7 @@ fn handle_key(
 /// - o / O: 打开设置视图
 /// - u / U: 打开登录模态框
 /// - 1/2/3: 在线比赛
+/// - ↑/↓ / j/k: 在错字时间线中移动选中项；PgUp/PgDn 翻页；Home/End(g/G) 跳到首/末条
 /// - Esc / q / Q: 返回主界面（重置会话为就绪状态；在线赛文重置回内置赛文）
 /// - Enter / r / R: 重新开始跟打当前赛文（仅限离线/内置赛文）
 fn handle_finished_key(app: &mut App, key: KeyEvent) -> bool {
@@ -2923,6 +2975,30 @@ fn handle_finished_key(app: &mut App, key: KeyEvent) -> bool {
         return true;
     }
     match key.code {
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.move_error_point(-1);
+            true
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.move_error_point(1);
+            true
+        }
+        KeyCode::PageUp => {
+            app.move_error_point(-(ERROR_TIMELINE_VISIBLE as isize));
+            true
+        }
+        KeyCode::PageDown => {
+            app.move_error_point(ERROR_TIMELINE_VISIBLE as isize);
+            true
+        }
+        KeyCode::Home | KeyCode::Char('g') => {
+            app.select_error_point(0);
+            true
+        }
+        KeyCode::End | KeyCode::Char('G') => {
+            app.select_error_point(usize::MAX);
+            true
+        }
         KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
             if app.text.is_online() {
                 app.text = load_builtin_text(BUILTIN_SETS[0]);
@@ -5946,7 +6022,7 @@ fn render_result_view(
         summary_lines.push(Line::from(format!(" 回改明细: {details}")));
     }
     // 上传状态（在线赛文）/ 统计复制状态（自由发文与离线赛文）
-    summary_lines.extend(upload_lines(upload, theme));
+    summary_lines.extend(upload_lines(upload, theme, &app.settings.input_method));
 
     // 计算顶部高度：内容行按终端内宽折算换行（超宽行占多行）后的总行数 + 边框 2 行
     let inner_width = (total_area.width.saturating_sub(2)).max(1) as usize;
@@ -5956,50 +6032,10 @@ fn render_result_view(
         .sum();
     let summary_height = (content_rows + 2) as u16;
 
-    // 2. 错字时间线行生成
-    let mut timeline_lines = Vec::new();
-    if stats.error_points.is_empty() {
-        timeline_lines.push(Line::from(" 全对无错字").fg(palette.success));
-    } else {
-        let max_show = 4;
-        for ep in stats.error_points.iter().take(max_show) {
-            match &ep.error_type {
-                ErrorType::Mismatch { typed, expected } => {
-                    timeline_lines.push(
-                        Line::from(format!(
-                            "   [{:04.1}s] 错字: '{}' (期望'{}') · WPM {:.1}",
-                            ep.time_secs,
-                            typed,
-                            expected
-                                .map(|c| c.to_string())
-                                .unwrap_or_else(|| "?".into()),
-                            ep.wpm
-                        ))
-                        .fg(palette.error),
-                    );
-                }
-                ErrorType::Backspace { deleted } => {
-                    timeline_lines.push(
-                        Line::from(format!(
-                            "   [{:04.1}s] 回改: '{}' · WPM {:.1}",
-                            ep.time_secs, deleted, ep.wpm
-                        ))
-                        .fg(palette.warning),
-                    );
-                }
-            }
-        }
-        if stats.error_points.len() > max_show {
-            timeline_lines.push(
-                Line::from(format!(
-                    "   ... 共有 {} 处错字记录",
-                    stats.error_points.len()
-                ))
-                .fg(palette.muted),
-            );
-        }
-    }
-    let timeline_height = (timeline_lines.len() as u16 + 2).min(8);
+    // 2. 错字时间线行生成（按当前选中项滚动，↑/↓ 可翻看全部错字）
+    let total_errors = stats.error_points.len();
+    let visible_rows = total_errors.clamp(1, ERROR_TIMELINE_VISIBLE);
+    let timeline_height = visible_rows as u16 + 2;
 
     // 3. 底部操作提示
     let hint_str = if app.text.is_online() {
@@ -6029,12 +6065,20 @@ fn render_result_view(
             Style::default().fg(palette.fg),
         ),
     ]);
-    if total_area.height < 14 {
+    // 高度不足时图表会挤掉时间线（实测 14 行时可见区为 0 行），
+    // 降级为「摘要 + 时间线」单块展示，保证错字条目始终可翻看。
+    if total_area.height < 16 {
         let [top_area, bottom_area] =
             Layout::vertical([Constraint::Min(0), Constraint::Length(3)]).areas(total_area);
         let mut all_lines = summary_lines;
         all_lines.push(Line::from(""));
-        all_lines.extend(timeline_lines);
+        all_lines.extend(error_timeline_lines(
+            stats,
+            app.error_point_selected,
+            app.error_point_scroll,
+            visible_rows.min(ERROR_TIMELINE_COMPACT_ROWS),
+            &palette,
+        ));
         frame.render_widget(
             Paragraph::new(all_lines)
                 .block(themed_block(&palette, true).title(result_title))
@@ -6167,16 +6211,18 @@ fn render_result_view(
         &palette,
     );
 
-    let timeline_title = Line::from(vec![Span::styled(
-        " 错字时间线 ",
-        Style::default()
-            .fg(palette.accent)
-            .add_modifier(Modifier::BOLD),
-    )]);
+    let timeline_title = error_timeline_title(total_errors, app.error_point_selected, &palette);
+    let capacity = (timeline_area.height.saturating_sub(2)) as usize;
     frame.render_widget(
-        Paragraph::new(timeline_lines)
-            .block(themed_block(&palette, true).title(timeline_title))
-            .wrap(Wrap { trim: false }),
+        Paragraph::new(error_timeline_lines(
+            stats,
+            app.error_point_selected,
+            app.error_point_scroll,
+            capacity,
+            &palette,
+        ))
+        .block(themed_block(&palette, true).title(timeline_title))
+        .wrap(Wrap { trim: false }),
         timeline_area,
     );
 
@@ -6190,6 +6236,133 @@ fn render_result_view(
         Paragraph::new(hint_line).block(themed_block(&palette, false).title(hint_title)),
         hint_area,
     );
+}
+
+/// 把错字时间线的滚动偏移修正到「刚好让 `selected` 可见」，`capacity` 为一屏可见条数。
+///
+/// 按键处理只掌握常量窗口大小，渲染时才知道终端实际容量；二者共用本函数，
+/// 保证任何容量下选中项都不会滚出可见区。
+fn clamp_error_scroll(selected: usize, scroll: usize, total: usize, capacity: usize) -> usize {
+    if total == 0 || capacity == 0 {
+        return 0;
+    }
+    let mut scroll = scroll.min(total.saturating_sub(capacity));
+    if selected < scroll {
+        scroll = selected;
+    } else if selected >= scroll + capacity {
+        scroll = selected + 1 - capacity;
+    }
+    scroll
+}
+
+/// 成绩视图「错字时间线」的区块标题：无错字时只显示标题，有错字时附上「第 n/m 处」与翻看提示。
+///
+/// 序号按总条数的位数右对齐补空，使标题渲染宽度恒定
+/// （宽度逐帧变化会在宽字符后留下上一帧的残影）。
+fn error_timeline_title(total: usize, selected: usize, palette: &ThemePalette) -> Line<'static> {
+    let mut spans = vec![Span::styled(
+        " 错字时间线 ",
+        Style::default()
+            .fg(palette.accent)
+            .add_modifier(Modifier::BOLD),
+    )];
+    if total > 0 {
+        let width = total.to_string().len();
+        spans.push(Span::styled(
+            format!(
+                " 第 {:>width$}/{} 处 · ↑/↓ 翻看 ",
+                selected.min(total - 1) + 1,
+                total
+            ),
+            Style::default().fg(palette.muted),
+        ));
+    }
+    Line::from(spans)
+}
+
+/// 生成成绩视图「错字时间线」的可见行（纯函数，供渲染与测试）。
+///
+/// 每个错字点占一行，选中项加 `▶` 光标与选中底色；返回行数不超过 `capacity`。
+/// `selected` 越界时夹取到末条，`scroll` 会被修正到「刚好让选中项可见」的偏移。
+fn error_timeline_lines(
+    stats: &Stats,
+    selected: usize,
+    scroll: usize,
+    capacity: usize,
+    palette: &ThemePalette,
+) -> Vec<Line<'static>> {
+    if stats.error_points.is_empty() {
+        return vec![Line::from(" 全对无错字").fg(palette.success)];
+    }
+    if capacity == 0 {
+        return Vec::new();
+    }
+    let total = stats.error_points.len();
+    let selected = selected.min(total - 1);
+    // 序号按总条数的位数定宽，滚动时各行渲染宽度保持不变。
+    let index_width = total.to_string().len();
+    // 终端高度变化时按真实容量重算偏移，保证选中项仍在可见窗口内。
+    let scroll = clamp_error_scroll(selected, scroll, total, capacity);
+
+    stats
+        .error_points
+        .iter()
+        .enumerate()
+        .skip(scroll)
+        .take(capacity)
+        .map(|(idx, ep)| {
+            let is_selected = idx == selected;
+            let (label, label_fg) = match &ep.error_type {
+                ErrorType::Mismatch { typed, expected } => (
+                    format!(
+                        "错字: '{}' (期望'{}')",
+                        typed,
+                        expected
+                            .map(|c| c.to_string())
+                            .unwrap_or_else(|| "?".to_string())
+                    ),
+                    palette.error,
+                ),
+                ErrorType::Backspace { deleted } => (format!("回改: '{deleted}'"), palette.warning),
+            };
+            let meta_fg = if is_selected {
+                palette.accent
+            } else {
+                palette.muted
+            };
+            Line::from(vec![
+                Span::styled(
+                    if is_selected { "▶" } else { " " },
+                    Style::default().bold().fg(palette.accent),
+                ),
+                Span::styled(
+                    format!("#{:<index_width$}", idx + 1),
+                    Style::default().fg(meta_fg),
+                ),
+                Span::styled(
+                    format!(" [{:04.1}s] ", ep.time_secs),
+                    Style::default().fg(meta_fg),
+                ),
+                Span::styled(
+                    label,
+                    Style::default().fg(label_fg).add_modifier(if is_selected {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+                ),
+                Span::styled(
+                    format!(" · WPM {:.1}", ep.wpm),
+                    Style::default().fg(meta_fg),
+                ),
+            ])
+            .style(if is_selected {
+                Style::default().bg(palette.selection)
+            } else {
+                Style::default()
+            })
+        })
+        .collect()
 }
 
 /// 在速度折线图上直接标注打错点（红点）及对应的错字字符（标注在红点上方，支持多字词语组合连续展示与防碰撞）。
@@ -6336,7 +6509,9 @@ fn overlay_error_chars_on_chart(
 }
 
 /// 成绩视图里的上传状态行（纯函数，供渲染与测试）。
-fn upload_lines(upload: &UploadState, theme: Theme) -> Vec<Line<'static>> {
+///
+/// `input_method` 为上传所用的输入法名（设置项「上传名称」），仅在线上传成功时展示。
+fn upload_lines(upload: &UploadState, theme: Theme, input_method: &str) -> Vec<Line<'static>> {
     match upload {
         UploadState::NotApplicable { copied_stats } => match copied_stats {
             None => vec![],
@@ -6348,10 +6523,7 @@ fn upload_lines(upload: &UploadState, theme: Theme) -> Vec<Line<'static>> {
             Line::from(""),
             Line::from(" 成绩上传中…").fg(color(theme.warn)),
         ],
-        UploadState::Success {
-            ranking,
-            share_text,
-        } => {
+        UploadState::Success { ranking } => {
             let mut lines = vec![Line::from("")];
             match ranking {
                 Some(r) => {
@@ -6361,7 +6533,14 @@ fn upload_lines(upload: &UploadState, theme: Theme) -> Vec<Line<'static>> {
                 }
                 None => lines.push(Line::from(" 已上传").fg(color(theme.accent))),
             }
-            lines.push(Line::from(format!(" 分享: {share_text}")).fg(color(theme.accent)));
+            // 上传名称是成绩提交到 52dazi 的身份标识，顶部摘要里没有，
+            // 不随整段分享文本一起删掉，单独保留一行。
+            if !input_method.is_empty() {
+                lines
+                    .push(Line::from(format!(" 上传名称: {input_method}")).fg(color(theme.accent)));
+            }
+            // 与离线赛文口径一致：顶部摘要已完整展示各项指标（含 emoji），
+            // 整段分享文本仅复制到剪贴板，此处不再重复展示。
             lines.push(Line::from(" 已复制到剪贴板").fg(color(theme.muted)));
             lines
         }
@@ -6383,8 +6562,8 @@ fn upload_lines(upload: &UploadState, theme: Theme) -> Vec<Line<'static>> {
                     Line::from(" 请按 Ctrl-O 重新登录（登录后自动重试上传）").fg(color(theme.warn)),
                 );
             }
-            if let Some(stats_text) = copied_stats {
-                lines.push(Line::from(format!(" 统计: {stats_text}")).fg(color(theme.accent)));
+            if copied_stats.is_some() {
+                // 同上：整段统计文本仅复制到剪贴板，不再重复展示。
                 lines.push(Line::from(" 已复制到剪贴板").fg(color(theme.muted)));
             }
             lines
@@ -8868,7 +9047,14 @@ mod tests {
     fn upload_lines_renders_each_state() {
         let theme = Theme::preset(ThemePreset::CatppuccinMocha);
         // 离线未复制：不显示上传状态。
-        assert!(upload_lines(&UploadState::NotApplicable { copied_stats: None }, theme).is_empty());
+        assert!(
+            upload_lines(
+                &UploadState::NotApplicable { copied_stats: None },
+                theme,
+                ""
+            )
+            .is_empty()
+        );
         // 离线已复制统计（自由发文/离线赛文）：不再重复展示整段统计文本（顶部摘要已含），
         // 仅保留「已复制到剪贴板」提示。
         let lines = upload_lines(
@@ -8876,38 +9062,35 @@ mod tests {
                 copied_stats: Some("自由发文《日常》 · WPM 85.2".into()),
             },
             theme,
+            "",
         );
         let text: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
         assert!(!text.iter().any(|s| s.contains("统计: 自由发文《日常》")));
         assert!(text.iter().any(|s| s.contains("已复制到剪贴板")));
         // 上传中。
-        let lines = upload_lines(&UploadState::Uploading, theme);
+        let lines = upload_lines(&UploadState::Uploading, theme, "");
         assert!(lines.iter().any(|l| l.to_string().contains("上传中")));
-        // 成功带排名：排名 + 已上传 + 分享 + 剪贴板。
+        // 成功带排名：排名 + 上传名称 + 剪贴板（分享文本不再重复展示）。
         let lines = upload_lines(
             &UploadState::Success {
                 ranking: Some("5".into()),
-                share_text: "极速杯 第5名《极速杯第100期》 · 🚀WPM 85.2 · ⌨️击键 3.5 · 📏码长 2.8 · ✅正确字数 40/40 · ❌错字 0 · ↩️回改 1 · 🔢键数 140 · 🎯键准 97.29% · 💬打词率 0.00% · ⏱️用时 01:25.230 · 虎码 🖥️dazitui".into(),
             },
             theme,
+            "虎码",
         );
         let text: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
         assert!(
             text.iter()
                 .any(|s| s.contains("第5名") && s.contains("已上传"))
         );
-        assert!(text.iter().any(|s| s.contains("极速杯 第5名")));
+        assert!(text.iter().all(|s| !s.contains("WPM 85.2")));
+        assert!(text.iter().any(|s| s.contains("上传名称: 虎码")));
         assert!(text.iter().any(|s| s.contains("已复制到剪贴板")));
-        // 成功无排名：仍显示已上传。
-        let lines = upload_lines(
-            &UploadState::Success {
-                ranking: None,
-                share_text: "x".into(),
-            },
-            theme,
-        );
+        // 成功无排名：仍显示已上传；未配置上传名称时不显示该行。
+        let lines = upload_lines(&UploadState::Success { ranking: None }, theme, "");
         assert!(lines.iter().any(|l| l.to_string().contains("已上传")));
-        // 失败：显示原因（含原始错误详情）与已复制的统计，不提示重新登录。
+        assert!(lines.iter().all(|l| !l.to_string().contains("上传名称")));
+        // 失败：显示原因（含原始错误详情）与已复制提示，不提示重新登录。
         let lines = upload_lines(
             &UploadState::Failed {
                 message: "网络连接失败".into(),
@@ -8916,6 +9099,7 @@ mod tests {
                 copied_stats: Some("离线赛文《t》 · WPM 85.2".into()),
             },
             theme,
+            "",
         );
         assert!(
             lines
@@ -8928,10 +9112,11 @@ mod tests {
                 .any(|l| l.to_string().contains("原始错误: 传输层错误详情"))
         );
         assert!(lines.iter().all(|l| !l.to_string().contains("重新登录")));
+        // 顶部摘要已含各项指标，失败分支同样不重复展示整段统计文本。
         assert!(
             lines
                 .iter()
-                .any(|l| l.to_string().contains("统计: 离线赛文《t》"))
+                .all(|l| !l.to_string().contains("离线赛文《t》"))
         );
         assert!(
             lines
@@ -8947,6 +9132,7 @@ mod tests {
                 copied_stats: None,
             },
             theme,
+            "",
         );
         assert!(lines.iter().any(|l| l.to_string().contains("重新登录")));
         assert!(
@@ -9045,8 +9231,7 @@ mod tests {
         handle.join().unwrap();
         assert!(matches!(
             &up,
-            UploadState::Success { ranking, share_text }
-                if ranking.as_deref() == Some("5") && share_text.contains("第5名")
+            UploadState::Success { ranking } if ranking.as_deref() == Some("5")
         ));
     }
 
@@ -9477,8 +9662,9 @@ mod tests {
     }
 
     #[test]
-    fn render_result_view_shows_online_share_lines() {
-        // 在线赛文上传成功后：分享文本与「已复制到剪贴板」行应可见
+    fn render_result_view_hides_duplicated_online_share_text() {
+        // 在线赛文上传成功后：整段分享文本不再重复展示（顶部摘要已含全部指标），
+        // 但排名与「已复制到剪贴板」行仍应可见
         // （历史 bug：固定 summary 高度不足导致这两行被裁剪，宽度自适应高度后修复）。
         let mut app = test_app(online_text("你好世界"));
         app.session.type_text("你好世界");
@@ -9486,14 +9672,209 @@ mod tests {
             stats: app.session.finish(Duration::from_secs(4)),
             upload: UploadState::Success {
                 ranking: Some("5".into()),
-                share_text: "极速杯 第5名《极速杯第100期》 · 🚀WPM 85.2 · ⌨️击键 3.5 · 📏码长 2.8 · ✅正确字数 40/40 · ❌错字 0 · ↩️回改 1 · 🔢键数 140 · 🎯键准 97.29% · 💬打词率 0.00% · ⏱️用时 01:25.230 · 虎码 🖥️dazitui".into(),
             },
             elapsed: Duration::from_secs(4),
         };
 
         let content = render_buffer_text(&app, 100, 30);
-        assert!(content.contains("分享:极速杯第5名"), "应显示分享文本行");
+        assert!(!content.contains("WPM85.2"), "不应重复展示分享文本里的指标");
+        assert!(content.contains("排名:第5名·已上传"), "应显示排名行");
         assert!(content.contains("已复制到剪贴板"), "应显示已复制提示");
+    }
+
+    /// 构造带 `n` 处错字的成绩视图：赛文由 `n` 个互不相同的汉字组成，逐字打错。
+    fn finished_app_with_errors(n: usize) -> App {
+        let content: String = "你好世界测试代码编程打字练习".chars().take(n).collect();
+        let mut app = test_app(file_text(&content));
+        for i in 0..n {
+            app.session
+                .type_text_at("四", Duration::from_secs_f64(i as f64 + 1.0));
+        }
+        app.finish_typing();
+        app
+    }
+
+    /// 取出成绩视图里的统计副本（`AppState` 未实现 `Debug`，非成绩视图直接 panic）。
+    fn finished_stats(app: &App) -> Stats {
+        match &app.state {
+            AppState::Finished { stats, .. } => stats.clone(),
+            _ => panic!("expected finished state"),
+        }
+    }
+
+    #[test]
+    fn error_timeline_lines_renders_selection_and_scroll_window() {
+        let app = finished_app_with_errors(12);
+        let stats = finished_stats(&app);
+        let palette = app.palette();
+        assert_eq!(stats.error_points.len(), 12);
+
+        // 无错字：单行提示。
+        let mut empty = stats.clone();
+        empty.error_points.clear();
+        assert_eq!(
+            error_timeline_lines(&empty, 0, 0, 8, &palette)
+                .iter()
+                .map(|l| l.to_string())
+                .collect::<Vec<_>>(),
+            vec![" 全对无错字".to_string()]
+        );
+
+        // 容量裁剪 + 选中项光标。
+        let lines: Vec<String> = error_timeline_lines(&stats, 0, 0, 3, &palette)
+            .iter()
+            .map(|l| l.to_string())
+            .collect();
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].starts_with("▶#1"), "首行应为选中态: {}", lines[0]);
+        assert!(lines[1].starts_with(" #2"), "非选中行无光标: {}", lines[1]);
+
+        // 选中项在窗口外时，滚动偏移自动修正到「刚好可见」。
+        let lines: Vec<String> = error_timeline_lines(&stats, 5, 0, 3, &palette)
+            .iter()
+            .map(|l| l.to_string())
+            .collect();
+        assert_eq!(lines.len(), 3);
+        assert!(lines[2].starts_with("▶#6"), "应滚到选中项: {}", lines[2]);
+        assert!(lines[0].starts_with(" #4"), "窗口应整体下移: {}", lines[0]);
+
+        // 末尾：滚动偏移被总数夹取，选中项始终在末行。
+        let lines: Vec<String> = error_timeline_lines(&stats, 11, 99, 3, &palette)
+            .iter()
+            .map(|l| l.to_string())
+            .collect();
+        assert_eq!(lines.len(), 3);
+        assert!(lines[2].starts_with("▶#12"), "末条应可见: {}", lines[2]);
+
+        // 选中下标越界时夹取到末条，不 panic。
+        let lines: Vec<String> = error_timeline_lines(&stats, 99, 0, 3, &palette)
+            .iter()
+            .map(|l| l.to_string())
+            .collect();
+        assert!(lines[2].starts_with("▶#12"), "越界下标应夹取: {}", lines[2]);
+    }
+
+    #[test]
+    fn finished_key_navigates_error_timeline() {
+        let mut app = finished_app_with_errors(12);
+        assert_eq!(app.error_point_count(), Some(12));
+        assert_eq!(app.error_point_selected, 0);
+
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        for _ in 0..3 {
+            assert!(handle_finished_key(&mut app, down));
+        }
+        assert_eq!(app.error_point_selected, 3);
+        assert!(handle_finished_key(&mut app, up));
+        assert_eq!(app.error_point_selected, 2);
+        // j / k 与方向键等价。
+        assert!(handle_finished_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)
+        ));
+        assert_eq!(app.error_point_selected, 3);
+        assert!(handle_finished_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE)
+        ));
+        assert_eq!(app.error_point_selected, 2);
+
+        // Home/End（含 g/G）跳到首末条，越界保持不动。
+        assert!(handle_finished_key(
+            &mut app,
+            KeyEvent::new(KeyCode::End, KeyModifiers::NONE)
+        ));
+        assert_eq!(app.error_point_selected, 11);
+        // 末条选中时滚动窗口跟到末屏（12 条 / 一屏 8 条 → 偏移 4）。
+        assert_eq!(app.error_point_scroll, 4);
+        assert!(handle_finished_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('G'), KeyModifiers::NONE)
+        ));
+        assert_eq!(app.error_point_selected, 11, "末条继续下移应保持不动");
+        assert!(handle_finished_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)
+        ));
+        assert_eq!(app.error_point_selected, 0);
+        assert_eq!(app.error_point_scroll, 0);
+        assert!(handle_finished_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE)
+        ));
+        assert_eq!(app.error_point_selected, 0, "首条继续上移应保持不动");
+
+        // 翻页按一屏 8 条移动，末页夹取到末条。
+        assert!(handle_finished_key(
+            &mut app,
+            KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)
+        ));
+        assert_eq!(app.error_point_selected, 8);
+        assert!(handle_finished_key(
+            &mut app,
+            KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)
+        ));
+        assert_eq!(app.error_point_selected, 11);
+        assert!(handle_finished_key(
+            &mut app,
+            KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)
+        ));
+        assert_eq!(app.error_point_selected, 3);
+    }
+
+    #[test]
+    fn render_result_view_scrolls_error_timeline() {
+        let mut app = finished_app_with_errors(12);
+        // 一屏 8 条：首屏只显示第 1~8 处，标题里提示总数与当前位置。
+        let content = render_buffer_text(&app, 100, 30);
+        assert!(
+            content.contains("#1") && content.contains("#8"),
+            "{content}"
+        );
+        assert!(!content.contains("#9"), "首屏不应出现第 9 处: {content}");
+        assert!(content.contains("1/12"), "标题应显示当前位置: {content}");
+
+        // 跳到末条后窗口滚动，早期条目被移出可见区。
+        assert!(handle_finished_key(
+            &mut app,
+            KeyEvent::new(KeyCode::End, KeyModifiers::NONE)
+        ));
+        let content = render_buffer_text(&app, 100, 30);
+        assert!(content.contains("12/12"), "标题应跟随选中项: {content}");
+        assert!(content.contains("#12"), "末条应可见: {content}");
+        assert!(!content.contains("#4"), "第 4 处应滚出可见区: {content}");
+    }
+
+    #[test]
+    fn clamp_error_scroll_keeps_selection_visible() {
+        // 一屏 3 条 / 共 12 条：偏移上限为 9。
+        assert_eq!(clamp_error_scroll(0, 9, 12, 3), 0, "选中首条应回到顶部");
+        assert_eq!(clamp_error_scroll(5, 0, 12, 3), 3, "选中项在窗口下方应下滚");
+        assert_eq!(clamp_error_scroll(11, 99, 12, 3), 9, "偏移越界应夹到上限");
+        assert_eq!(clamp_error_scroll(5, 4, 12, 3), 4, "已可见时保持不动");
+        // 容量为 0（终端被挤压到只剩边框）与无错字时都退回 0。
+        assert_eq!(clamp_error_scroll(5, 2, 12, 0), 0);
+        assert_eq!(clamp_error_scroll(0, 3, 0, 3), 0);
+    }
+
+    #[test]
+    fn render_result_view_keeps_timeline_visible_on_short_terminal() {
+        // 15 行终端：图表会挤掉独立时间线区块，降级为「摘要 + 时间线」单块，
+        // 错字条目仍须可见且可翻看（历史问题：可见区被压成 0 行，整块空白）。
+        let mut app = finished_app_with_errors(12);
+        let content = render_buffer_text(&app, 100, 15);
+        assert!(content.contains("▶#1"), "应显示带光标的首条: {content}");
+        assert!(content.contains("#3"), "降级视图应保留多条: {content}");
+
+        // 降级视图下方向键依然能滚动选中项。
+        assert!(handle_finished_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)
+        ));
+        assert_eq!(app.error_point_selected, 1);
+        let content = render_buffer_text(&app, 100, 15);
+        assert!(content.contains("▶#2"), "降级视图应跟随选中项: {content}");
     }
 
     #[test]
