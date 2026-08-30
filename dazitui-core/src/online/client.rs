@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use serde::Deserializer;
 use serde_json::{Map, Value, json};
 
 use super::protocol::encrypt_value;
@@ -178,6 +179,115 @@ pub fn parse_upload_response(body: &str) -> Result<RankResult, ApiError> {
     }
 }
 
+/// 排行榜单行（getCompetitionRank 响应 `rankResult` / `myRankResult` 元素）。
+///
+/// 注意：52dazi 网关对多数数值字段返回**字符串**（如 `speed:"197.18"`、`jianShu:"901"`），
+/// 仅 `rank`/`total`/`textLength` 等为数字。故数值字段统一用「数字或字符串皆可」的灵活反序列化，
+/// 避免某字段偶发类型变化导致整行解析失败。
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompetitionRankRow {
+    /// 排名（数字）。
+    #[serde(default, deserialize_with = "de_flex_u32")]
+    pub rank: u32,
+    /// 用户名。
+    #[serde(default)]
+    pub username: String,
+    /// 速度（WPM）。
+    #[serde(default, deserialize_with = "de_flex_f64")]
+    pub speed: f64,
+    /// 输入法（如「虎码」）。
+    #[serde(default)]
+    pub input_method: String,
+    /// 击键（每秒按键数），v2 可配置列预留。
+    #[serde(default, deserialize_with = "de_flex_f64")]
+    pub keystrokes: f64,
+    /// 码长，v2 可配置列预留。
+    #[serde(default, deserialize_with = "de_flex_f64")]
+    pub ma_chang: f64,
+    /// 键准（百分号字符串），v2 可配置列预留。
+    #[serde(default)]
+    pub jian_zhun: String,
+    /// 键数，v2 可配置列预留。
+    #[serde(default, deserialize_with = "de_flex_u32")]
+    pub jian_shu: u32,
+    /// 回改次数，v2 可配置列预留。
+    #[serde(default, deserialize_with = "de_flex_u32")]
+    pub hui_gai: u32,
+    /// 打词率（百分号字符串），v2 可配置列预留。
+    #[serde(default)]
+    pub da_ci: String,
+    /// 用时（`MM:SS.mmm`），v2 可配置列预留。
+    #[serde(default)]
+    pub typing_time: String,
+    /// 设备（如「极速跟打器v1.82」），v2 可配置列预留。
+    #[serde(default)]
+    pub from: String,
+    /// 门派，v2 可配置列预留。
+    #[serde(default)]
+    pub sect_name: String,
+}
+
+/// 比赛排行榜（getCompetitionRank 响应 `msg` 对象）。
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompetitionRank {
+    /// 榜单行（按名次升序）。
+    #[serde(default)]
+    pub rank_result: Vec<CompetitionRankRow>,
+    /// 当前登录用户在本期榜单中的整行（未登录为空数组）。
+    #[serde(default)]
+    pub my_rank_result: Vec<CompetitionRankRow>,
+    /// 本期总参与人数。
+    #[serde(default, deserialize_with = "de_flex_u32")]
+    pub total: u32,
+    /// 当期赛文标题（视图可显示）。
+    #[serde(default)]
+    pub text_title: String,
+    /// 当期赛文字数。
+    #[serde(default, deserialize_with = "de_flex_u32")]
+    pub text_length: u32,
+}
+
+/// 灵活反序列化：数字或数字字符串都接受为 `u32`（服务端部分字段偶发字符串）。
+fn de_flex_u32<'de, D>(d: D) -> Result<u32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum V {
+        Num(u32),
+        Str(String),
+    }
+    match V::deserialize(d)? {
+        V::Num(n) => Ok(n),
+        V::Str(s) => s.trim().parse().map_err(serde::de::Error::custom),
+    }
+}
+
+/// 灵活反序列化：数字或数字字符串都接受为 `f64`（服务端数值字段多为字符串）。
+fn de_flex_f64<'de, D>(d: D) -> Result<f64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum V {
+        Num(f64),
+        Str(String),
+    }
+    match V::deserialize(d)? {
+        V::Num(n) => Ok(n),
+        V::Str(s) => s.trim().parse().map_err(serde::de::Error::custom),
+    }
+}
+
+/// 解析比赛排行榜响应：外壳 `error != 0` → `Server` 错误，否则 `msg` 反序列化为 `CompetitionRank`。
+pub fn parse_competition_rank_response(body: &str) -> Result<CompetitionRank, ApiError> {
+    parse_api_response(body)
+}
+
 /// 请求体公共字段：`from` + `timestamp` + `version` + `subversions` + 可选 `token`。
 fn base_fields(token: Option<&str>) -> Map<String, Value> {
     let mut m = Map::new();
@@ -219,6 +329,19 @@ fn upload_payload(token: &str, payload: &Value) -> String {
             m.insert(k.clone(), v.clone());
         }
     }
+    encrypt_value(&Value::Object(m))
+}
+
+/// 比赛排行榜请求体（加密后）：`competitionType` + `snum`(当天日期) + `deviceType` + 分页。
+///
+/// 该端点免登录即可调用（公开榜）；传入 `token` 时服务端会在 `myRankResult` 回填当前用户整行。
+fn rank_payload(token: Option<&str>, competition_type: CompetitionType, date: &str) -> String {
+    let mut m = base_fields(token);
+    m.insert("competitionType".into(), json!(competition_type.code()));
+    m.insert("snum".into(), json!(date));
+    m.insert("deviceType".into(), json!(0));
+    m.insert("pagesize".into(), json!(30));
+    m.insert("currentPage".into(), json!(1));
     encrypt_value(&Value::Object(m))
 }
 
@@ -377,6 +500,22 @@ impl ApiClient {
         let body = upload_payload(token, payload);
         let resp = self.post("Api/Rank/uploadResult", &body)?;
         parse_upload_response(&resp)
+    }
+
+    /// 拉取指定比赛、指定日期（期次）的比赛排行榜。
+    ///
+    /// 端点 `Api/Rank/getCompetitionRank` **免登录**即可返回公开榜；若当前已登录（持有 token），
+    /// 响应 `my_rank_result` 会回填当前用户整行（用于视图高亮与「我第 N 名」）。
+    /// 期次 `date` 即当天日期 `YYYY-MM-DD`，与 `getContent` 当日赛文严格对应。
+    pub fn get_competition_rank(
+        &self,
+        competition_type: CompetitionType,
+        date: &str,
+    ) -> Result<CompetitionRank, ApiError> {
+        let token = self.current_token();
+        let body = rank_payload(token.as_deref(), competition_type, date);
+        let resp = self.post("Api/Rank/getCompetitionRank", &body)?;
+        parse_competition_rank_response(&resp)
     }
 
     /// 一站式完成跟打成绩上传（深模块核心接口）：
@@ -586,6 +725,128 @@ mod tests {
         assert_eq!(r.message, "恭喜获得第5名");
         assert_eq!(r.ranking, Some("5".into()));
     }
+
+    // ---- 比赛排行榜（getCompetitionRank）----
+
+    /// 真实抓包脱敏 fixture：数值字段多为字符串（speed/jianShu/huiGai...），
+    /// rank/total/textLength 为数字；含 `myRankResult` 一行（登录态）。
+    const RANK_FIXTURE: &str = r#"{
+        "error": 0,
+        "msg": {
+            "total": 59,
+            "textTitle": "复古腕表器物鉴赏的时光质感",
+            "textLength": 369,
+            "rankResult": [
+                {"id":"1176549","rank":1,"username":"虹","speed":"197.18","keystrokes":"8.02","maChang":"2.44","jianZhun":"96.56%","jianShu":"901","huiGai":"7","daCi":"62.33%","typingTime":"01:52.282","inputMethod":"虎码","from":"极速跟打器v1.82","sectName":"小虎队"},
+                {"id":"1176698","rank":2,"username":"beiyiwang12","speed":"190.31","maChang":"3.25","jianZhun":"98.50%","jianShu":"1198","huiGai":"4","inputMethod":"","from":"极速跟打器v1.82","sectName":"梦幻阁"},
+                {"rank":3,"username":"MIDII","speed":"181.25","maChang":"2.33","jianZhun":"92.74%","jianShu":"854","huiGai":"15","inputMethod":"","from":"极速跟打器v1.67","sectName":""}
+            ],
+            "myRankResult": [
+                {"rank":42,"username":"我的账号","speed":"88.50","maChang":"2.10","jianZhun":"95.00%","jianShu":"400","huiGai":"3","inputMethod":"虎码","from":"dazitui","sectName":"小虎队"}
+            ]
+        }
+    }"#;
+
+    #[test]
+    fn parse_competition_rank_extracts_rows_and_mine() {
+        let r = parse_competition_rank_response(RANK_FIXTURE).unwrap();
+        assert_eq!(r.total, 59);
+        assert_eq!(r.text_title, "复古腕表器物鉴赏的时光质感");
+        assert_eq!(r.text_length, 369);
+        // rankResult：字符串数值被正确解析为 f64/u32
+        assert_eq!(r.rank_result.len(), 3);
+        let top = &r.rank_result[0];
+        assert_eq!(top.rank, 1);
+        assert_eq!(top.username, "虹");
+        assert!((top.speed - 197.18).abs() < 1e-9, "speed 应为 197.18，得到 {}", top.speed);
+        assert_eq!(top.input_method, "虎码");
+        assert!((top.ma_chang - 2.44).abs() < 1e-9);
+        assert_eq!(top.jian_shu, 901);
+        assert_eq!(top.hui_gai, 7);
+        assert_eq!(top.sect_name, "小虎队");
+        // 缺省字段兜底（第 3 行无 inputMethod/sectName）
+        let third = &r.rank_result[2];
+        assert_eq!(third.rank, 3);
+        assert_eq!(third.input_method, "");
+        assert_eq!(third.sect_name, "");
+        // myRankResult：登录态整行
+        assert_eq!(r.my_rank_result.len(), 1);
+        let mine = &r.my_rank_result[0];
+        assert_eq!(mine.rank, 42);
+        assert_eq!(mine.username, "我的账号");
+        assert!((mine.speed - 88.50).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parse_competition_rank_logged_out_my_rank_is_empty() {
+        let body = r#"{"error":0,"msg":{"total":9,"textTitle":"键神杯","textLength":200,"rankResult":[{"rank":1,"username":"a","speed":"100.0","inputMethod":"虎码"}],"myRankResult":[]}}"#;
+        let r = parse_competition_rank_response(body).unwrap();
+        assert_eq!(r.rank_result.len(), 1);
+        assert!(r.my_rank_result.is_empty(), "未登录时 myRankResult 应为空");
+    }
+
+    #[test]
+    fn parse_competition_rank_server_error_is_server_error() {
+        let err = parse_competition_rank_response(r#"{"error":1,"msg":"暂无赛文！"}"#).unwrap_err();
+        assert_eq!(err, ApiError::Server("暂无赛文！".into()));
+    }
+
+    #[test]
+    fn rank_payload_contains_date_type_and_paging() {
+        let encoded = rank_payload(None, CompetitionType::Jisu, "2026-08-30");
+        let decrypted = super::super::protocol::decrypt(&encoded);
+        let v: Value = serde_json::from_str(&decrypted).unwrap();
+        assert_eq!(v["competitionType"], 0); // 极速杯 = 0
+        assert_eq!(v["snum"], "2026-08-30");
+        assert_eq!(v["deviceType"], 0);
+        assert_eq!(v["pagesize"], 30);
+        assert_eq!(v["currentPage"], 1);
+        assert!(v.get("token").is_none(), "免登录请求不应带 token");
+    }
+
+    #[test]
+    fn rank_payload_includes_token_when_logged_in() {
+        let encoded = rank_payload(Some("tok-9"), CompetitionType::Jinbiao, "2026-08-30");
+        let decrypted = super::super::protocol::decrypt(&encoded);
+        let v: Value = serde_json::from_str(&decrypted).unwrap();
+        assert_eq!(v["competitionType"], 2); // 锦标赛 = 2
+        assert_eq!(v["token"], "tok-9");
+    }
+
+    #[test]
+    fn get_competition_rank_roundtrip_via_mock() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = conn.read(&mut buf).unwrap();
+            // 不解密请求体：只断言路径，返回 fixture
+            conn.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    RANK_FIXTURE.len(),
+                    RANK_FIXTURE
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        });
+
+        let client = ApiClient::with_base_url(&format!("http://{addr}"));
+        let rank = client
+            .get_competition_rank(CompetitionType::Jisu, "2026-08-30")
+            .expect("get_competition_rank 应解析成功");
+        assert_eq!(rank.total, 59);
+        assert_eq!(rank.rank_result[0].username, "虹");
+        assert!((rank.rank_result[0].speed - 197.18).abs() < 1e-9);
+
+        server.join().unwrap();
+    }
+
 
     #[test]
     fn parse_invalid_json_is_parse_error() {
