@@ -231,6 +231,21 @@ enum AppState {
     Stats(StatsViewState),
     /// 赞赏与支持视图：展示微信与支付宝二维码。
     Sponsor,
+    /// 开始跟打前的准备倒计时：显示 3-2-1 弹窗，期间拦截所有输入；
+    /// 倒计时结束自动进入 `Typing` 并开始计时。
+    Countdown {
+        deadline: Instant,
+        source: CountdownSource,
+    },
+}
+
+/// 准备倒计时从哪个浏览界面进入，取消时回到对应界面。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CountdownSource {
+    Browsing,
+    BrowsingBuiltin,
+    /// 从暂停态继续跟打：保留已累计用时，倒计时结束后从暂停处续接计时。
+    Resume,
 }
 
 /// 设置视图焦点项下标。
@@ -250,6 +265,9 @@ const ERROR_TIMELINE_VISIBLE: usize = 8;
 
 /// 极小终端降级展示时「错字时间线」并进成绩摘要块的可见条数。
 const ERROR_TIMELINE_COMPACT_ROWS: usize = 3;
+
+/// 开始跟打前的准备倒计时时长。
+const COUNTDOWN_SECS: Duration = Duration::from_secs(3);
 
 /// 预设中「自定义」项的标签（哨兵值，选中即打开文本弹窗）。
 const SCHEME_CUSTOM: &str = "自定义";
@@ -1065,14 +1083,6 @@ impl App {
         self.paused = true;
     }
 
-    /// 恢复跟打计时。
-    fn resume(&mut self) {
-        if self.paused {
-            self.active_start = Some(Instant::now());
-            self.paused = false;
-        }
-    }
-
     /// 确保跟打计时处于启动活跃态。
     fn touch_typing(&mut self) {
         if self.paused || self.active_start.is_none() {
@@ -1271,6 +1281,83 @@ impl App {
         self.browse_error = None;
     }
 
+    /// 仅重建当前赛文会话与清状态，不重置计时、不切状态（供进入倒计时准备阶段）。
+    fn prepare_session(&mut self) {
+        if self.text.shuffled
+            && let TextSource::Builtin { set } = self.text.source
+        {
+            self.text = load_builtin_text_shuffled(set);
+        }
+        let wb = self.text.session_word_boundaries();
+        self.session = Session::new_gated_with_words_and_size(
+            &self.text.content,
+            self.text.source.is_builtin(),
+            &wb,
+            self.settings.group_size as usize,
+        );
+        self.last_saved_completed = 0;
+        self.live_keyboard.clear();
+        self.browse_error = None;
+    }
+
+    /// 进入开始倒计时：准备会话并弹出 3-2-1 弹窗，倒计时结束后才真正开始计时。
+    fn enter_countdown(&mut self, source: CountdownSource) {
+        self.prepare_session();
+        self.state = AppState::Countdown {
+            deadline: Instant::now() + COUNTDOWN_SECS,
+            source,
+        };
+    }
+
+    /// 进入继续跟打倒计时：保留当前会话与已累计用时，仅冻结计时并弹出 2-1 弹窗。
+    /// 暂停态（paused=true, active_start=None）下计时本就冻结，倒计时期间保持不变。
+    fn enter_resume_countdown(&mut self) {
+        self.state = AppState::Countdown {
+            deadline: Instant::now() + COUNTDOWN_SECS,
+            source: CountdownSource::Resume,
+        };
+    }
+
+    /// 倒计时结束：真正开始跟打（重置计时并进入 Typing）。
+    fn launch_countdown(&mut self) {
+        self.start = Instant::now();
+        self.accumulated_elapsed = Duration::ZERO;
+        self.active_start = None;
+        self.paused = false;
+        self.live_keyboard.clear();
+        self.state = AppState::Typing;
+    }
+
+    /// 继续跟打倒计时结束：从暂停处续接计时（不清零），回到 Typing 态。
+    fn complete_resume_countdown(&mut self) {
+        self.active_start = Some(Instant::now());
+        self.paused = false;
+        self.state = AppState::Typing;
+    }
+
+    /// 取消倒计时，回到进入前的界面（续打则回到暂停态）。
+    fn cancel_countdown(&mut self, source: CountdownSource) {
+        self.state = match source {
+            CountdownSource::Browsing => AppState::Browsing,
+            CountdownSource::BrowsingBuiltin => AppState::BrowsingBuiltin,
+            CountdownSource::Resume => AppState::Typing,
+        };
+    }
+
+    /// 若正处于倒计时且已到期，按来源自动进入跟打或续接（主循环每帧调用）。
+    fn advance_countdown_if_due(&mut self) {
+        if let AppState::Countdown { deadline, source } = self.state {
+            if Instant::now() >= deadline {
+                match source {
+                    CountdownSource::Browsing | CountdownSource::BrowsingBuiltin => {
+                        self.launch_countdown();
+                    }
+                    CountdownSource::Resume => self.complete_resume_countdown(),
+                }
+            }
+        }
+    }
+
     /// 完成跟打：计算成绩并进入成绩视图。
     ///
     /// 在线赛文置为「上传中」并返回 `Some((成绩, 用时))` 供调用方继续上传；
@@ -1407,7 +1494,7 @@ impl App {
         match load_text_from_file(&path) {
             Ok(text) => {
                 self.text = text;
-                self.restart();
+                self.enter_countdown(CountdownSource::Browsing);
             }
             Err(err) => {
                 self.browse_error = Some(match err {
@@ -1486,7 +1573,12 @@ impl App {
                 return;
             }
         }
-        self.start_builtin_set(set, 0);
+        self.text = if self.builtin_shuffle {
+            load_builtin_text_shuffled(set)
+        } else {
+            load_builtin_text(set)
+        };
+        self.enter_countdown(CountdownSource::BrowsingBuiltin);
     }
 
     /// 从指定已完成组数开始某个内置赛文跟打。
@@ -1792,6 +1884,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
     loop {
         // 消费后台方案加载结果（非阻塞，TUI 不冻结）。
         app.poll_scheme_loader();
+        app.advance_countdown_if_due();
         terminal.draw(|frame| ui(frame, &app))?;
         let event_to_process = if let Some(pk) = pending_key_event.take() {
             Event::Key(pk)
@@ -1916,7 +2009,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                         // 就绪态 (app.session.is_empty()) 或 暂停态 (app.paused) —— Normal 命令态
                         if key.code == KeyCode::Tab {
                             if app.paused {
-                                app.resume();
+                                app.enter_resume_countdown();
                             } else {
                                 app.sidebar_visible = !app.sidebar_visible;
                             }
@@ -1928,7 +2021,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                                 || key.code == KeyCode::Char('i')
                                 || key.code == KeyCode::Char('I')
                             {
-                                app.resume();
+                                app.enter_resume_countdown();
                                 continue;
                             }
                             if is_early_finish(key) {
@@ -2487,6 +2580,16 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                         | KeyCode::Char('D') => app.state = AppState::Typing,
                         _ => {}
                     },
+                    AppState::Countdown { source, .. } => {
+                        // 倒计时期间拦截所有输入，仅 Esc/q/Q 可取消返回进入前的浏览界面。
+                        if key.code == KeyCode::Esc
+                            || key.code == KeyCode::Char('q')
+                            || key.code == KeyCode::Char('Q')
+                        {
+                            app.cancel_countdown(source);
+                        }
+                        continue;
+                    }
                 }
             }
             Event::Paste(committed) => {
@@ -3640,6 +3743,10 @@ fn ui(frame: &mut Frame, app: &App) {
     if let Some((set, saved, total)) = app.resume_prompt {
         render_resume_prompt_popup(frame, set, saved, total, &palette, app.theme());
     }
+    // 开始准备倒计时弹窗：覆盖层，倒计时结束由主循环自动关闭。
+    if matches!(app.state, AppState::Countdown { .. }) {
+        render_countdown_popup(frame, app, &palette);
+    }
 
     // 非阻塞「方案加载中…」角标：右上角小标签，后台加载期间显示，跟打/设置照常进行。
     if let Some(loading_id) = &app.scheme_loading {
@@ -3842,6 +3949,47 @@ fn render_resume_prompt_popup(
             palette,
         ));
     }
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+/// 开始准备倒计时弹窗：居中显示 3-2-1 大数字，倒计时结束由主循环自动关闭并开始跟打。
+fn render_countdown_popup(frame: &mut Frame, app: &App, palette: &ThemePalette) {
+    let AppState::Countdown { deadline, source } = &app.state else {
+        return;
+    };
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    // 剩余秒数向上取整：3.0~2.0 显示 3、2.0~1.0 显示 2、1.0~0.0 显示 1，每个数字约 1 秒。
+    let secs = remaining.as_secs_f32().ceil().max(1.0) as u32;
+    let (title, tip) = match source {
+        CountdownSource::Resume => (" ⏱ 继续跟打 ", "手指就位，继续计时"),
+        _ => (" ⏱ 准备开始 ", "手指就位，马上开始"),
+    };
+    let area = centered_rect(frame.area(), 36, 9);
+    frame.render_widget(Clear, area);
+
+    let block = themed_block(palette, true)
+        .title(title)
+        .style(Style::default().bg(palette.bg).fg(palette.fg));
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from("").centered());
+    lines.push(
+        Line::from(vec![Span::styled(
+            format!("  {secs}  "),
+            Style::default().fg(palette.accent).bold(),
+        )])
+        .centered(),
+    );
+    lines.push(Line::from("").centered());
+    lines.push(Line::from(tip).centered());
+    lines.push(Line::from("").centered());
+    lines.push(hint_bar_line(" [Esc] 取消 ↩️ ", palette));
 
     frame.render_widget(
         Paragraph::new(lines)
@@ -7582,7 +7730,7 @@ mod tests {
         assert_eq!(app.text.title, "常用单字中五百");
         assert!(matches!(app.text.source, TextSource::Builtin { .. }));
         assert!(!app.text.is_online());
-        assert!(matches!(app.state, AppState::Typing));
+        assert!(matches!(app.state, AppState::Countdown { .. }));
         assert_eq!(app.session.len(), 0);
     }
 
@@ -7618,7 +7766,7 @@ mod tests {
         assert!(app.text.shuffled, "乱序加载的 Text 应 shuffled=true");
         assert_eq!(app.text.title, "常用单字前五百（乱序）");
         assert!(matches!(app.text.source, TextSource::Builtin { .. }));
-        assert!(matches!(app.state, AppState::Typing));
+        assert!(matches!(app.state, AppState::Countdown { .. }));
     }
 
     #[test]
@@ -8199,10 +8347,77 @@ mod tests {
         app.load_selected();
         assert_eq!(app.text.title, "a.txt");
         assert_eq!(app.text.content, "你好， 世界。\n第二行");
-        assert!(matches!(app.state, AppState::Typing));
+        assert!(matches!(app.state, AppState::Countdown { .. }));
         assert_eq!(app.session.len(), 0);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn countdown_launches_into_typing_when_deadline_passed() {
+        let mut app = test_app(file_text("旧赛文"));
+        app.state = AppState::Countdown {
+            deadline: Instant::now() - Duration::from_millis(1),
+            source: CountdownSource::Browsing,
+        };
+        app.advance_countdown_if_due();
+        assert!(matches!(app.state, AppState::Typing));
+    }
+
+    #[test]
+    fn countdown_stays_until_deadline() {
+        let mut app = test_app(file_text("旧赛文"));
+        app.state = AppState::Countdown {
+            deadline: Instant::now() + Duration::from_secs(10),
+            source: CountdownSource::Browsing,
+        };
+        app.advance_countdown_if_due();
+        assert!(matches!(app.state, AppState::Countdown { .. }));
+    }
+
+    #[test]
+    fn resume_enters_countdown_then_continues_without_resetting_timer() {
+        let mut app = test_app(file_text("旧赛文"));
+        // 模拟已暂停且已累计 42 秒跟打
+        app.accumulated_elapsed = Duration::from_secs(42);
+        app.active_start = None;
+        app.paused = true;
+        app.state = AppState::Typing;
+
+        // 按继续键：应进入续打倒计时，而非直接恢复
+        app.enter_resume_countdown();
+        assert!(matches!(
+            app.state,
+            AppState::Countdown {
+                source: CountdownSource::Resume,
+                ..
+            }
+        ));
+        assert!(app.paused, "续打倒计时期间应仍保持暂停（计时冻结）");
+
+        // 倒计时结束：从暂停处续接，已累计用时不丢、计时继续
+        app.state = AppState::Countdown {
+            deadline: Instant::now() - Duration::from_millis(1),
+            source: CountdownSource::Resume,
+        };
+        app.advance_countdown_if_due();
+        assert!(matches!(app.state, AppState::Typing));
+        assert!(!app.paused, "倒计时结束后应恢复跟打");
+        assert_eq!(
+            app.accumulated_elapsed,
+            Duration::from_secs(42),
+            "续打不应清零已累计用时"
+        );
+
+        // 取消续打倒计时：回到暂停态
+        app.paused = true;
+        app.state = AppState::Countdown {
+            deadline: Instant::now() + Duration::from_secs(10),
+            source: CountdownSource::Resume,
+        };
+        app.cancel_countdown(CountdownSource::Resume);
+        assert!(matches!(app.state, AppState::Typing));
+        assert!(app.paused, "取消续打倒倒计时应回到暂停态");
     }
 
     #[test]
@@ -10333,8 +10548,8 @@ mod tests {
         assert!(app.active_start.is_none());
         let paused_elapsed = app.current_elapsed();
 
-        // 恢复
-        app.resume();
+        // 恢复（续接计时，逻辑等价于倒计时结束后的恢复）
+        app.complete_resume_countdown();
         assert!(!app.paused);
         assert!(app.active_start.is_some());
         assert!(app.current_elapsed() >= paused_elapsed);
@@ -11517,8 +11732,8 @@ mod tests {
         assert!(clean_paused.contains("[暂停]"));
         assert!(clean_paused.contains("(0)"));
 
-        // 4. 恢复打字（调用 resume()）：徽标消失，指标正常续接
-        app.resume();
+        // 4. 恢复打字（续接计时）：徽标消失，指标正常续接
+        app.complete_resume_countdown();
         let mut term_resumed =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
         term_resumed.draw(|f| ui(f, &app)).unwrap();

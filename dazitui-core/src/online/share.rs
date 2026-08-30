@@ -84,11 +84,14 @@ pub fn build_upload_payload(
     } else {
         (stats.phrase_chars as f64 / total_chars as f64 * 100.0).clamp(0.0, 100.0)
     };
+    // 上报给 52dazi 的码长精确到小数点后两位（展示友好、避免超长浮点位数）；
+    // 键准公式仍使用原始 key_length，不被截断影响。
+    let ma_chang = (upload.key_length * 100.0).round() / 100.0;
     serde_json::json!({
         "textTitle": text.title,
         "speed": upload.speed,
         "keystrokes": upload.keystrokes,
-        "maChang": upload.key_length,
+        "maChang": ma_chang,
         "wordNum": total_chars,
         "typingTime": format_time(elapsed),
         "huiGai": stats.edits,
@@ -228,6 +231,34 @@ mod tests {
         };
         let v = build_upload_payload(&text, &stats, &up, Duration::from_secs(60), "");
         assert_eq!(v["daCi"], "100.00%");
+    }
+
+    #[test]
+    fn build_upload_payload_rounds_ma_chang_to_two_decimals() {
+        let stats = sample_stats();
+        let up = UploadStats {
+            speed: 85.2,
+            keystrokes: 3.5,
+            key_length: 2.8765,
+        };
+        let text = Text {
+            title: "t".into(),
+            content: "你好世界".into(),
+            source: TextSource::Online {
+                competition_type: CompetitionType::Jisu,
+            },
+            word_boundaries: None,
+            shuffled: false,
+        };
+        let v = build_upload_payload(&text, &stats, &up, Duration::from_secs(60), "");
+        // 上报码长精确到 2 位小数
+        assert!(
+            (v["maChang"].as_f64().unwrap() - 2.88).abs() < 1e-9,
+            "maChang 应四舍五入到 2.88"
+        );
+        // 键准公式仍使用原始码长 2.8765：wasted = 1 + 1*2.8765，accuracy = (140 - 3.8765)/140*100
+        let expected_accuracy = (140.0 - 1.0 - 2.8765) / 140.0 * 100.0;
+        assert!((v["accuracy"].as_f64().unwrap() - expected_accuracy).abs() < 1e-6);
     }
 
     #[test]
