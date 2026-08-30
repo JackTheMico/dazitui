@@ -345,6 +345,38 @@ fn rank_payload(token: Option<&str>, competition_type: CompetitionType, date: &s
     encrypt_value(&Value::Object(m))
 }
 
+/// 比赛期次日期（`YYYY-MM-DD`），用于排行榜 `snum`。
+///
+/// 52dazi 赛事按中国时区计日，故以 Asia/Shanghai（UTC+8）计算「今天」，
+/// 避免 UTC 日期在午夜附近与服务器期次错位。无外部时间依赖。
+pub fn today_ymd() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    // 东八区：+8h 后再取整到天。
+    let shanghai_secs = secs + 8 * 3600;
+    let days = shanghai_secs.div_euclid(86400);
+    let (y, m, d) = civil_from_days(days);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// 从「自 1970-01-01 起的天数」换算出公历 `(年, 月, 日)`（Howard Hinnant 算法，无依赖）。
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
+
 /// 52dazi 客户端（深模块：封装会话持久化、Cookie 回传、自动重登与上传全流程）。
 #[derive(Debug, Clone)]
 pub struct ApiClient {
@@ -847,6 +879,28 @@ mod tests {
         server.join().unwrap();
     }
 
+    #[test]
+    fn today_ymd_returns_iso_date() {
+        let s = today_ymd();
+        assert_eq!(s.len(), 10);
+        let parts: Vec<&str> = s.split('-').collect();
+        assert_eq!(parts.len(), 3);
+        assert!(parts[0].len() == 4 && parts[0].chars().all(|c| c.is_ascii_digit()));
+        assert!(parts[1].len() == 2 && parts[1].chars().all(|c| c.is_ascii_digit()));
+        assert!(parts[2].len() == 2 && parts[2].chars().all(|c| c.is_ascii_digit()));
+        let month: u32 = parts[1].parse().unwrap();
+        let day: u32 = parts[2].parse().unwrap();
+        assert!((1..=12).contains(&month));
+        assert!((1..=31).contains(&day));
+    }
+
+    #[test]
+    fn civil_from_days_epoch_and_leap_years() {
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(365), (1971, 1, 1));
+        assert_eq!(civil_from_days(730), (1972, 1, 1));
+        assert_eq!(civil_from_days(1096), (1973, 1, 1));
+    }
 
     #[test]
     fn parse_invalid_json_is_parse_error() {

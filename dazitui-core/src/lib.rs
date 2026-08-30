@@ -36,7 +36,8 @@ pub use settings::{
 pub use online::auth::{env_credentials, is_auth_failure, should_auto_relogin};
 #[cfg(feature = "online")]
 pub use online::client::{
-    ApiClient, ApiError, CompetitionText, LoginResult, RankResult, UploadOutcome,
+    ApiClient, ApiError, CompetitionRank, CompetitionRankRow, CompetitionText, LoginResult,
+    RankResult, UploadOutcome, today_ymd,
 };
 #[cfg(feature = "online")]
 pub use online::protocol::{ProtocolError, build_request, decrypt, encrypt, parse_json};
@@ -306,7 +307,7 @@ fn shuffled_title(set: BuiltinSet) -> String {
 }
 
 /// 52dazi.cn 比赛类型。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CompetitionType {
     /// 极速杯。
     Jisu,
