@@ -614,7 +614,7 @@ checksum = "8b1e3a325bc115f096c8b77bbf027a7c2592230e70be2d985be950d3d5e60ebe"
 
 [[package]]
 name = "dazitui"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "crossterm",
  "dazitui-core",
@@ -628,7 +628,7 @@ dependencies = [
 
 [[package]]
 name = "dazitui-core"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "aes",
  "arboard",

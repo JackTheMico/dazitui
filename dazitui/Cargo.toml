@@ -9,7 +9,7 @@ description.workspace = true
 
 [dependencies]
 crossterm = "0.29.0"
-dazitui-core = { version = "1.0.4", path = "../dazitui-core", features = ["online"] }
+dazitui-core = { version = "1.0.5", path = "../dazitui-core", features = ["online"] }
 image = "0.25.10"
 notify = "8.2.0"
 ratatui = "0.30.2"
