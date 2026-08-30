@@ -275,6 +275,8 @@ const ERROR_TIMELINE_COMPACT_ROWS: usize = 3;
 
 /// 开始跟打前的准备倒计时时长。
 const COUNTDOWN_SECS: Duration = Duration::from_secs(3);
+/// 成功热重载后「方案已重载」状态栏闪现的持续时间（约 2 秒后淡出）。
+const SCHEME_RELOAD_FLASH_DURATION: Duration = Duration::from_millis(2000);
 
 /// 预设中「自定义」项的标签（哨兵值，选中即打开文本弹窗）。
 const SCHEME_CUSTOM: &str = "自定义";
@@ -743,6 +745,13 @@ struct App {
     scheme_watch_paths: Option<Vec<PathBuf>>,
     /// 检测到改动后、真正发起重载前的防抖时刻；期间忽略后续事件，避免重复重载风暴。
     scheme_reload_pending_at: Option<Instant>,
+    /// 热重载派发标记：置 true 表示当前正在等待一次由热监控触发的后台重载结果，
+    /// 该结果回传时才应闪现「方案已重载」（区分初始加载/手动切方案，避免误闪）。
+    scheme_hot_reload_expected: bool,
+    /// 成功热重载后状态栏闪现「方案已重载」的截止时刻；`now < 该时刻` 时显示，过期即淡出。
+    scheme_reload_flash_at: Option<Instant>,
+    /// 热重载失败提示（如 YAML 写坏）。`Some` 时状态栏报错；成功重载后清空（与成功闪现互斥）。
+    scheme_reload_error: Option<String>,
     /// 后台数据库异步写入 Worker。
     db_worker: Option<DbWorker>,
     /// 赞赏与支持视图图片协议缓存。
@@ -972,6 +981,9 @@ impl App {
             scheme_watcher: scheme_watcher::SchemeWatcher::new().ok(),
             scheme_watch_paths: None,
             scheme_reload_pending_at: None,
+            scheme_hot_reload_expected: false,
+            scheme_reload_flash_at: None,
+            scheme_reload_error: None,
             db_worker,
             sponsor_state: RefCell::new(None),
         };
@@ -1077,10 +1089,21 @@ impl App {
                 if self.settings.scheme == result.id {
                     self.scheme_dict = Some(dict);
                     self.arm_scheme_watcher();
+                    // 本次成功回传来自热监控触发的重载：闪现「方案已重载」，并清除既有失败提示（互斥）。
+                    if self.scheme_hot_reload_expected {
+                        self.scheme_hot_reload_expected = false;
+                        self.scheme_reload_flash_at =
+                            Some(Instant::now() + SCHEME_RELOAD_FLASH_DURATION);
+                        self.scheme_reload_error.take();
+                    }
                 }
             } else if self.settings.scheme == result.id {
                 // 加载失败（路径缺失/解析错误）：仅当仍选中时才清空。
                 self.scheme_dict = None;
+                // 热监控触发的重载失败：解除标记（#98 在此置位失败提示）。
+                if self.scheme_hot_reload_expected {
+                    self.scheme_hot_reload_expected = false;
+                }
             }
             if self.scheme_loading.as_deref() == Some(result.id.as_str()) {
                 self.scheme_loading = None;
@@ -1119,6 +1142,12 @@ impl App {
     /// 关键陷阱（issue #94）：必须先 `scheme_cache.remove(current_id)` 再调用 `reload_scheme_dict()`，
     /// 否则后者会因缓存命中而短路返回，重载不会发生（这是热重载「改了不生效」的根因）。
     fn poll_scheme_hot_reload(&mut self) {
+        // 闪现提示过期即清除（即使总开关关闭也清理，避免残留旧提示）。
+        if let Some(at) = self.scheme_reload_flash_at {
+            if Instant::now() >= at {
+                self.scheme_reload_flash_at = None;
+            }
+        }
         // 总开关关闭：清空任何排定中的重载并停止检测。
         if !self.settings.monitor_scheme {
             self.scheme_reload_pending_at = None;
@@ -1128,6 +1157,8 @@ impl App {
         if let Some(at) = self.scheme_reload_pending_at {
             if Instant::now() >= at {
                 self.scheme_reload_pending_at = None;
+                // 标记本次重载由热监控触发，结果回传时才闪现成功提示（区分初始/手动加载）。
+                self.scheme_hot_reload_expected = true;
                 // 先驱逐缓存，破除 `reload_scheme_dict` 的缓存命中短路。
                 let id = self.settings.scheme.clone();
                 self.scheme_cache.remove(&id);
@@ -1144,6 +1175,28 @@ impl App {
         if changed {
             self.scheme_reload_pending_at = Some(Instant::now() + Duration::from_millis(200));
         }
+    }
+
+    /// 当前是否应显示「方案已重载」闪现提示（成功热重载后约 2 秒）。仅测试使用。
+    #[cfg(test)]
+    fn scheme_reload_flash_active(&self) -> bool {
+        matches!(self.scheme_reload_flash_at, Some(at) if Instant::now() < at)
+    }
+
+    /// 状态栏闪现提示的内容与样式；过期或不存在时为 `None`。
+    /// 淡出：剩余不足 600ms 时改用 `muted` 色，避免硬截断观感突兀（issue #97）。
+    fn scheme_reload_status(&self) -> Option<(String, Style)> {
+        let at = self.scheme_reload_flash_at?;
+        if Instant::now() >= at {
+            return None;
+        }
+        let remaining = at.saturating_duration_since(Instant::now());
+        let color = if remaining < Duration::from_millis(600) {
+            self.palette().muted
+        } else {
+            self.palette().accent
+        };
+        Some(("✓ 方案已重载".to_string(), Style::default().fg(color)))
     }
 
     /// 计算当前总活跃用时（已累计用时 + 当前活跃段）。
@@ -3812,9 +3865,13 @@ fn ui(frame: &mut Frame, app: &App) {
             .fg(palette.accent)
             .add_modifier(Modifier::BOLD),
     )]);
+    // 成功热重载后，状态栏底部右侧短暂闪现「方案已重载」（约 2s 淡出，issue #97）。
+    let mut help_block = themed_block(&palette, false).title(hint_title);
+    if let Some((msg, style)) = app.scheme_reload_status() {
+        help_block = help_block.title_bottom(Line::from(Span::styled(msg, style)).right_aligned());
+    }
     frame.render_widget(
-        Paragraph::new(hint_bar_line(hint, &palette))
-            .block(themed_block(&palette, false).title(hint_title)),
+        Paragraph::new(hint_bar_line(hint, &palette)).block(help_block),
         help_bar,
     );
 
@@ -12932,6 +12989,93 @@ mod scheme_hot_reload_tests {
             app.scheme_dict.as_ref().and_then(|d| d.get_primary_code("新")),
             None,
             "开关关闭时改动源文件不应触发热重载"
+        );
+    }
+
+    #[test]
+    fn hot_reload_shows_flash_on_success_and_fades() {
+        let dir = tmp("scheme-flash");
+        let schema = dir.join("demo.schema.yaml");
+        let dict = dir.join("demo.dict.yaml");
+        std::fs::write(&schema, "schema:\n  name: Demo\n  schema_id: demo\n").unwrap();
+        std::fs::write(&dict, "---\nname: demo\n...\n\n文\tvw\n化\the\n").unwrap();
+
+        let mut app = app_with_scheme(schema.clone());
+
+        // 首次加载（非热重载路径）不应触发热重载闪现。
+        app.reload_scheme_dict();
+        for _ in 0..30 {
+            app.poll_scheme_loader();
+            if app.scheme_dict.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            !app.scheme_reload_flash_active(),
+            "初始加载不应闪现热重载提示"
+        );
+
+        // 改动源文件：新增「新→xx」
+        std::fs::write(&dict, "---\nname: demo\n...\n\n文\tvw\n化\the\n新\txx\n").unwrap();
+
+        let mut reloaded = false;
+        for _ in 0..60 {
+            app.poll_scheme_hot_reload();
+            std::thread::sleep(Duration::from_millis(50));
+            app.poll_scheme_loader();
+            if app
+                .scheme_dict
+                .as_ref()
+                .and_then(|d| d.get_primary_code("新"))
+                == Some("xx")
+            {
+                reloaded = true;
+                break;
+            }
+        }
+        assert!(reloaded, "改动源文件后应自动热重载，使「新→xx」生效");
+
+        // 成功热重载后，状态栏应闪现「方案已重载」，且约 2s 后淡出（不堆叠为多条）。
+        assert!(
+            app.scheme_reload_flash_active(),
+            "成功热重载后应闪现「方案已重载」"
+        );
+        let remaining = app
+            .scheme_reload_flash_at
+            .expect("热重载成功后应置位闪现截止时刻")
+            .duration_since(std::time::Instant::now());
+        assert!(
+            remaining <= Duration::from_millis(2100) && remaining > Duration::from_millis(1500),
+            "闪现应在约 2s 内淡出，实际剩余 {:?}",
+            remaining
+        );
+
+        // 连续多次重载不堆叠：再次改动并热重载，仍是单条、未过期时间被重置（非叠加）。
+        std::fs::write(
+            &dict,
+            "---\nname: demo\n...\n\n文\tvw\n化\the\n新\txx\n又\tzz\n",
+        )
+        .unwrap();
+        let mut reloaded2 = false;
+        for _ in 0..60 {
+            app.poll_scheme_hot_reload();
+            std::thread::sleep(Duration::from_millis(50));
+            app.poll_scheme_loader();
+            if app
+                .scheme_dict
+                .as_ref()
+                .and_then(|d| d.get_primary_code("又"))
+                == Some("zz")
+            {
+                reloaded2 = true;
+                break;
+            }
+        }
+        assert!(reloaded2, "第二次改动也应自动热重载");
+        assert!(
+            app.scheme_reload_flash_active(),
+            "连续重载仍只闪现单条「方案已重载」"
         );
     }
 }
