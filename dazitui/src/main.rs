@@ -764,6 +764,8 @@ struct SchemeLoadResult {
     id: String,
     /// 加载成功的码表；路径缺失/解析失败时为 `None`。
     dict: Option<SchemeDict>,
+    /// 加载失败原因（`dict == None` 时有值），用于状态栏报错（issue #98）。
+    error: Option<String>,
 }
 
 /// 异步方案加载器：派生后台线程解析大型 `.dict.yaml`（如 51MB 空明拳），
@@ -779,12 +781,14 @@ impl SchemeLoader {
         Self { sender, receiver }
     }
 
-    /// 派发一次后台加载：在独立线程解析 `path` 并回传结果。调用方需自行保证不重复派发同一方案。
+    /// 派发一次后台加载：在独立线程解析 `path` 并回传结果（含失败原因）。调用方需自行保证不重复派发同一方案。
     fn request(&self, id: String, path: PathBuf) {
         let sender = self.sender.clone();
         std::thread::spawn(move || {
-            let dict = SchemeDict::load_from_file(&path).ok();
-            let _ = sender.send(SchemeLoadResult { id, dict });
+            let loaded = SchemeDict::load_from_file(&path);
+            let dict = loaded.as_ref().ok().cloned();
+            let error = loaded.err().map(|e| e.to_string());
+            let _ = sender.send(SchemeLoadResult { id, dict, error });
         });
     }
 }
@@ -1098,11 +1102,19 @@ impl App {
                     }
                 }
             } else if self.settings.scheme == result.id {
-                // 加载失败（路径缺失/解析错误）：仅当仍选中时才清空。
-                self.scheme_dict = None;
-                // 热监控触发的重载失败：解除标记（#98 在此置位失败提示）。
+                // 加载失败（路径缺失/解析错误）。
                 if self.scheme_hot_reload_expected {
+                    // 热监控触发的重载失败：保留上一版方案（不清空、不空白），
+                    // 并在状态栏置位失败提示（issue #98）。
                     self.scheme_hot_reload_expected = false;
+                    let reason = result
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "未知错误".to_string());
+                    self.scheme_reload_error = Some(format!("方案重载失败：{reason}"));
+                } else {
+                    // 非热重载（如初始/手动切换到坏方案）：维持既有清空行为。
+                    self.scheme_dict = None;
                 }
             }
             if self.scheme_loading.as_deref() == Some(result.id.as_str()) {
@@ -1183,20 +1195,30 @@ impl App {
         matches!(self.scheme_reload_flash_at, Some(at) if Instant::now() < at)
     }
 
-    /// 状态栏闪现提示的内容与样式；过期或不存在时为 `None`。
-    /// 淡出：剩余不足 600ms 时改用 `muted` 色，避免硬截断观感突兀（issue #97）。
+    /// 状态栏闪现/报错提示的内容与样式；无提示时为 `None`。
+    /// 优先级：成功闪现 > 失败报错（成功闪现期间已清除报错，issue #97/#98）。
+    /// 成功闪现淡出：剩余不足 600ms 时改用 `muted` 色，避免硬截断观感突兀（issue #97）。
     fn scheme_reload_status(&self) -> Option<(String, Style)> {
-        let at = self.scheme_reload_flash_at?;
-        if Instant::now() >= at {
-            return None;
+        // 成功闪现优先
+        if let Some(at) = self.scheme_reload_flash_at {
+            if Instant::now() < at {
+                let remaining = at.saturating_duration_since(Instant::now());
+                let color = if remaining < Duration::from_millis(600) {
+                    self.palette().muted
+                } else {
+                    self.palette().accent
+                };
+                return Some(("✓ 方案已重载".to_string(), Style::default().fg(color)));
+            }
         }
-        let remaining = at.saturating_duration_since(Instant::now());
-        let color = if remaining < Duration::from_millis(600) {
-            self.palette().muted
-        } else {
-            self.palette().accent
-        };
-        Some(("✓ 方案已重载".to_string(), Style::default().fg(color)))
+        // 失败报错（持续显示，直到下次成功重载清除）
+        if let Some(err) = &self.scheme_reload_error {
+            return Some((
+                format!("⚠ {err}"),
+                Style::default().fg(self.palette().error),
+            ));
+        }
+        None
     }
 
     /// 计算当前总活跃用时（已累计用时 + 当前活跃段）。
@@ -13076,6 +13098,97 @@ mod scheme_hot_reload_tests {
         assert!(
             app.scheme_reload_flash_active(),
             "连续重载仍只闪现单条「方案已重载」"
+        );
+    }
+
+    #[test]
+    fn hot_reload_failure_keeps_old_scheme_and_reports_error() {
+        let dir = tmp("scheme-fail");
+        let schema = dir.join("demo.schema.yaml");
+        let dict = dir.join("demo.dict.yaml");
+        std::fs::write(&schema, "schema:\n  name: Demo\n  schema_id: demo\n").unwrap();
+        std::fs::write(&dict, "---\nname: demo\n...\n\n文\tvw\n化\the\n").unwrap();
+
+        let mut app = app_with_scheme(schema.clone());
+
+        // 首次加载
+        app.reload_scheme_dict();
+        for _ in 0..30 {
+            app.poll_scheme_loader();
+            if app.scheme_dict.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(
+            app.scheme_dict
+                .as_ref()
+                .and_then(|d| d.get_primary_code("文")),
+            Some("vw"),
+            "初始加载应成功"
+        );
+
+        // 模拟「坏部署」：把词典文件换成同名目录，使后台加载读取失败（解析/读取错误）。
+        std::fs::remove_file(&dict).unwrap();
+        std::fs::create_dir(&dict).unwrap();
+
+        // 驱动热重载循环，等待失败结果
+        let mut failed = false;
+        for _ in 0..60 {
+            app.poll_scheme_hot_reload();
+            std::thread::sleep(Duration::from_millis(50));
+            app.poll_scheme_loader();
+            if app.scheme_reload_error.is_some() {
+                failed = true;
+                break;
+            }
+        }
+        assert!(failed, "坏部署热重载应失败并置位错误提示");
+        // 旧方案应被保留（不空白、不丢失词条）
+        assert_eq!(
+            app.scheme_dict
+                .as_ref()
+                .and_then(|d| d.get_primary_code("文")),
+            Some("vw"),
+            "重载失败应保留上一版方案"
+        );
+        assert!(
+            app.scheme_reload_error
+                .as_deref()
+                .unwrap()
+                .contains("方案重载失败"),
+            "状态栏应报错说明方案重载失败：{:?}",
+            app.scheme_reload_error
+        );
+
+        // 修复部署：还原为合法词典并新增「新→xx」
+        std::fs::remove_dir(&dict).unwrap();
+        std::fs::write(
+            &dict,
+            "---\nname: demo\n...\n\n文\tvw\n化\the\n新\txx\n",
+        )
+        .unwrap();
+
+        let mut recovered = false;
+        for _ in 0..60 {
+            app.poll_scheme_hot_reload();
+            std::thread::sleep(Duration::from_millis(50));
+            app.poll_scheme_loader();
+            if app
+                .scheme_dict
+                .as_ref()
+                .and_then(|d| d.get_primary_code("新"))
+                == Some("xx")
+            {
+                recovered = true;
+                break;
+            }
+        }
+        assert!(recovered, "修复部署后应热重载成功");
+        // 成功重载应清除失败提示
+        assert!(
+            app.scheme_reload_error.is_none(),
+            "成功重载后应清除失败提示"
         );
     }
 }
