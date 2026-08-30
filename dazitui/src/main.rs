@@ -1206,17 +1206,32 @@ impl App {
     fn poll_rank_loader(&mut self) {
         while let Ok(result) = self.rank_loader.receiver.try_recv() {
             if let AppState::OnlineRank(state) = &mut self.state {
-                if state.active_tab == result.competition_type && state.date == result.date {
-                    let board = state.boards.entry(result.competition_type).or_default();
-                    board.loading = false;
-                    match result.result {
-                        Ok(rank) => {
-                            board.data = Some(rank);
-                            board.error = None;
+                // 仅接受与当前期次日期一致的回包：跨天后的旧请求作废（#107）。
+                if state.date != result.date {
+                    continue;
+                }
+                // 无论当前激活 Tab 是否为本回包所属比赛，都写入对应缓存，
+                // 保证按 Tab 切换不重复拉取（#104）。仅当该榜为当前激活 Tab 时自动滚到我的行。
+                let board = state.boards.entry(result.competition_type).or_default();
+                board.loading = false;
+                match result.result {
+                    Ok(rank) => {
+                        let is_active = state.active_tab == result.competition_type;
+                        if is_active {
+                            // 登录态下自动滚动到当前用户所在行，使高亮行立即可见。
+                            if let Some(mine) = rank.my_rank_result.first() {
+                                if let Some(idx) =
+                                    rank.rank_result.iter().position(|r| r.rank == mine.rank)
+                                {
+                                    board.scroll = idx as u16;
+                                }
+                            }
                         }
-                        Err(e) => {
-                            board.error = Some(api_error_text(&e));
-                        }
+                        board.data = Some(rank);
+                        board.error = None;
+                    }
+                    Err(e) => {
+                        board.error = Some(api_error_text(&e));
                     }
                 }
             }
@@ -1249,8 +1264,13 @@ impl App {
     }
 
     /// 切换排行榜当前 Tab 并拉取对应榜单（封装对 `app.state` 的可变借用，避免与 `fetch_rank` 冲突）。
+    /// 切换时同步刷新期次日期，确保跨自然日后 `snum` 仍为当天（#107）。
     fn switch_rank_tab(&mut self, tab: CompetitionType) {
         let date = if let AppState::OnlineRank(state) = &mut self.state {
+            let today = today_ymd();
+            if today != state.date {
+                state.date = today.clone();
+            }
             state.active_tab = tab;
             state.date.clone()
         } else {
@@ -2936,11 +2956,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                         KeyCode::Char('3') => app.switch_rank_tab(CompetitionType::Jianshen),
                         KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
                             let next = if let AppState::OnlineRank(s) = &app.state {
-                                match s.active_tab {
-                                    CompetitionType::Jisu => CompetitionType::Jinbiao,
-                                    CompetitionType::Jinbiao => CompetitionType::Jianshen,
-                                    CompetitionType::Jianshen => CompetitionType::Jisu,
-                                }
+                                s.active_tab.next()
                             } else {
                                 CompetitionType::Jisu
                             };
@@ -2948,11 +2964,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                         }
                         KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
                             let prev = if let AppState::OnlineRank(s) = &app.state {
-                                match s.active_tab {
-                                    CompetitionType::Jisu => CompetitionType::Jianshen,
-                                    CompetitionType::Jinbiao => CompetitionType::Jisu,
-                                    CompetitionType::Jianshen => CompetitionType::Jinbiao,
-                                }
+                                s.active_tab.prev()
                             } else {
                                 CompetitionType::Jisu
                             };
@@ -3808,14 +3820,9 @@ fn render_online_rank_view(frame: &mut Frame, app: &App, rank_state: &OnlineRank
     let inner = outer.inner(total_area);
     frame.render_widget(outer, total_area);
 
-    // 三 Tab 行：极速杯 / 锦标赛 / 键神杯，当前 Tab 高亮
-    let tabs: [(CompetitionType, &str); 3] = [
-        (CompetitionType::Jisu, "极速杯"),
-        (CompetitionType::Jinbiao, "锦标赛"),
-        (CompetitionType::Jianshen, "键神杯"),
-    ];
+    // 三 Tab 行：极速杯 / 锦标赛 / 键神杯，当前 Tab 高亮（顺序由 `CompetitionType::ALL` 统一）。
     let mut tab_spans: Vec<Span> = Vec::new();
-    for (i, (ct, label)) in tabs.iter().enumerate() {
+    for (i, ct) in CompetitionType::ALL.iter().enumerate() {
         let active = *ct == rank_state.active_tab;
         if i > 0 {
             tab_spans.push(Span::styled(" │ ", Style::default().fg(palette.selection)));
@@ -3825,44 +3832,11 @@ fn render_online_rank_view(frame: &mut Frame, app: &App, rank_state: &OnlineRank
         } else {
             Style::default().fg(palette.fg)
         };
-        tab_spans.push(Span::styled(format!(" {label} "), style));
+        tab_spans.push(Span::styled(format!(" {} ", ct.name()), style));
     }
 
-    // 榜单区内容（按当前 Tab 的缓存状态分支）
-    let body_line: Line = match rank_state.boards.get(&rank_state.active_tab) {
-        Some(board) if board.loading => Line::from(vec![Span::styled(
-            "加载中…",
-            Style::default().fg(palette.muted),
-        )]),
-        Some(board) => match &board.error {
-            Some(err) => Line::from(vec![
-                Span::styled(
-                    format!("加载失败：{err}"),
-                    Style::default().fg(palette.error),
-                ),
-                Span::styled("（按 R 重试）", Style::default().fg(palette.warning)),
-            ]),
-            None => match &board.data {
-                Some(data) if data.rank_result.is_empty() => Line::from(vec![Span::styled(
-                    "暂无数据（今日该比赛尚未产生成绩）",
-                    Style::default().fg(palette.muted),
-                )]),
-                Some(_) => Line::from(vec![Span::styled(
-                    "榜单渲染中…",
-                    Style::default().fg(palette.muted),
-                )]),
-                None => Line::from(vec![Span::styled(
-                    "加载中…",
-                    Style::default().fg(palette.muted),
-                )]),
-            },
-        },
-        None => Line::from(vec![Span::styled(
-            "加载中…",
-            Style::default().fg(palette.muted),
-        )]),
-    };
-
+    // 榜单区内容（按当前 Tab 的缓存状态分支：加载 / 错误 / 空 / 表格）
+    let board = rank_state.boards.get(&rank_state.active_tab);
     let [tab_area, body_area] =
         Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).areas(inner);
     frame.render_widget(
@@ -3870,10 +3844,137 @@ fn render_online_rank_view(frame: &mut Frame, app: &App, rank_state: &OnlineRank
             .alignment(ratatui::layout::Alignment::Center),
         tab_area,
     );
+
+    match board {
+        Some(b) if b.loading => render_rank_note(frame, body_area, "加载中…", palette.muted),
+        Some(b) => match &b.error {
+            Some(err) => {
+                let line = Line::from(vec![
+                    Span::styled(format!("加载失败：{err}"), Style::default().fg(palette.error)),
+                    Span::styled("（按 R 重试）", Style::default().fg(palette.warning)),
+                ]);
+                frame.render_widget(Paragraph::new(line).wrap(Wrap { trim: false }), body_area);
+            }
+            None => match &b.data {
+                Some(data) if data.rank_result.is_empty() => {
+                    render_rank_note(frame, body_area, "暂无数据（今日该比赛尚未产生成绩）", palette.muted);
+                }
+                Some(data) => {
+                    // 名次条：登录态下展示「我第 N 名 / 共 M 人」；未登录降级为公开榜提示。
+                    let my_rank = data.my_rank_result.first().map(|r| r.rank);
+                    let rankbar = match my_rank {
+                        Some(r) => Line::from(Span::styled(
+                            format!("我第 {} 名 / 共 {} 人", r, data.total),
+                            Style::default().fg(palette.accent).bold(),
+                        )),
+                        None if !app.logged_in => Line::from(Span::styled(
+                            "未登录：登录后可见个人名次（当前为公开榜）",
+                            Style::default().fg(palette.warning),
+                        )),
+                        None => Line::from(Span::styled(
+                            "暂无个人名次",
+                            Style::default().fg(palette.muted),
+                        )),
+                    };
+                    let [bar_area, table_area] =
+                        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(body_area);
+                    frame.render_widget(Paragraph::new(rankbar), bar_area);
+                    render_rank_table(frame, &palette, data, my_rank, b.scroll, table_area);
+                }
+                None => render_rank_note(frame, body_area, "加载中…", palette.muted),
+            },
+        },
+        None => render_rank_note(frame, body_area, "加载中…", palette.muted),
+    }
+}
+
+/// 榜单区居中提示（加载中 / 空数据等）。
+fn render_rank_note(frame: &mut Frame, area: Rect, note: &str, color: Color) {
     frame.render_widget(
-        Paragraph::new(body_line).wrap(Wrap { trim: false }),
-        body_area,
+        Paragraph::new(Span::styled(note, Style::default().fg(color)))
+            .alignment(ratatui::layout::Alignment::Center),
+        area,
     );
+}
+
+/// 渲染四列榜单：排名 / 用户名 / 速度(WPM) / 输入法，按 `scroll` 偏移可滚动。
+/// 列宽在窄终端下等比缩小以适配可用宽度，避免溢出（#105）。
+fn render_rank_table(
+    frame: &mut Frame,
+    palette: &ThemePalette,
+    data: &CompetitionRank,
+    my_rank: Option<u32>,
+    scroll: u16,
+    area: Rect,
+) {
+    let accent = Style::default().fg(palette.accent).bold();
+    let fg = Style::default().fg(palette.fg);
+    // 各列最小宽度（排名/用户名/速度/输入法），窄终端等比缩放。
+    let min_widths: [usize; 4] = [5, 20, 9, 12];
+    let min_total: usize = min_widths.iter().sum();
+    let avail = area.width as usize;
+    let widths = if avail >= min_total {
+        min_widths
+    } else {
+        let mut w = min_widths;
+        let scale = avail as f64 / min_total as f64;
+        for slot in w.iter_mut() {
+            *slot = ((*slot as f64 * scale).max(4.0)) as usize;
+        }
+        w
+    };
+    let header = Line::from(vec![
+        Span::styled(pad_display("排名", widths[0], true), accent),
+        Span::styled(pad_display("用户名", widths[1], false), accent),
+        Span::styled(pad_display("速度(WPM)", widths[2], true), accent),
+        Span::styled(pad_display("输入法", widths[3], false), accent),
+    ]);
+    let available = area.height.saturating_sub(1) as usize;
+    let rows = &data.rank_result;
+    let max_scroll = rows.len().saturating_sub(available);
+    let start = (scroll as usize).min(max_scroll);
+    let mut lines = vec![header];
+    for row in rows.iter().skip(start).take(available) {
+        let speed = format!("{:.2}", row.speed);
+        // 当前用户所在行高亮（与名次条呼应）。
+        let row_style = if Some(row.rank) == my_rank {
+            Style::default().fg(palette.accent).bold()
+        } else {
+            fg
+        };
+        lines.push(Line::from(vec![
+            Span::styled(pad_display(&row.rank.to_string(), widths[0], true), row_style),
+            Span::styled(pad_display(&row.username, widths[1], false), row_style),
+            Span::styled(pad_display(&speed, widths[2], true), row_style),
+            Span::styled(pad_display(&row.input_method, widths[3], false), row_style),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// 按显示宽度（而非字节数）对 `s` 做截断/补齐，兼容中文等宽与英文混排。
+fn pad_display(s: &str, width: usize, align_right: bool) -> String {
+    let w = UnicodeWidthStr::width(s);
+    if w >= width {
+        let mut out = String::new();
+        let mut cur = 0;
+        for c in s.chars() {
+            let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+            if cur + cw > width {
+                break;
+            }
+            out.push(c);
+            cur += cw;
+        }
+        out
+    } else {
+        let pad = " ".repeat(width - w);
+        if align_right {
+            format!("{pad}{s}")
+        } else {
+            format!("{s}{pad}")
+        }
+    }
 }
 
 fn ui(frame: &mut Frame, app: &App) {
@@ -11301,6 +11402,296 @@ mod tests {
         activate_sidebar_menu_item(&mut app, &mut terminal).unwrap();
         assert!(matches!(app.state, AppState::Settings));
         app.state = AppState::Typing;
+    }
+
+    #[test]
+    fn render_online_rank_view_renders_four_column_table() {
+        let data = CompetitionRank {
+            rank_result: vec![
+                dazitui_core::CompetitionRankRow {
+                    rank: 1,
+                    username: "虹".into(),
+                    speed: 197.18,
+                    input_method: "虎码".into(),
+                    ..Default::default()
+                },
+                dazitui_core::CompetitionRankRow {
+                    rank: 2,
+                    username: "beiyi".into(),
+                    speed: 190.31,
+                    ..Default::default()
+                },
+            ],
+            my_rank_result: vec![],
+            total: 2,
+            text_title: "t".into(),
+            text_length: 100,
+        };
+        let state = OnlineRankState {
+            active_tab: CompetitionType::Jisu,
+            date: "2026-08-30".into(),
+            boards: HashMap::from([(
+                CompetitionType::Jisu,
+                RankBoard {
+                    data: Some(data),
+                    loading: false,
+                    error: None,
+                    scroll: 0,
+                },
+            )]),
+            error: None,
+        };
+        let mut app = test_app(file_text("x"));
+        app.state = AppState::OnlineRank(state);
+
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| ui(f, &app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let content = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let clean = content.replace(' ', "");
+        assert!(clean.contains("排名"), "应包含表头「排名」");
+        assert!(clean.contains("用户名"), "应包含表头「用户名」");
+        assert!(clean.contains("速度"), "应包含表头「速度」");
+        assert!(clean.contains("输入法"), "应包含表头「输入法」");
+        assert!(clean.contains("虹"), "应包含榜首用户名「虹」");
+        assert!(clean.contains("197.18"), "应渲染榜首速度");
+    }
+
+    #[test]
+    fn render_online_rank_view_shows_my_rank_and_highlights_row() {
+        let data = CompetitionRank {
+            rank_result: vec![
+                dazitui_core::CompetitionRankRow {
+                    rank: 1,
+                    username: "a".into(),
+                    speed: 100.0,
+                    ..Default::default()
+                },
+                dazitui_core::CompetitionRankRow {
+                    rank: 2,
+                    username: "我的账号".into(),
+                    speed: 88.5,
+                    ..Default::default()
+                },
+            ],
+            my_rank_result: vec![dazitui_core::CompetitionRankRow {
+                rank: 2,
+                username: "我的账号".into(),
+                speed: 88.5,
+                ..Default::default()
+            }],
+            total: 59,
+            text_title: "t".into(),
+            text_length: 100,
+        };
+        let state = OnlineRankState {
+            active_tab: CompetitionType::Jisu,
+            date: "2026-08-30".into(),
+            boards: HashMap::from([(
+                CompetitionType::Jisu,
+                RankBoard {
+                    data: Some(data),
+                    loading: false,
+                    error: None,
+                    scroll: 0,
+                },
+            )]),
+            error: None,
+        };
+        let mut app = test_app(file_text("x"));
+        app.logged_in = true;
+        app.state = AppState::OnlineRank(state);
+
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| ui(f, &app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let content = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let clean = content.replace(' ', "");
+        assert!(clean.contains("我第2名"), "应显示「我第 2 名」名次条");
+        assert!(clean.contains("共59人"), "应显示总人数");
+
+        // 当前用户行（用户名「我的账号」）应高亮：其关键字形单元格前景为 accent。
+        // 注意：宽字符在 TestBackend 中按单字占格、相邻空格为占位，故按字形而非 substring 校验；
+        // 这些用户名字形仅出现在当前用户行，因此全缓冲范围内均应带 accent 前景。
+        let palette = app.palette();
+        let want_glyphs: &[&str] = &["我", "的", "账", "号"];
+        let mut highlighted = true;
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                let sym = buffer[(x, y)].symbol();
+                if want_glyphs.contains(&sym)
+                    && buffer[(x, y)].style().fg != Some(palette.accent)
+                {
+                    highlighted = false;
+                }
+            }
+        }
+        assert!(highlighted, "当前用户行应高亮（前景 accent）");
+    }
+
+    // #107：网络失败态渲染「加载失败 …（按 R 重试）」提示。
+    #[test]
+    fn render_online_rank_view_shows_error_and_retry() {
+        let state = OnlineRankState {
+            active_tab: CompetitionType::Jisu,
+            date: "2026-08-30".into(),
+            boards: HashMap::from([(
+                CompetitionType::Jisu,
+                RankBoard {
+                    data: None,
+                    loading: false,
+                    error: Some("连接超时".into()),
+                    scroll: 0,
+                },
+            )]),
+            error: None,
+        };
+        let mut app = test_app(file_text("x"));
+        app.logged_in = false;
+        app.state = AppState::OnlineRank(state);
+
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| ui(f, &app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let clean: String = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            .replace(' ', "");
+        assert!(clean.contains("加载失败：连接超时"), "应展示具体错误");
+        assert!(clean.contains("（按R重试）") || clean.contains("重试"), "应提示按 R 重试");
+    }
+
+    // #107：未登录降级为公开榜提示，且不展示个人名次条。
+    #[test]
+    fn render_online_rank_view_logged_out_shows_public_board_note() {
+        let data = CompetitionRank {
+            rank_result: vec![dazitui_core::CompetitionRankRow {
+                rank: 1,
+                username: "路人甲".into(),
+                speed: 100.0,
+                ..Default::default()
+            }],
+            my_rank_result: vec![], // 未登录：服务端不回填个人行
+            total: 59,
+            text_title: "t".into(),
+            text_length: 100,
+        };
+        let state = OnlineRankState {
+            active_tab: CompetitionType::Jisu,
+            date: "2026-08-30".into(),
+            boards: HashMap::from([(
+                CompetitionType::Jisu,
+                RankBoard {
+                    data: Some(data),
+                    loading: false,
+                    error: None,
+                    scroll: 0,
+                },
+            )]),
+            error: None,
+        };
+        let mut app = test_app(file_text("x"));
+        app.logged_in = false; // 未登录
+        app.state = AppState::OnlineRank(state);
+
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| ui(f, &app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let clean: String = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            .replace(' ', "");
+        assert!(clean.contains("未登录"), "应提示未登录");
+        assert!(clean.contains("公开榜"), "应提示当前为公开榜");
+        assert!(!clean.contains("我第"), "未登录不应展示个人名次条");
+    }
+
+    // #107：手动刷新跨天时更新期次日期。
+    #[test]
+    fn refresh_rank_updates_date_on_cross_day() {
+        let mut app = test_app(file_text("x"));
+        // 指向死亡地址，避免后台线程真实联网（连接被快速拒绝）。
+        app.api = ApiClient::with_base_url("http://127.0.0.1:1");
+        app.state = AppState::OnlineRank(OnlineRankState {
+            active_tab: CompetitionType::Jisu,
+            date: "2000-01-01".into(), // 旧期次
+            boards: HashMap::new(),
+            error: None,
+        });
+        app.refresh_rank();
+        match &app.state {
+            AppState::OnlineRank(s) => assert_eq!(s.date, today_ymd(), "刷新后日期应更新为今天"),
+            _ => panic!("状态应保持为 OnlineRank"),
+        }
+    }
+
+    // #107：榜单滚动偏移上滚不应越过 0（下界夹紧）。
+    #[test]
+    fn rank_scroll_clamps_at_top() {
+        let mut app = test_app(file_text("x"));
+        app.api = ApiClient::with_base_url("http://127.0.0.1:1");
+        app.state = AppState::OnlineRank(OnlineRankState {
+            active_tab: CompetitionType::Jisu,
+            date: "2026-08-30".into(),
+            boards: HashMap::from([(
+                CompetitionType::Jisu,
+                RankBoard {
+                    data: None,
+                    loading: false,
+                    error: None,
+                    scroll: 3,
+                },
+            )]),
+            error: None,
+        });
+        app.rank_scroll(-10); // 远小于当前 scroll
+        match &app.state {
+            AppState::OnlineRank(s) => {
+                let scroll = s.boards.get(&CompetitionType::Jisu).unwrap().scroll;
+                assert_eq!(scroll, 0, "上滚不应越过 0");
+            }
+            _ => panic!("状态应保持为 OnlineRank"),
+        }
+        app.rank_scroll(2);
+        match &app.state {
+            AppState::OnlineRank(s) => {
+                let scroll = s.boards.get(&CompetitionType::Jisu).unwrap().scroll;
+                assert_eq!(scroll, 2, "正向下滚应在下界之上累加");
+            }
+            _ => panic!("状态应保持为 OnlineRank"),
+        }
     }
 
     #[test]
