@@ -246,6 +246,8 @@ enum CountdownSource {
     BrowsingBuiltin,
     /// 从暂停态继续跟打：保留已累计用时，倒计时结束后从暂停处续接计时。
     Resume,
+    /// 从 52dazi 在线赛文下载完成后进入：倒计时结束后直接开打（在线赛文不可重打、完成自动上传）。
+    Online,
 }
 
 /// 设置视图焦点项下标。
@@ -1341,6 +1343,8 @@ impl App {
             CountdownSource::Browsing => AppState::Browsing,
             CountdownSource::BrowsingBuiltin => AppState::BrowsingBuiltin,
             CountdownSource::Resume => AppState::Typing,
+            // 在线赛文无独立浏览态，取消后回到就绪态（功能栏可见，会话已清空）。
+            CountdownSource::Online => AppState::Typing,
         };
     }
 
@@ -1353,6 +1357,8 @@ impl App {
                         self.launch_countdown();
                     }
                     CountdownSource::Resume => self.complete_resume_countdown(),
+                    // 在线赛文倒计时结束：与选文一致，重置计时后直接开打。
+                    CountdownSource::Online => self.launch_countdown(),
                 }
             }
         }
@@ -1687,12 +1693,10 @@ impl App {
                     word_boundaries: None,
                     shuffled: false,
                 };
-                self.session =
-                    Session::new_gated(&self.text.content, self.text.source.is_builtin());
-                self.start = Instant::now();
-                self.state = AppState::Typing;
                 self.online_loading = None;
                 self.online_error = None;
+                // 进入三秒准备倒计时（与选文一致），倒计时结束由主循环 launch_countdown 真正开打。
+                self.enter_countdown(CountdownSource::Online);
             }
             Err(e) => {
                 self.online_loading = None;
@@ -2050,7 +2054,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                                 (app.sidebar_selected + 1) % SIDEBAR_MENU_ITEMS.len();
                             continue;
                         }
-                        if key.code == KeyCode::Enter || key.code == KeyCode::Char('l') {
+                        if key.code == KeyCode::Char('l') {
                             activate_sidebar_menu_item(&mut app, terminal)?;
                             continue;
                         }
@@ -2749,9 +2753,9 @@ fn hint_text(
     } else if browsing_builtin {
         " jk 选择 | Enter 载入 | s 乱序 | g/G 首尾 | Esc/q 取消 | o 设置 | Ctrl-Q 退出"
     } else if paused {
-        " jk 菜单导航 | Enter 执行 | i/Esc 恢复跟打 | d 提前结算 | r 重打 | s 统计 | o 设置 | Ctrl-Q 退出"
+        " jk 菜单导航 | l 执行 | i/Esc 恢复跟打 | d 提前结算 | r 重打 | s 统计 | o 设置 | Ctrl-Q 退出"
     } else if is_ready {
-        " jk 菜单导航 | Enter 执行 | f 载文 | b 内置 | i 自由发文 | p 剪贴板 | 1 极速杯 | s 统计 | o 设置 | Ctrl-Q 退出"
+        " jk 菜单导航 | l 执行 | f 载文 | b 内置 | i 自由发文 | p 剪贴板 | 1 极速杯 | s 统计 | o 设置 | Ctrl-Q 退出"
     } else if is_online {
         " Esc 暂停/命令 | Tab 侧栏 | s 统计 | o 设置 | u 登录 | Ctrl-Q 退出"
     } else {
@@ -9728,7 +9732,11 @@ mod tests {
         assert_eq!(app.text.title, "极速杯第3280期");
         assert_eq!(app.text.content, "你好世界内容");
         assert!(matches!(app.text.source, TextSource::Online { .. }));
-        assert!(matches!(app.state, AppState::Typing));
+        // 在线赛文下载成功后应先进入三秒准备倒计时，而非直接开打。
+        assert!(
+            matches!(app.state, AppState::Countdown { source: CountdownSource::Online, .. }),
+            "在线赛文应进入倒计时（CountdownSource::Online），当前为其他状态"
+        );
     }
 
     #[test]
@@ -10756,6 +10764,24 @@ mod tests {
                 assert_eq!(span.style.bg, Some(palette.selection));
             }
         }
+    }
+
+    #[test]
+    fn ready_and_paused_hint_bar_no_longer_shows_enter_execute() {
+        // 功能栏（就绪态/暂停态）不再用 Enter 执行菜单项，仅保留 l 与专用快捷键。
+        let ready = hint_text(false, false, false, false, true);
+        let paused = hint_text(false, false, false, true, false);
+        assert!(
+            !ready.contains("Enter 执行"),
+            "就绪态提示栏不应再有「Enter 执行」：{ready}"
+        );
+        assert!(
+            !paused.contains("Enter 执行"),
+            "暂停态提示栏不应再有「Enter 执行」：{paused}"
+        );
+        // 仍应保留 l 作为执行键提示。
+        assert!(ready.contains("l 执行"), "就绪态提示栏应保留「l 执行」：{ready}");
+        assert!(paused.contains("l 执行"), "暂停态提示栏应保留「l 执行」：{paused}");
     }
 
     #[test]
