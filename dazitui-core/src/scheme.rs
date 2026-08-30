@@ -21,6 +21,15 @@ pub struct SchemeDict {
     /// 规则：某字词同时含「短码 c」与「长码 d」且 d 以 c 为严格前缀（如 文化 `vw`⊂`vwah`），
     /// 则短码 c 需键入 `'` 才能提交该候选，提示区据此补 `'`。
     prefix_commit_codes: HashSet<String>,
+    /// 本次加载实际读入的文件路径闭包（均经 canonicalize）：`.schema.yaml` 自身、
+    /// 主 `.dict.yaml`、以及经 `import_tables` 递归导入的所有 `.dict.yaml`。
+    /// 供热监控器据此配置 watch 集合，无需重新扫目录。
+    source_paths: Vec<PathBuf>,
+}
+
+/// 规范路径：解析软链到真实文件，失败则回退原路径（与 watcher canonicalize 策略一致）。
+fn canonicalize_path(p: &Path) -> PathBuf {
+    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
 /// 单个词组单位的编码提示结果（供渲染层逐词对齐）。
@@ -182,10 +191,11 @@ impl SchemeDict {
         if visited.contains(&canon) {
             return Ok(Self::default());
         }
-        visited.insert(canon);
+        visited.insert(canon.clone());
 
         let content = std::fs::read_to_string(path)?;
         let mut dict = Self::parse(&content);
+        dict.source_paths.push(canon);
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
         for name in Self::extract_import_tables(&content) {
             let import_path = parent.join(format!("{name}.dict.yaml"));
@@ -206,6 +216,11 @@ impl SchemeDict {
                 if !entry.contains(c) {
                     entry.push(c.clone());
                 }
+            }
+        }
+        for p in &other.source_paths {
+            if !self.source_paths.contains(p) {
+                self.source_paths.push(p.clone());
             }
         }
         self.rebuild_prefix_commit_codes();
@@ -289,6 +304,9 @@ impl SchemeDict {
                 Self::default()
             };
 
+            // 记录 schema 自身路径（热监控闭包的一部分）
+            dict.source_paths.push(canonicalize_path(path));
+
             if let Some(alg) = algebra {
                 dict.set_chord_algebra(alg);
             }
@@ -313,6 +331,8 @@ impl SchemeDict {
 
         let schema_candidate = parent_dir.join(format!("{stem}.schema.yaml"));
         if schema_candidate.exists() {
+            // 记录伴随 schema 路径（热监控闭包的一部分）
+            dict.source_paths.push(canonicalize_path(&schema_candidate));
             let mut resolver = RimeSchemaResolver::new();
             let rules = resolver.resolve_chord_algebra(&schema_candidate);
             if !rules.is_empty() {
@@ -418,6 +438,13 @@ impl SchemeDict {
     /// 获取字典总词条数。
     pub fn entry_count(&self) -> usize {
         self.word_to_codes.len()
+    }
+
+    /// 获取本次加载实际读入的文件路径闭包（均经 canonicalize）：
+    /// `.schema.yaml` 自身、主 `.dict.yaml`、以及经 `import_tables` 递归导入的所有 `.dict.yaml`。
+    /// 供热监控器据此配置 watch 集合。
+    pub fn source_paths(&self) -> &[PathBuf] {
+        &self.source_paths
     }
 
     /// 反查指定汉字或词组的首选击键序列（或并击组合）。
@@ -1485,6 +1512,43 @@ mod tests {
         let hints = dict.build_code_hints(&["文化遗产".to_string()]);
         assert_eq!(hints[0].code, "vaBC");
         assert!(!hints[0].is_oov);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scheme_dict_records_source_paths_of_schema_and_imports() {
+        // T92（热监控前置）：加载含 import_tables 的方案后，source_paths 应含
+        // schema 自身、主 dict、以及被 import 的 dict（即热重载需监控的文件闭包）。
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!("dazitui_srcpaths_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let schema = dir.join("demo.schema.yaml");
+        let main_dict = dir.join("demo.dict.yaml");
+        let sub = dir.join("sub.dict.yaml");
+
+        fs::write(
+            &schema,
+            "schema:\n  name: 演示\n  schema_id: demo\ntranslator:\n  dictionary: demo\n",
+        )
+        .unwrap();
+        fs::write(&main_dict, "---\nname: demo\nimport_tables:\n  - sub\n...\n\n文\tvw\n").unwrap();
+        fs::write(&sub, "化\tah\n").unwrap();
+
+        let dict = SchemeDict::load_from_file(&schema).expect("加载 demo 方案");
+
+        let mut paths: Vec<PathBuf> = dict.source_paths().to_vec();
+        paths.sort();
+        let mut expected = vec![schema.clone(), main_dict.clone(), sub.clone()];
+        expected.sort();
+        assert_eq!(
+            paths, expected,
+            "source_paths 应含 schema + 主 dict + 被 import 的 dict"
+        );
+        assert_eq!(dict.get_primary_code("文"), Some("vw"));
+        assert_eq!(dict.get_primary_code("化"), Some("ah"));
 
         let _ = fs::remove_dir_all(&dir);
     }
