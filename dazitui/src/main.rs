@@ -1037,6 +1037,9 @@ impl App {
         // 1. 缓存命中：瞬时切换，无需后台加载。
         if let Some(cached) = self.scheme_cache.get(&id) {
             self.scheme_dict = Some(cached.clone());
+            // 重建热监控闭包到当前方案（issue #95）：切回已缓存方案时若不复建监控，
+            // 会仍然监控旧方案的源文件，导致热重载错乱。
+            self.arm_scheme_watcher();
             return;
         }
         // 2. 已在加载同一方案：避免重复派发。
@@ -12845,5 +12848,120 @@ mod scheme_hot_reload_tests {
             }
         }
         assert!(reloaded, "改动源文件后应自动热重载，使「新→xx」生效");
+    }
+}
+
+/// 切换方案时重建监控闭包（issue #95）测试。
+#[cfg(test)]
+mod scheme_switch_watch_tests {
+    use super::*;
+    use dazitui_core::{ApiClient, SchemeInfo, SettingsStore, TextSource, TokenStore};
+    use std::time::Duration;
+
+    fn tmp(suffix: &str) -> PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("dazitui-switch-{stamp}-{suffix}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn file_text(content: &str) -> Text {
+        Text {
+            title: "t".into(),
+            content: content.into(),
+            source: TextSource::File,
+            word_boundaries: None,
+            shuffled: false,
+        }
+    }
+
+    /// 构造最小 App，并指向 `discovered` 中的多个临时方案。
+    fn app_with_schemes(schemas: &[(String, PathBuf)]) -> App {
+        let token_dir = tmp("tok");
+        let settings_dir = tmp("set");
+        let mut app = App::new_with(
+            file_text("练习"),
+            TokenStore::new(token_dir.join("token")),
+            ApiClient::with_base_url_and_store(
+                "http://127.0.0.1:1",
+                Some(TokenStore::new(token_dir.join("token"))),
+            ),
+            SettingsStore::new(settings_dir.join("settings")),
+            None,
+        );
+        app.settings.scheme = String::new();
+        app.discovered = schemas
+            .iter()
+            .map(|(id, p)| SchemeInfo {
+                id: id.clone(),
+                display_name: id.clone(),
+                path: p.clone(),
+            })
+            .collect();
+        app
+    }
+
+    /// 等待当前 scheme 加载完成且监控闭包包含 `expect_dict`。
+    fn wait_loaded(app: &mut App, expect_dict: &PathBuf) -> bool {
+        for _ in 0..30 {
+            app.poll_scheme_loader();
+            if app
+                .scheme_watch_paths
+                .as_ref()
+                .map(|p| p.contains(expect_dict))
+                .unwrap_or(false)
+            {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        false
+    }
+
+    #[test]
+    fn switching_scheme_rebuilds_watch_closure() {
+        let dir = tmp("switch");
+        let d_schema = dir.join("demo.schema.yaml");
+        let d_dict = dir.join("demo.dict.yaml");
+        std::fs::write(&d_schema, "schema:\n  name: Demo\n  schema_id: demo\n").unwrap();
+        std::fs::write(&d_dict, "---\nname: demo\n...\n\n文\tvw\n").unwrap();
+        let a_schema = dir.join("alt.schema.yaml");
+        let a_dict = dir.join("alt.dict.yaml");
+        std::fs::write(&a_schema, "schema:\n  name: Alt\n  schema_id: alt\n").unwrap();
+        std::fs::write(&a_dict, "---\nname: alt\n...\n\n字\tqq\n").unwrap();
+
+        let mut app = app_with_schemes(&[
+            ("demo".to_string(), d_schema.clone()),
+            ("alt".to_string(), a_schema.clone()),
+        ]);
+
+        // 加载 demo（首次，异步）
+        app.settings.scheme = "demo".to_string();
+        app.reload_scheme_dict();
+        assert!(wait_loaded(&mut app, &d_dict), "demo 应加载并建监控");
+
+        // 切到 alt（异步）
+        app.settings.scheme = "alt".to_string();
+        app.reload_scheme_dict();
+        assert!(wait_loaded(&mut app, &a_dict), "切到 alt 应重建监控到 alt");
+        assert!(
+            !app.scheme_watch_paths.as_ref().unwrap().contains(&d_dict),
+            "切换后不应再监控 demo 文件"
+        );
+
+        // 切回 demo：此时 demo 已在缓存中，走「缓存命中」分支——这里正是不重建监控的陷阱。
+        app.settings.scheme = "demo".to_string();
+        app.reload_scheme_dict();
+        assert!(
+            app.scheme_watch_paths.as_ref().unwrap().contains(&d_dict),
+            "缓存命中切回 demo 也应重建监控到 demo"
+        );
+        assert!(
+            !app.scheme_watch_paths.as_ref().unwrap().contains(&a_dict),
+            "切回后不应再监控 alt 文件"
+        );
     }
 }
