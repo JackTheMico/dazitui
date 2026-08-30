@@ -7029,6 +7029,47 @@ fn code_hint_overlay_line(
     Some(code_hint_line_from_cells(&cells, theme))
 }
 
+/// 短语感知合并（修复「经典造型」类自定义短语不显示整词码的根因）。
+///
+/// jieba 分词不认识用户词典里的自定义短语，会把「经典造型」拆成「经典」「造型」，
+/// 导致提示显示逐词码 `RvFX mbfp` 而非整词码 `RFmf`。本函数在分词结果之上做最长匹配：
+/// 若相邻若干词拼接后正好命中方案词典中的整词码，则合并为一个提示单元并反查整词码。
+/// 仅当拼接命中时才合并；否则保持原分词不变，行为向后兼容。
+///
+/// 同时合并 `word_ranges` 与 `typed_mask`，使提示行、正文行的索引与合并后的词单元锁步。
+fn merge_phrase_hints(
+    words: &[String],
+    typed_mask: &[bool],
+    word_ranges: &[(usize, usize)],
+    dict: &SchemeDict,
+) -> (Vec<String>, Vec<bool>, Vec<(usize, usize)>) {
+    let n = words.len();
+    let mut out_w: Vec<String> = Vec::new();
+    let mut out_m: Vec<bool> = Vec::new();
+    let mut out_r: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < n {
+        // 从最长拼接（覆盖余下全部词）向短回溯，命中词典整词码即采用。
+        let mut best_k = 1usize;
+        let mut merged = words[i].clone();
+        let mut merged_range = word_ranges[i];
+        for k in 2..=n - i {
+            let cand: String = words[i..i + k].concat();
+            if dict.get_primary_code(&cand).is_some() {
+                merged = cand;
+                best_k = k;
+                merged_range = (word_ranges[i].0, word_ranges[i + k - 1].1);
+            }
+        }
+        out_w.push(merged);
+        // 合并单元的「已正确上屏」= 所有组成词均正确。
+        out_m.push((i..i + best_k).all(|j| typed_mask.get(j).copied().unwrap_or(false)));
+        out_r.push(merged_range);
+        i += best_k;
+    }
+    (out_w, out_m, out_r)
+}
+
 /// 内置词组赛文开启遍码提示时，当前页词条的词格列宽（`max(词宽, 提示码宽)`）。
 ///
 /// 提示码宽于词（如「腕间」4 列 vs 码 `HjYIw` 5 列）时词格需撑宽，对照区正文行与
@@ -7158,6 +7199,11 @@ fn code_hint_grid_text(
     if words.is_empty() {
         return None;
     }
+
+    // 短语感知合并：相邻分词单元若拼接命中词典整词码（如自定义短语「经典造型」），
+    // 合并为整词提示单元，反查显示整词码而非逐词码（issue 根因修复）。
+    let (words, typed_mask, word_ranges) =
+        merge_phrase_hints(&words, &typed_mask, &word_ranges, dict);
 
     let hints: Vec<CodeHint> = dict.build_code_hints(&words);
     // 词格列宽 = max(词宽, 提示码宽)：提示码宽于词时不截断提示，而由正文补空格让位。
@@ -9279,6 +9325,44 @@ mod tests {
             .is_none(),
             "内置词组赛文不应走双行词格路径"
         );
+    }
+
+    #[test]
+    fn code_hint_grid_merges_adjacent_words_into_registered_phrase() {
+        // 根因修复验证：jieba 把「经典造型」拆成「经典」「造型」，但词典含整词
+        // 「经典造型→RFmf」时，提示应合并显示整词码 RFmf，无论参考文本是否含空格
+        // （空格只是分隔符，真正分词靠 jieba）。码值取自真实 yoyo-pure-km 词库。
+        let theme = Theme::preset(ThemePreset::CatppuccinMocha);
+        let tsv = "经典造型\tRFmf\n经典\tRvFX\n造型\tmbfp\n";
+        let dict = SchemeDict::parse(tsv);
+
+        for (label, content) in [("含空格", "经典 造型"), ("无空格", "经典造型")] {
+            let text = load_text_from_string(
+                "自由发文",
+                content.to_string(),
+                TextSource::File,
+                &LoadOptions::default(),
+            )
+            .unwrap();
+            let session = Session::new(&text.content);
+            let grid = code_hint_grid_text(&session, &text, Some(&dict), theme, false, 40)
+                .unwrap_or_else(|| panic!("[{label}] 应生成词格"));
+            let joined: String = grid
+                .lines
+                .iter()
+                .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+                .collect();
+            assert!(
+                joined.contains("RFmf"),
+                "[{label}] 应显示整词码 RFmf, 得到: {:?}",
+                joined
+            );
+            assert!(
+                !joined.contains("RvFX"),
+                "[{label}] 不应再出现拆解码 RvFX, 得到: {:?}",
+                joined
+            );
+        }
     }
 
     #[test]
