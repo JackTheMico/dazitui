@@ -263,8 +263,9 @@ const FOCUS_SCHEME: usize = 4;
 const FOCUS_INPUT_METHOD: usize = 5;
 const FOCUS_GROUP_SIZE: usize = 6;
 const FOCUS_CODE_HINT: usize = 7;
+const FOCUS_MONITOR_SCHEME: usize = 8;
 /// 设置视图焦点项总数。
-const SETTINGS_FOCUS_COUNT: usize = 8;
+const SETTINGS_FOCUS_COUNT: usize = 9;
 
 /// 成绩视图「错字时间线」一屏最多可见的错字条数（超出部分滚动查看）。
 const ERROR_TIMELINE_VISIBLE: usize = 8;
@@ -1089,7 +1090,18 @@ impl App {
 
     /// 用当前 `scheme_dict` 的源文件闭包配置热监控。仅在成功从磁盘加载到码表后调用，
     /// 因此天然覆盖「切换方案后重建监控闭包」（#95）。
+    ///
+    /// 受总开关 `settings.monitor_scheme` 控制（issue #96）：关闭时卸载监控、不排定重载。
     fn arm_scheme_watcher(&mut self) {
+        // 总开关关闭：卸载任何已建监控，保持「不监控」状态。
+        if !self.settings.monitor_scheme {
+            if let Some(w) = self.scheme_watcher.as_mut() {
+                w.set_paths(&[]);
+            }
+            self.scheme_watch_paths = None;
+            self.scheme_reload_pending_at = None;
+            return;
+        }
         if let (Some(watcher), Some(dict)) = (self.scheme_watcher.as_mut(), self.scheme_dict.as_ref())
         {
             let paths: Vec<PathBuf> = dict.source_paths().to_vec();
@@ -1102,9 +1114,16 @@ impl App {
 
     /// 每帧调用：检测方案源文件改动，经防抖后驱逐缓存并发起重载（复用既有 `SchemeLoader` 通道）。
     ///
+    /// 受总开关 `settings.monitor_scheme` 控制（issue #96/#94）：关闭时直接返回，不检测、不重载。
+    ///
     /// 关键陷阱（issue #94）：必须先 `scheme_cache.remove(current_id)` 再调用 `reload_scheme_dict()`，
     /// 否则后者会因缓存命中而短路返回，重载不会发生（这是热重载「改了不生效」的根因）。
     fn poll_scheme_hot_reload(&mut self) {
+        // 总开关关闭：清空任何排定中的重载并停止检测。
+        if !self.settings.monitor_scheme {
+            self.scheme_reload_pending_at = None;
+            return;
+        }
         // 1. 防抖窗口内：到点才执行一次真正重载，期间忽略事件避免重复风暴。
         if let Some(at) = self.scheme_reload_pending_at {
             if Instant::now() >= at {
@@ -1190,6 +1209,14 @@ impl App {
     fn toggle_code_hint(&mut self) {
         self.settings.code_hint = !self.settings.code_hint;
         let _ = self.settings_store.save(&self.settings);
+    }
+
+    /// 切换方案热监控总开关并即时持久化；开关即时生效（开→重建监控，关→卸载监控）。
+    fn toggle_monitor_scheme(&mut self) {
+        self.settings.monitor_scheme = !self.settings.monitor_scheme;
+        let _ = self.settings_store.save(&self.settings);
+        // 复用 arm 逻辑：开则重建监控、关则卸载，保证开关即时生效。
+        self.arm_scheme_watcher();
     }
 
     /// 切换到下一实时键盘模式并即时持久化。
@@ -2321,6 +2348,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                                 FOCUS_RATIO => app.adjust_ratio(if forward { 5 } else { -5 }),
                                 FOCUS_BOLD => app.toggle_bold(),
                                 FOCUS_CODE_HINT => app.toggle_code_hint(),
+                                FOCUS_MONITOR_SCHEME => app.toggle_monitor_scheme(),
                                 FOCUS_KEYBOARD => {
                                     if forward {
                                         app.next_keyboard_mode();
@@ -5767,6 +5795,12 @@ fn render_settings(frame: &mut Frame, app: &App) {
         focus == FOCUS_CODE_HINT,
         &palette,
     ));
+    lines.push(settings_row(
+        "方案热监控",
+        on_off(app.settings.monitor_scheme),
+        focus == FOCUS_MONITOR_SCHEME,
+        &palette,
+    ));
 
     lines.push(Line::from(""));
     // 主题预览：用当前主题的对/错色渲染示意文字。
@@ -8111,9 +8145,10 @@ mod tests {
 
     #[test]
     fn move_focus_wraps_around() {
-        // SETTINGS_FOCUS_COUNT = 8（主题/占比/粗体/实时键盘/反查方案/上传名称/分组大小/遍码提示）
-        assert_eq!(move_focus(0, -1), 7); // 第 0 项向前 → 末项（7）
-        assert_eq!(move_focus(7, 1), 0); // 末项向后 → 第 0 项
+        // SETTINGS_FOCUS_COUNT = 9（主题/占比/粗体/实时键盘/反查方案/上传名称/分组大小/遍码提示/方案热监控）
+        assert_eq!(move_focus(0, -1), 8); // 第 0 项向前 → 末项（8）
+        assert_eq!(move_focus(8, 1), 0); // 末项向后 → 第 0 项
+        assert_eq!(move_focus(7, 1), 8); // 倒数第二项向后 → 末项
         assert_eq!(move_focus(0, 1), 1);
         assert_eq!(move_focus(5, 1), 6);
         assert_eq!(move_focus(2, -1), 1);
@@ -12848,6 +12883,56 @@ mod scheme_hot_reload_tests {
             }
         }
         assert!(reloaded, "改动源文件后应自动热重载，使「新→xx」生效");
+    }
+
+    #[test]
+    fn hot_reload_disabled_when_monitor_scheme_off() {
+        let dir = tmp("scheme-off");
+        let schema = dir.join("demo.schema.yaml");
+        let dict = dir.join("demo.dict.yaml");
+        std::fs::write(&schema, "schema:\n  name: Demo\n  schema_id: demo\n").unwrap();
+        std::fs::write(&dict, "---\nname: demo\n...\n\n文\tvw\n化\tah\n").unwrap();
+
+        let mut app = app_with_scheme(schema.clone());
+        // 关闭热监控总开关。
+        app.settings.monitor_scheme = false;
+
+        // 首次加载（开关不影响正常加载）
+        app.reload_scheme_dict();
+        let mut loaded = false;
+        for _ in 0..30 {
+            app.poll_scheme_loader();
+            if app.scheme_dict.is_some() {
+                loaded = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(loaded, "首次方案加载应成功（与开关无关）");
+        assert_eq!(
+            app.scheme_dict.as_ref().and_then(|d| d.get_primary_code("文")),
+            Some("vw")
+        );
+        // 开关关闭时不应对源文件建监控。
+        assert!(
+            app.scheme_watch_paths.is_none(),
+            "开关关闭时不应对源文件建监控"
+        );
+
+        // 修改源文件
+        std::fs::write(&dict, "---\nname: demo\n...\n\n文\tvw\n化\tah\n新\txx\n").unwrap();
+
+        // 驱动循环，确认不会热重载
+        for _ in 0..40 {
+            app.poll_scheme_hot_reload();
+            std::thread::sleep(Duration::from_millis(50));
+            app.poll_scheme_loader();
+        }
+        assert_eq!(
+            app.scheme_dict.as_ref().and_then(|d| d.get_primary_code("新")),
+            None,
+            "开关关闭时改动源文件不应触发热重载"
+        );
     }
 }
 

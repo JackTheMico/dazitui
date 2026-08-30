@@ -382,6 +382,8 @@ pub struct Settings {
     pub group_size: u8,
     /// 遍码提示（编码提示）开关：开启后在对照区字词上方显示最少击数输入编码。
     pub code_hint: bool,
+    /// 方案源文件热监控开关（issue #91/#96）：开启后改动方案码表文件会自动重载（默认开启）。
+    pub monitor_scheme: bool,
     /// 各内置赛文的练习进度（跨会话保留），key 为赛文名。
     pub builtin_progress: HashMap<String, BuiltinProgress>,
 }
@@ -442,6 +444,7 @@ impl Default for Settings {
             heatmap_layout: HeatmapLayout::Staggered,
             group_size: Self::DEFAULT_GROUP_SIZE,
             code_hint: false,
+            monitor_scheme: true,
             builtin_progress: HashMap::new(),
         }
     }
@@ -512,7 +515,7 @@ impl SettingsStore {
             std::fs::create_dir_all(parent)?;
         }
         let mut content = format!(
-            "theme={}\nreference_ratio={}\nbold={}\nkeyboard_mode={}\nscheme={}\ninput_method={}\nheatmap_layout={}\ngroup_size={}\ncode_hint={}\n",
+            "theme={}\nreference_ratio={}\nbold={}\nkeyboard_mode={}\nscheme={}\ninput_method={}\nheatmap_layout={}\ngroup_size={}\ncode_hint={}\nmonitor_scheme={}\n",
             settings.theme.as_str(),
             settings.reference_ratio,
             settings.bold,
@@ -522,6 +525,7 @@ impl SettingsStore {
             settings.heatmap_layout.as_str(),
             settings.group_size,
             settings.code_hint,
+            settings.monitor_scheme,
         );
         for (scheme, path) in &settings.scheme_dict_paths {
             content.push_str(&format!("scheme_dict.{}={}\n", scheme, path));
@@ -583,6 +587,7 @@ impl SettingsStore {
                 }
                 "bold" => settings.bold = value == "true",
                 "code_hint" => settings.code_hint = value == "true",
+                "monitor_scheme" => settings.monitor_scheme = value == "true",
                 "font" => {} // 忽略已移除的 font 设置
                 "keyboard_mode" => {
                     if let Some(mode) = KeyboardMode::parse(value) {
@@ -782,6 +787,7 @@ mod tests {
             scheme_dict_paths,
             heatmap_layout: HeatmapLayout::Ortholinear,
             code_hint: false,
+            monitor_scheme: true,
             builtin_progress: HashMap::new(),
         };
         store.save(&s).unwrap();
@@ -1148,6 +1154,44 @@ mod tests {
         let loaded = store.load();
         assert_eq!(loaded.scheme, "yoyo-pure-km");
         // 旧配置中 scheme 为路径时，归一化在 App 层完成；存储层只保证字符串原样往返。
+        let _ = std::fs::remove_file(store.path());
+    }
+
+    #[test]
+    fn monitor_scheme_defaults_true() {
+        assert!(Settings::default().monitor_scheme, "方案热监控默认开启");
+    }
+
+    #[test]
+    fn monitor_scheme_roundtrips_through_store() {
+        let store = SettingsStore::new(temp_path("monitor_roundtrip"));
+        let mut s = Settings::default();
+        s.monitor_scheme = false;
+        store.save(&s).unwrap();
+        assert!(
+            !store.load().monitor_scheme,
+            "关闭后存储应保留 false"
+        );
+        let mut s2 = store.load();
+        s2.monitor_scheme = true;
+        store.save(&s2).unwrap();
+        assert!(store.load().monitor_scheme, "重新开启应保留 true");
+        let _ = std::fs::remove_file(store.path());
+    }
+
+    #[test]
+    fn monitor_scheme_absent_in_old_file_defaults_true() {
+        // 旧配置文件无 monitor_scheme 行时应默认开启（向后兼容）。
+        let store = SettingsStore::new(temp_path("monitor_absent"));
+        std::fs::write(
+            store.path(),
+            "theme=catppuccin-mocha\nreference_ratio=62\nbold=false\ncode_hint=false\n",
+        )
+        .unwrap();
+        assert!(
+            store.load().monitor_scheme,
+            "旧配置缺省 monitor_scheme 时应默认 true"
+        );
         let _ = std::fs::remove_file(store.path());
     }
 }
