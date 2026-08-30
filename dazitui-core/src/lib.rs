@@ -430,6 +430,17 @@ pub fn save_text_to_file(path: &Path, content: &str) -> std::io::Result<()> {
     std::fs::write(path, content)
 }
 
+/// 去除字符串中所有空白字符（半角空格、制表符、换行、全角空格 U+3000 等），并去掉首尾空白。
+///
+/// 被 `process_content` 与 `normalize_online_content` 共用，避免去空白逻辑重复。
+fn strip_whitespace_chars(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
 /// 按选项处理原文：去空格、去标点、去首尾空白；处理为空则报 Empty。
 fn process_content(raw: String, options: &LoadOptions) -> Result<String, LoadError> {
     if raw.is_empty() {
@@ -437,7 +448,7 @@ fn process_content(raw: String, options: &LoadOptions) -> Result<String, LoadErr
     }
     let mut content = raw;
     if options.strip_whitespace {
-        content = content.chars().filter(|c| !c.is_whitespace()).collect();
+        content = strip_whitespace_chars(&content);
     }
     if options.strip_punctuation {
         content = content.chars().filter(|c| !is_punctuation(*c)).collect();
@@ -448,6 +459,17 @@ fn process_content(raw: String, options: &LoadOptions) -> Result<String, LoadErr
         return Err(LoadError::Empty);
     }
     Ok(content)
+}
+
+/// 在线赛文内容归一化：去除所有空白字符（半角空格、制表符、换行、全角空格 U+3000 等）。
+///
+/// 52dazi 部分赛文内容会带词间空格（如「经典 造型」「智能 手表 的 科技 感」），
+/// 跟打时用户不需要、也不应输入空格；空白还会破坏遍码提示的分词（jieba 会按空格断开）。
+/// 故载文时统一去除，得到连续中文正文。标题为元数据，不在此处理。
+///
+/// 仅做去空白，不做空内容校验（空校验由调用方在载文路径决定如何处理）。
+pub fn normalize_online_content(content: &str) -> String {
+    strip_whitespace_chars(content)
 }
 
 /// 判断字符是否为标点：ASCII 标点 + 常见中英文标点。
@@ -741,6 +763,39 @@ mod tests {
         };
         assert!(!file_text.is_online());
         assert!(online_text.is_online());
+    }
+
+    #[test]
+    fn normalize_online_content_strips_spaces_between_words() {
+        // 52dazi 词间空格（如「经典 造型」）应被去除，得到连续正文。
+        let raw = "智能 手表 的 科技 感 ， 复古 腕表 以 简约 设计 、 经典 造型";
+        assert_eq!(
+            normalize_online_content(raw),
+            "智能手表的科技感，复古腕表以简约设计、经典造型"
+        );
+    }
+
+    #[test]
+    fn normalize_online_content_strips_newlines_tabs_and_fullwidth_space() {
+        // 换行、制表符、全角空格（U+3000）等所有 Unicode 空白都应去除。
+        let raw = "春眠不觉晓\t处处闻啼鸟\n夜来风雨声　花落知多少";
+        assert_eq!(
+            normalize_online_content(raw),
+            "春眠不觉晓处处闻啼鸟夜来风雨声花落知多少"
+        );
+    }
+
+    #[test]
+    fn normalize_online_content_keeps_punctuation() {
+        // 标点（逗号、顿号、句号）属于正文需输入，不应被当作空白去除。
+        let raw = "你好 ， 世界 、 加油 。";
+        assert_eq!(normalize_online_content(raw), "你好，世界、加油。");
+    }
+
+    #[test]
+    fn normalize_online_content_trims_leading_trailing_space() {
+        let raw = "  你好世界  ";
+        assert_eq!(normalize_online_content(raw), "你好世界");
     }
 
     #[test]

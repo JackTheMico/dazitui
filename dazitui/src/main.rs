@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use dazitui_core::ThemePreset;
+use dazitui_core::normalize_online_content;
 use dazitui_core::{
     ApiClient, ApiError, AuthSession, BUILTIN_SETS, BuiltinProgress, BuiltinSet, CharStatus,
     CodeHint, CompetitionType, DbTask, DbWorker, ErrorRecordItem, ErrorType, HeatmapLayout,
@@ -1854,9 +1855,17 @@ impl App {
         }
         match self.api.get_content(competition_type) {
             Ok(comp) => {
+                let content = normalize_online_content(&comp.content);
+                if content.is_empty() {
+                    // 去空白后为空（如服务端返回空白/纯空格的赛文）：不进入跟打，
+                    // 避免开打一个「完成即结束」的退化赛文。保持旧赛文不变，仅报错。
+                    self.online_loading = None;
+                    self.online_error = Some("赛文内容为空或仅含空白".to_string());
+                    return;
+                }
                 self.text = Text {
                     title: comp.title,
-                    content: comp.content,
+                    content,
                     source: TextSource::Online { competition_type },
                     word_boundaries: None,
                     shuffled: false,
@@ -10003,6 +10012,71 @@ mod tests {
             matches!(app.state, AppState::Countdown { source: CountdownSource::Online, .. }),
             "在线赛文应进入倒计时（CountdownSource::Online），当前为其他状态"
         );
+    }
+
+    #[test]
+    fn download_online_strips_spaces_from_content() {
+        // 52dazi 赛文内容带词间空格（如「经典 造型」）→ 载文后应自动去除，
+        // 得到连续正文，避免用户误打空格、也避免破坏遍码提示分词。
+        let store = temp_token_store();
+        store.save("tok").unwrap();
+        let (port, handle) = mock_server(&[(
+            "/Api/Text/getContent",
+            r#"{"error":0,"msg":{"0":"智能 手表 的 科技 感 ， 复古 腕表 以 简约 设计 、 精湛 机械 工艺 、 经典 造型","7":"极速杯第3281期"}}"#,
+        )]);
+        let mut app = App::new_with(
+            online_text("旧赛文"),
+            store.clone(),
+            ApiClient::with_base_url_and_store(&format!("http://127.0.0.1:{port}"), Some(store)),
+            temp_settings_store(),
+            None,
+        );
+        app.logged_in = true;
+        app.online_loading = Some(CompetitionType::Jisu);
+        app.download_online(CompetitionType::Jisu);
+        handle.join().unwrap();
+        assert!(app.online_loading.is_none());
+        assert!(app.online_error.is_none());
+        assert_eq!(app.text.title, "极速杯第3281期");
+        assert_eq!(
+            app.text.content,
+            "智能手表的科技感，复古腕表以简约设计、精湛机械工艺、经典造型"
+        );
+        // 标题作为元数据不受影响，仍保留服务端原始值。
+        assert!(!app.text.content.contains(' '));
+    }
+
+    #[test]
+    fn download_online_empty_after_strip_shows_error() {
+        // 服务端返回纯空白赛文 → 去空格后为空 → 不应开打退化赛文，应报错并保留旧赛文。
+        let store = temp_token_store();
+        store.save("tok").unwrap();
+        let (port, handle) = mock_server(&[(
+            "/Api/Text/getContent",
+            r#"{"error":0,"msg":{"0":"   \t\n   ","7":"极速杯第3282期"}}"#,
+        )]);
+        let mut app = App::new_with(
+            online_text("旧赛文"),
+            store.clone(),
+            ApiClient::with_base_url_and_store(&format!("http://127.0.0.1:{port}"), Some(store)),
+            temp_settings_store(),
+            None,
+        );
+        app.logged_in = true;
+        app.online_loading = Some(CompetitionType::Jisu);
+        app.download_online(CompetitionType::Jisu);
+        handle.join().unwrap();
+        assert!(app.online_loading.is_none());
+        assert_eq!(
+            app.online_error.as_deref(),
+            Some("赛文内容为空或仅含空白")
+        );
+        // 旧赛文保持不变，且未进入倒计时。
+        assert_eq!(app.text.content, "旧赛文");
+        assert!(!matches!(
+            app.state,
+            AppState::Countdown { .. }
+        ));
     }
 
     #[test]
