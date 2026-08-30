@@ -331,8 +331,11 @@ impl SchemeDict {
 
         let schema_candidate = parent_dir.join(format!("{stem}.schema.yaml"));
         if schema_candidate.exists() {
-            // 记录伴随 schema 路径（热监控闭包的一部分）
-            dict.source_paths.push(canonicalize_path(&schema_candidate));
+            // 记录伴随 schema 路径（热监控闭包的一部分）；与已记录的自身路径去重。
+            let sc = canonicalize_path(&schema_candidate);
+            if !dict.source_paths.contains(&sc) {
+                dict.source_paths.push(sc);
+            }
             let mut resolver = RimeSchemaResolver::new();
             let rules = resolver.resolve_chord_algebra(&schema_candidate);
             if !rules.is_empty() {

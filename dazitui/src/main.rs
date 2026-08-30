@@ -277,6 +277,8 @@ const ERROR_TIMELINE_COMPACT_ROWS: usize = 3;
 const COUNTDOWN_SECS: Duration = Duration::from_secs(3);
 /// 成功热重载后「方案已重载」状态栏闪现的持续时间（约 2 秒后淡出）。
 const SCHEME_RELOAD_FLASH_DURATION: Duration = Duration::from_millis(2000);
+/// 热重载防抖时长：连续写盘（原子保存多事件）在此时窗内合并为一次重载（issue #94 验收 300ms）。
+const SCHEME_RELOAD_DEBOUNCE: Duration = Duration::from_millis(300);
 
 /// 预设中「自定义」项的标签（哨兵值，选中即打开文本弹窗）。
 const SCHEME_CUSTOM: &str = "自定义";
@@ -739,7 +741,8 @@ struct App {
     scheme_loader: SchemeLoader,
     /// 方案源文件热监控器（issue #91/#93/#94）。`None` 表示 `notify` 初始化失败，
     /// 此时安全降级为「不监控」（不影响既有加载/切换逻辑）。
-    /// 开/关开关（设置项 `monitor_scheme`）由 #96 接入；此处默认始终监控。
+    /// 开/关开关（设置项 `monitor_scheme`，默认开启）由 #96 接入；关闭时
+    /// `rebuild_scheme_watcher` 会卸载监控闭包，不影响既有加载/切换逻辑。
     scheme_watcher: Option<scheme_watcher::SchemeWatcher>,
     /// 当前已交给监控器的源文件路径闭包，用于重载成功后重建监控（应对原子保存换 inode）。
     scheme_watch_paths: Option<Vec<PathBuf>>,
@@ -1056,7 +1059,7 @@ impl App {
             self.scheme_dict = Some(cached.clone());
             // 重建热监控闭包到当前方案（issue #95）：切回已缓存方案时若不复建监控，
             // 会仍然监控旧方案的源文件，导致热重载错乱。
-            self.arm_scheme_watcher();
+            self.rebuild_scheme_watcher();
             return;
         }
         // 2. 已在加载同一方案：避免重复派发。
@@ -1092,7 +1095,7 @@ impl App {
                 // 仅当仍是当前选中方案时才激活，并据此建立/重建热监控（#94/#95）。
                 if self.settings.scheme == result.id {
                     self.scheme_dict = Some(dict);
-                    self.arm_scheme_watcher();
+                    self.rebuild_scheme_watcher();
                     // 本次成功回传来自热监控触发的重载：闪现「方案已重载」，并清除既有失败提示（互斥）。
                     if self.scheme_hot_reload_expected {
                         self.scheme_hot_reload_expected = false;
@@ -1112,6 +1115,8 @@ impl App {
                         .clone()
                         .unwrap_or_else(|| "未知错误".to_string());
                     self.scheme_reload_error = Some(format!("方案重载失败：{reason}"));
+                    // 失败优先：清除可能残留的成功闪现，使报错立即显示（与成功闪现互斥）。
+                    self.scheme_reload_flash_at = None;
                 } else {
                     // 非热重载（如初始/手动切换到坏方案）：维持既有清空行为。
                     self.scheme_dict = None;
@@ -1127,7 +1132,7 @@ impl App {
     /// 因此天然覆盖「切换方案后重建监控闭包」（#95）。
     ///
     /// 受总开关 `settings.monitor_scheme` 控制（issue #96）：关闭时卸载监控、不排定重载。
-    fn arm_scheme_watcher(&mut self) {
+    fn rebuild_scheme_watcher(&mut self) {
         // 总开关关闭：卸载任何已建监控，保持「不监控」状态。
         if !self.settings.monitor_scheme {
             if let Some(w) = self.scheme_watcher.as_mut() {
@@ -1165,7 +1170,19 @@ impl App {
             self.scheme_reload_pending_at = None;
             return;
         }
-        // 1. 防抖窗口内：到点才执行一次真正重载，期间忽略事件避免重复风暴。
+        // 每帧排空监控通道：吸收本次及突发写盘（原子保存 temp+rename 多事件）产生的所有事件，
+        // 避免残留事件在防抖到期后二次触发重载（issue #94 防抖合并）。
+        let changed = self
+            .scheme_watcher
+            .as_mut()
+            .map(|w| w.drain_changed())
+            .unwrap_or(false);
+        if changed {
+            // 任意改动都重置防抖计时：连续写盘在 `SCHEME_RELOAD_DEBOUNCE` 窗口内只触发一次重载。
+            self.scheme_reload_pending_at = Some(Instant::now() + SCHEME_RELOAD_DEBOUNCE);
+            return;
+        }
+        // 无新改动且防抖到点：执行一次真正重载（期间忽略事件避免重复风暴）。
         if let Some(at) = self.scheme_reload_pending_at {
             if Instant::now() >= at {
                 self.scheme_reload_pending_at = None;
@@ -1176,16 +1193,6 @@ impl App {
                 self.scheme_cache.remove(&id);
                 self.reload_scheme_dict();
             }
-            return;
-        }
-        // 2. 未排定：检测是否有改动。`drain_changed` 会清空通道，避免同一次保存的多事件重复触发。
-        let changed = self
-            .scheme_watcher
-            .as_mut()
-            .map(|w| w.drain_changed())
-            .unwrap_or(false);
-        if changed {
-            self.scheme_reload_pending_at = Some(Instant::now() + Duration::from_millis(200));
         }
     }
 
@@ -1291,7 +1298,7 @@ impl App {
         self.settings.monitor_scheme = !self.settings.monitor_scheme;
         let _ = self.settings_store.save(&self.settings);
         // 复用 arm 逻辑：开则重建监控、关则卸载，保证开关即时生效。
-        self.arm_scheme_watcher();
+        self.rebuild_scheme_watcher();
     }
 
     /// 切换到下一实时键盘模式并即时持久化。
