@@ -13198,6 +13198,76 @@ mod scheme_hot_reload_tests {
             "成功重载后应清除失败提示"
         );
     }
+
+    /// 真实场景复刻（yoyo-pure-km）：主表 `import` 用户表，用户表里的整词码
+    /// （如用户在 yoyo-user.dict.yaml 加的「经典造型→RFmf」）应当被合并进词库；
+    /// 改用户表后热重载应把新码吃进来（issue #94 在多文件 import 场景下的端到端验证）。
+    #[test]
+    fn hot_reload_picks_up_edit_in_imported_user_dict() {
+        let dir = tmp("scheme-import");
+        let schema = dir.join("demo.schema.yaml");
+        let primary = dir.join("demo.dict.yaml");
+        let user = dir.join("demo-user.dict.yaml");
+        std::fs::write(
+            &schema,
+            "schema:\n  name: Demo\n  schema_id: demo\n  translator:\n    dictionary: demo\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &primary,
+            "---\nname: demo\nimport_tables:\n  - demo-user\n...\n\n经\tRv\n典\tFX\n造\tmbp\n型\tfpV\n",
+        )
+        .unwrap();
+        std::fs::write(&user, "---\nname: demo-user\n...\n\n经典造型\tRFmf\t100\n").unwrap();
+
+        let mut app = app_with_scheme(schema.clone());
+
+        app.reload_scheme_dict();
+        let mut loaded = false;
+        for _ in 0..30 {
+            app.poll_scheme_loader();
+            if app.scheme_dict.is_some() {
+                loaded = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(loaded, "首次加载应成功");
+        assert_eq!(
+            app.scheme_dict
+                .as_ref()
+                .and_then(|d| d.get_primary_code("经典造型")),
+            Some("RFmf"),
+            "初始加载应合并 import 进来的用户表整词码"
+        );
+        // 监控闭包应同时覆盖主表与用户表
+        let paths = app.scheme_watch_paths.clone().unwrap_or_default();
+        assert!(paths.contains(&primary), "应监控主表");
+        assert!(paths.contains(&user), "应监控 import 进来的用户表");
+
+        // 模拟用户改了 yoyo-user.dict.yaml：把 经典造型 的码改成 ZZZZ
+        std::fs::write(&user, "---\nname: demo-user\n...\n\n经典造型\tZZZZ\t100\n").unwrap();
+
+        let mut reloaded = false;
+        for _ in 0..80 {
+            app.poll_scheme_hot_reload();
+            std::thread::sleep(Duration::from_millis(50));
+            app.poll_scheme_loader();
+            if app
+                .scheme_dict
+                .as_ref()
+                .and_then(|d| d.get_primary_code("经典造型"))
+                == Some("ZZZZ")
+            {
+                reloaded = true;
+                break;
+            }
+        }
+        assert!(
+            reloaded,
+            "改动 import 进来的用户表后，热重载应把新码吃进来"
+        );
+    }
 }
 
 /// 切换方案时重建监控闭包（issue #95）测试。
