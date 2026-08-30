@@ -734,6 +734,14 @@ struct App {
     scheme_loading: Option<String>,
     /// 异步方案加载器：后台线程解析 `.dict.yaml`，经通道回传，主循环每帧 poll。
     scheme_loader: SchemeLoader,
+    /// 方案源文件热监控器（issue #91/#93/#94）。`None` 表示 `notify` 初始化失败，
+    /// 此时安全降级为「不监控」（不影响既有加载/切换逻辑）。
+    /// 开/关开关（设置项 `monitor_scheme`）由 #96 接入；此处默认始终监控。
+    scheme_watcher: Option<scheme_watcher::SchemeWatcher>,
+    /// 当前已交给监控器的源文件路径闭包，用于重载成功后重建监控（应对原子保存换 inode）。
+    scheme_watch_paths: Option<Vec<PathBuf>>,
+    /// 检测到改动后、真正发起重载前的防抖时刻；期间忽略后续事件，避免重复重载风暴。
+    scheme_reload_pending_at: Option<Instant>,
     /// 后台数据库异步写入 Worker。
     db_worker: Option<DbWorker>,
     /// 赞赏与支持视图图片协议缓存。
@@ -960,6 +968,9 @@ impl App {
             scheme_cache: HashMap::new(),
             scheme_loading: None,
             scheme_loader: SchemeLoader::new(),
+            scheme_watcher: scheme_watcher::SchemeWatcher::new().ok(),
+            scheme_watch_paths: None,
+            scheme_reload_pending_at: None,
             db_worker,
             sponsor_state: RefCell::new(None),
         };
@@ -1058,9 +1069,10 @@ impl App {
         while let Ok(result) = self.scheme_loader.receiver.try_recv() {
             if let Some(dict) = result.dict {
                 self.scheme_cache.insert(result.id.clone(), dict.clone());
-                // 仅当仍是当前选中方案时才激活。
+                // 仅当仍是当前选中方案时才激活，并据此建立/重建热监控（#94/#95）。
                 if self.settings.scheme == result.id {
                     self.scheme_dict = Some(dict);
+                    self.arm_scheme_watcher();
                 }
             } else if self.settings.scheme == result.id {
                 // 加载失败（路径缺失/解析错误）：仅当仍选中时才清空。
@@ -1069,6 +1081,46 @@ impl App {
             if self.scheme_loading.as_deref() == Some(result.id.as_str()) {
                 self.scheme_loading = None;
             }
+        }
+    }
+
+    /// 用当前 `scheme_dict` 的源文件闭包配置热监控。仅在成功从磁盘加载到码表后调用，
+    /// 因此天然覆盖「切换方案后重建监控闭包」（#95）。
+    fn arm_scheme_watcher(&mut self) {
+        if let (Some(watcher), Some(dict)) = (self.scheme_watcher.as_mut(), self.scheme_dict.as_ref())
+        {
+            let paths: Vec<PathBuf> = dict.source_paths().to_vec();
+            watcher.set_paths(&paths);
+            self.scheme_watch_paths = Some(paths);
+            // 重置防抖，避免上次排定的重载在新方案上误触发。
+            self.scheme_reload_pending_at = None;
+        }
+    }
+
+    /// 每帧调用：检测方案源文件改动，经防抖后驱逐缓存并发起重载（复用既有 `SchemeLoader` 通道）。
+    ///
+    /// 关键陷阱（issue #94）：必须先 `scheme_cache.remove(current_id)` 再调用 `reload_scheme_dict()`，
+    /// 否则后者会因缓存命中而短路返回，重载不会发生（这是热重载「改了不生效」的根因）。
+    fn poll_scheme_hot_reload(&mut self) {
+        // 1. 防抖窗口内：到点才执行一次真正重载，期间忽略事件避免重复风暴。
+        if let Some(at) = self.scheme_reload_pending_at {
+            if Instant::now() >= at {
+                self.scheme_reload_pending_at = None;
+                // 先驱逐缓存，破除 `reload_scheme_dict` 的缓存命中短路。
+                let id = self.settings.scheme.clone();
+                self.scheme_cache.remove(&id);
+                self.reload_scheme_dict();
+            }
+            return;
+        }
+        // 2. 未排定：检测是否有改动。`drain_changed` 会清空通道，避免同一次保存的多事件重复触发。
+        let changed = self
+            .scheme_watcher
+            .as_mut()
+            .map(|w| w.drain_changed())
+            .unwrap_or(false);
+        if changed {
+            self.scheme_reload_pending_at = Some(Instant::now() + Duration::from_millis(200));
         }
     }
 
@@ -1892,6 +1944,8 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
     loop {
         // 消费后台方案加载结果（非阻塞，TUI 不冻结）。
         app.poll_scheme_loader();
+        // 检测方案源文件改动并（防抖后）热重载（issue #91/#94）。
+        app.poll_scheme_hot_reload();
         app.advance_countdown_if_due();
         terminal.draw(|frame| ui(frame, &app))?;
         let event_to_process = if let Some(pk) = pending_key_event.take() {
@@ -12675,5 +12729,121 @@ mod tests {
 
         let rendered_p2 = original_line(&session, &text, theme, false, None);
         assert_eq!(rendered_p2.lines[0].spans.len(), 5, "翻页后第二页也是 5 字");
+    }
+}
+
+/// 方案热重载（issue #91/#94）端到端测试：编辑源文件 → 自动驱逐缓存并重载。
+#[cfg(test)]
+mod scheme_hot_reload_tests {
+    use super::*;
+    use dazitui_core::{ApiClient, SchemeInfo, SettingsStore, TextSource, TokenStore};
+    use std::time::Duration;
+
+    fn tmp(suffix: &str) -> PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("dazitui-hot-{stamp}-{suffix}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn file_text(content: &str) -> Text {
+        Text {
+            title: "t".into(),
+            content: content.into(),
+            source: TextSource::File,
+            word_boundaries: None,
+            shuffled: false,
+        }
+    }
+
+    /// 构造最小 App（临时 token/设置存储 + 不可达 API），并指向 `discovered` 中的临时方案。
+    fn app_with_scheme(schema_path: PathBuf) -> App {
+        let token_dir = tmp("tok");
+        let settings_dir = tmp("set");
+        let mut app = App::new_with(
+            file_text("练习"),
+            TokenStore::new(token_dir.join("token")),
+            ApiClient::with_base_url_and_store(
+                "http://127.0.0.1:1",
+                Some(TokenStore::new(token_dir.join("token"))),
+            ),
+            SettingsStore::new(settings_dir.join("settings")),
+            None,
+        );
+        // 覆盖自动发现，指向临时方案，避免加载本机真实 fcitx5 方案。
+        app.settings.scheme = "demo".to_string();
+        app.discovered = vec![SchemeInfo {
+            id: "demo".to_string(),
+            display_name: "Demo".to_string(),
+            path: schema_path,
+        }];
+        app
+    }
+
+    #[test]
+    fn hot_reload_reloads_scheme_dict_after_source_file_change() {
+        let dir = tmp("scheme");
+        let schema = dir.join("demo.schema.yaml");
+        let dict = dir.join("demo.dict.yaml");
+        std::fs::write(
+            &schema,
+            "schema:\n  name: Demo\n  schema_id: demo\n",
+        )
+        .unwrap();
+        // 初始词典：文→vw，化→ah
+        std::fs::write(&dict, "---\nname: demo\n...\n\n文\tvw\n化\tah\n").unwrap();
+
+        let mut app = app_with_scheme(schema.clone());
+
+        // 首次加载
+        app.reload_scheme_dict();
+        let mut loaded = false;
+        for _ in 0..30 {
+            app.poll_scheme_loader();
+            if app.scheme_dict.is_some() {
+                loaded = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(loaded, "首次方案加载应成功");
+        assert_eq!(
+            app.scheme_dict
+                .as_ref()
+                .and_then(|d| d.get_primary_code("文")),
+            Some("vw")
+        );
+        // 监控应已对源文件闭包建监控
+        assert!(
+            app.scheme_watch_paths
+                .as_ref()
+                .map(|p| p.contains(&dict))
+                .unwrap_or(false),
+            "热监控应覆盖方案源文件"
+        );
+
+        // 修改源文件：新增「新→xx」
+        std::fs::write(&dict, "---\nname: demo\n...\n\n文\tvw\n化\tah\n新\txx\n").unwrap();
+
+        // 驱动热重载循环（模拟每帧：先 hot_reload 检测，再 poll 消费异步结果）
+        let mut reloaded = false;
+        for _ in 0..60 {
+            app.poll_scheme_hot_reload();
+            std::thread::sleep(Duration::from_millis(50));
+            app.poll_scheme_loader();
+            if app
+                .scheme_dict
+                .as_ref()
+                .and_then(|d| d.get_primary_code("新"))
+                == Some("xx")
+            {
+                reloaded = true;
+                break;
+            }
+        }
+        assert!(reloaded, "改动源文件后应自动热重载，使「新→xx」生效");
     }
 }
