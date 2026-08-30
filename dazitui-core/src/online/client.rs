@@ -188,31 +188,31 @@ pub fn parse_upload_response(body: &str) -> Result<RankResult, ApiError> {
 #[serde(rename_all = "camelCase")]
 pub struct CompetitionRankRow {
     /// 排名（数字）。
-    #[serde(default, deserialize_with = "de_flex_u32")]
+    #[serde(default, deserialize_with = "de_flex_num")]
     pub rank: u32,
     /// 用户名。
     #[serde(default)]
     pub username: String,
     /// 速度（WPM）。
-    #[serde(default, deserialize_with = "de_flex_f64")]
+    #[serde(default, deserialize_with = "de_flex_num")]
     pub speed: f64,
     /// 输入法（如「虎码」）。
     #[serde(default)]
     pub input_method: String,
     /// 击键（每秒按键数），v2 可配置列预留。
-    #[serde(default, deserialize_with = "de_flex_f64")]
+    #[serde(default, deserialize_with = "de_flex_num")]
     pub keystrokes: f64,
     /// 码长，v2 可配置列预留。
-    #[serde(default, deserialize_with = "de_flex_f64")]
+    #[serde(default, deserialize_with = "de_flex_num")]
     pub ma_chang: f64,
     /// 键准（百分号字符串），v2 可配置列预留。
     #[serde(default)]
     pub jian_zhun: String,
     /// 键数，v2 可配置列预留。
-    #[serde(default, deserialize_with = "de_flex_u32")]
+    #[serde(default, deserialize_with = "de_flex_num")]
     pub jian_shu: u32,
     /// 回改次数，v2 可配置列预留。
-    #[serde(default, deserialize_with = "de_flex_u32")]
+    #[serde(default, deserialize_with = "de_flex_num")]
     pub hui_gai: u32,
     /// 打词率（百分号字符串），v2 可配置列预留。
     #[serde(default)]
@@ -239,45 +239,30 @@ pub struct CompetitionRank {
     #[serde(default)]
     pub my_rank_result: Vec<CompetitionRankRow>,
     /// 本期总参与人数。
-    #[serde(default, deserialize_with = "de_flex_u32")]
+    #[serde(default, deserialize_with = "de_flex_num")]
     pub total: u32,
     /// 当期赛文标题（视图可显示）。
     #[serde(default)]
     pub text_title: String,
     /// 当期赛文字数。
-    #[serde(default, deserialize_with = "de_flex_u32")]
+    #[serde(default, deserialize_with = "de_flex_num")]
     pub text_length: u32,
 }
 
-/// 灵活反序列化：数字或数字字符串都接受为 `u32`（服务端部分字段偶发字符串）。
-fn de_flex_u32<'de, D>(d: D) -> Result<u32, D::Error>
+/// 灵活反序列化：数字或数字字符串都接受为数值类型 `T`（服务端数值字段多为字符串）。
+fn de_flex_num<'de, D, T>(d: D) -> Result<T, D::Error>
 where
     D: Deserializer<'de>,
+    T: Deserialize<'de> + std::str::FromStr,
+    T::Err: std::fmt::Display,
 {
     #[derive(Deserialize)]
     #[serde(untagged)]
-    enum V {
-        Num(u32),
+    enum V<T> {
+        Num(T),
         Str(String),
     }
-    match V::deserialize(d)? {
-        V::Num(n) => Ok(n),
-        V::Str(s) => s.trim().parse().map_err(serde::de::Error::custom),
-    }
-}
-
-/// 灵活反序列化：数字或数字字符串都接受为 `f64`（服务端数值字段多为字符串）。
-fn de_flex_f64<'de, D>(d: D) -> Result<f64, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum V {
-        Num(f64),
-        Str(String),
-    }
-    match V::deserialize(d)? {
+    match V::<T>::deserialize(d)? {
         V::Num(n) => Ok(n),
         V::Str(s) => s.trim().parse().map_err(serde::de::Error::custom),
     }
@@ -340,7 +325,7 @@ fn rank_payload(token: Option<&str>, competition_type: CompetitionType, date: &s
     m.insert("competitionType".into(), json!(competition_type.code()));
     m.insert("snum".into(), json!(date));
     m.insert("deviceType".into(), json!(0));
-    m.insert("pagesize".into(), json!(30));
+    m.insert("pagesize".into(), json!(100));
     m.insert("currentPage".into(), json!(1));
     encrypt_value(&Value::Object(m))
 }
@@ -831,7 +816,7 @@ mod tests {
         assert_eq!(v["competitionType"], 0); // 极速杯 = 0
         assert_eq!(v["snum"], "2026-08-30");
         assert_eq!(v["deviceType"], 0);
-        assert_eq!(v["pagesize"], 30);
+        assert_eq!(v["pagesize"], 100);
         assert_eq!(v["currentPage"], 1);
         assert!(v.get("token").is_none(), "免登录请求不应带 token");
     }

@@ -335,6 +335,21 @@ impl CompetitionType {
             Self::Jianshen => 4,
         }
     }
+
+    /// UI 中三比赛的固定展示顺序（极速杯 → 锦标赛 → 键神杯）。
+    pub const ALL: [CompetitionType; 3] = [Self::Jisu, Self::Jinbiao, Self::Jianshen];
+
+    /// 在 `ALL` 顺序中前进到下一比赛（到末尾回环到开头）。
+    pub fn next(&self) -> Self {
+        let i = Self::ALL.iter().position(|c| c == self).unwrap_or(0);
+        Self::ALL[(i + 1) % Self::ALL.len()]
+    }
+
+    /// 在 `ALL` 顺序中后退到上一比赛（到开头回环到末尾）。
+    pub fn prev(&self) -> Self {
+        let i = Self::ALL.iter().position(|c| c == self).unwrap_or(0);
+        Self::ALL[(i + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
 }
 
 impl Text {
