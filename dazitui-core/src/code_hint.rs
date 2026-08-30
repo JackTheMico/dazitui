@@ -23,7 +23,7 @@ pub enum HintHand {
     None,
 }
 
-/// 提示区一个词单元的渲染单元：已按词宽截断/居中/留空的可视文本，与其手区归属（用于配色）。
+/// 提示区一个词单元的渲染单元：已按词格宽居中/留空的可视文本，与其手区归属（用于配色）。
 pub struct HintCell {
     pub text: String,
     pub hand: HintHand,
@@ -56,7 +56,40 @@ pub fn display_width(s: &str) -> usize {
     s.chars().map(char_width).sum()
 }
 
-/// 将单个提示码按目标列宽（对应正文词宽）截断/居中，返回定宽字符串。
+/// 提示单元的实际显示文本：去掉手区修饰符与 `%` 前缀，空格并击简词追加空格键标记。
+fn hint_display_text(code: &str) -> String {
+    let mut s = strip_hand_prefix(code).to_string();
+    if code.starts_with('%') {
+        s.push(SPACE_CHORD_MARK);
+    }
+    s
+}
+
+/// 每个词格的列宽：`max(词可视宽, 提示码可视宽)`。
+///
+/// 提示码必须完整可见才具备「照着打」的价值，因此词格宽度由编码而非词宽兜底：
+/// 「腕间」可视宽 4 列，但其在 yoyo-pure 下逐字拼接的编码 `HjYIw` 为 5 列，故格宽取 5。
+/// 列宽与「该词是否已上屏」无关（`typed_mask` 只决定提示是否留空），
+/// 否则打完一词后整行会抖动。
+pub fn hint_cell_widths(words: &[String], hints: &[CodeHint]) -> Vec<usize> {
+    words
+        .iter()
+        .enumerate()
+        .map(|(i, w)| {
+            let word_w = display_width(w);
+            let code_w = hints
+                .get(i)
+                .map(|h| display_width(&hint_display_text(&h.code)))
+                .unwrap_or(0);
+            word_w.max(code_w).max(1)
+        })
+        .collect()
+}
+
+/// 将单个提示码居中到目标列宽（词格宽），返回定宽字符串。
+///
+/// 目标列宽由 `hint_cell_widths` 保证 ≥ 码宽，故正常不截断；
+/// 截断分支仅作调用方误传窄宽度时的兜底（避免补空格时 usize 下溢）。
 fn format_hint_cell(code: &str, target_width: usize) -> String {
     let code_width = display_width(code);
     if code_width == target_width {
@@ -95,22 +128,23 @@ fn strip_hand_prefix(code: &str) -> &str {
 
 /// 内置赛文对照区双行词格：生成本页「提示行」的逐词渲染单元。
 ///
-/// `words` 为本页正文词（与 `hints` 同序），每个提示按对应词的可视列宽截断/居中，
-/// 词间以单空格分隔，使提示行与正文行（同样以单空格分词）逐词对齐。提示码会先去掉
+/// `words` 为本页正文词（与 `hints` 同序），每个提示按对应词格宽（`max(词宽, 码宽)`）居中，
+/// 词间以单空格分隔，使提示行与正文行（同样以单空格分词、并补齐到同一词格宽）逐词对齐。提示码会先去掉
 /// 手区修饰符前缀（如单手简码 `_b` → `b`），仅显示实际按键；其手区归属（`HintHand`）
 /// 一并返回，交由渲染层据左右手上色（左手粉、右手黄）。
 ///
-/// `typed_mask[i]` 为真表示该词已全部正确上屏，其提示留空（仍按词宽占位，不影响对齐）。
+/// `typed_mask[i]` 为真表示该词已全部正确上屏，其提示留空（仍按词格宽占位，不影响对齐）。
 pub fn layout_code_hint_line(
     words: &[String],
     hints: &[CodeHint],
     typed_mask: &[bool],
 ) -> Vec<HintCell> {
+    let widths = hint_cell_widths(words, hints);
     words
         .iter()
         .enumerate()
         .map(|(i, w)| {
-            let target = display_width(w);
+            let target = widths.get(i).copied().unwrap_or_else(|| display_width(w));
             let typed = typed_mask.get(i).copied().unwrap_or(false);
             if typed {
                 return HintCell {
@@ -121,11 +155,7 @@ pub fn layout_code_hint_line(
             match hints.get(i) {
                 Some(h) => {
                     let hand = hand_of_code(&h.code);
-                    let mut code = strip_hand_prefix(&h.code).to_string();
-                    // 空格并击简词：在按键序列后附加空格键标记，提示用户需按住空格。
-                    if h.code.starts_with('%') {
-                        code.push(SPACE_CHORD_MARK);
-                    }
+                    let code = hint_display_text(&h.code);
                     HintCell {
                         text: format_hint_cell(&code, target),
                         hand,
@@ -169,8 +199,9 @@ pub fn pack_words_by_width(word_widths: &[usize], max_width: usize) -> Vec<Vec<u
 
 /// 双行词格（长文）：将提示行与正文行按词边界锁步折行，返回逐行 `(提示单元, 正文行)`。
 ///
-/// 每词提示按对应词宽截断/居中，词间单空格分隔；正文行为对应词原文（同样单空格分隔）。
-/// 两者列结构完全一致，故每行提示与其下方正文逐词对齐、永不错位。提示单元携带手区归属，
+/// 每词提示按对应词格宽（= max(词宽, 码宽)）居中，词间单空格分隔；正文行为对应词原文
+/// 补齐到词格宽后同样单空格分隔。两者列结构完全一致，故每行提示与其下方正文逐词对齐、
+/// 永不错位。提示码超词宽时正文补空格让位（而非截断提示）。提示单元携带手区归属，
 /// 交由渲染层上色（左手粉、右手黄）。`typed_mask[i]` 为真表示该词已全部正确上屏，
 /// 其提示单元留空但仍占位。
 ///
@@ -182,7 +213,7 @@ pub fn layout_code_hint_grid(
     typed_mask: &[bool],
     max_width: usize,
 ) -> Vec<(Vec<HintCell>, String)> {
-    let widths: Vec<usize> = words.iter().map(|w| display_width(w)).collect();
+    let widths: Vec<usize> = hint_cell_widths(words, hints);
     let rows = pack_words_by_width(&widths, max_width);
     rows.into_iter()
         .map(|row| {
@@ -203,7 +234,15 @@ pub fn layout_code_hint_grid(
                 .map(|&i| typed_mask.get(i).copied().unwrap_or(false))
                 .collect();
             let hint_cells = layout_code_hint_line(&row_words, &row_hints, &row_typed);
-            let body_line = row_words.join(" ");
+            // 正文词补尾随空格到词格宽，使提示行与正文行列结构一致。
+            let body_line = row
+                .iter()
+                .map(|&i| {
+                    let w = &words[i];
+                    format!("{w}{}", " ".repeat(widths[i] - display_width(w)))
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
             (hint_cells, body_line)
         })
         .collect()
@@ -244,14 +283,14 @@ mod tests {
     }
 
     #[test]
-    fn layout_word_truncated_and_joined() {
-        // 「中」(2) + 「中国」(4)；「中国」提示 lgyinay(7)>4 截断为 lgyi；
-        // 词间单空格分隔，提示行与正文行逐词对齐。
+    fn layout_word_centered_and_joined() {
+        // 「中」(2) + 「中国」(4)；「中国」提示 lgyinay(7) 宽于词 → 词格撑到 7 列完整显示；
+        // 词间单空格分隔，提示行与正文行逐词对齐（正文行由 layout_code_hint_grid 补空格让位）。
         let words = vec!["中".to_string(), "中国".to_string()];
         let hints = vec![hint("k"), hint("lgyinay")];
         assert_eq!(
             cells_text(&layout_code_hint_line(&words, &hints, &[])),
-            "k  lgyi"
+            "k  lgyinay"
         );
     }
 
@@ -273,26 +312,47 @@ mod tests {
 
     #[test]
     fn layout_typed_word_is_blank_but_aligned() {
-        // T04：已全对上屏的词，其上方提示留空（按词宽占位，手区为 None）。
-        // 「中」(2) 已打 → 2 空格；词间单空格分隔符；「中国」(4) 未打 → 显示 lgyi。
-        // 故提示行 = "  " + " " + "lgyi" = "   lgyi"（3 前导空格）。
+        // T04：已全对上屏的词，其上方提示留空（按词格宽占位，手区为 None）。
+        // 「中」(2) 已打 → 2 空格；词间单空格分隔符；「中国」格宽 7 未打 → 显示 lgyinay。
+        // 故提示行 = "  " + " " + "lgyinay" = "   lgyinay"（3 前导空格）。
         let words = vec!["中".to_string(), "中国".to_string()];
         let hints = vec![hint("k"), hint("lgyinay")];
         let typed_mask = vec![true, false];
         let cells = layout_code_hint_line(&words, &hints, &typed_mask);
-        assert_eq!(cells_text(&cells), "   lgyi");
+        assert_eq!(cells_text(&cells), "   lgyinay");
         assert_eq!(cells[0].hand, HintHand::None);
     }
 
     #[test]
-    fn layout_overwide_chord_truncated_to_word_width() {
-        // T05：超宽并击码（如 wCsA，4 字符）在单字（CJK 宽 2）提示区内按词宽截断为 2 列。
+    fn layout_overwide_chord_widens_cell_instead_of_truncating() {
+        // T05 修正：超宽并击码（wCsA，4 列）在单字（CJK 宽 2）词格内不再被截断，
+        // 词格撑到 4 列完整显示——截断后的码无法照打，提示即失去意义。
         let words = vec!["中".to_string()];
         let hints = vec![hint("wCsA")];
         assert_eq!(
             cells_text(&layout_code_hint_line(&words, &hints, &[])),
-            "wC"
+            "wCsA"
         );
+    }
+
+    #[test]
+    fn layout_code_wider_than_word_is_shown_in_full() {
+        // 用户报告：「腕间」(4 列) 在 yoyo-pure 下无整词条目，逐字拼接得 腕=HjY + 间=Iw
+        // → HjYIw（5 列）；旧行为按词宽截断为 HjYI，末位码元 w 丢失、无法照打。
+        let words = vec!["腕间".to_string()];
+        let hints = vec![hint("HjYIw")];
+        let cells = layout_code_hint_line(&words, &hints, &[]);
+        assert_eq!(cells_text(&cells), "HjYIw");
+        assert_eq!(cells[0].hand, HintHand::TwoHand);
+    }
+
+    #[test]
+    fn hint_cell_widths_takes_max_of_word_and_code() {
+        // 词格宽 = max(词宽, 码宽)：腕间 4 vs HjYIw 5 → 5；中 2 vs k 1 → 2；
+        // 世界 4 vs %XY（显示 "XY␣" 3 列）→ 4。
+        let words = vec!["腕间".to_string(), "中".to_string(), "世界".to_string()];
+        let hints = vec![hint("HjYIw"), hint("k"), hint("%XY")];
+        assert_eq!(hint_cell_widths(&words, &hints), vec![5, 2, 4]);
     }
 
     #[test]
@@ -310,10 +370,10 @@ mod tests {
         let cells2 = layout_code_hint_line(&words, &hints2, &[]);
         assert_eq!(cells_text(&cells2), "e ");
         assert_eq!(cells2[0].hand, HintHand::Right);
-        // 无前缀并击码 wCs 不受影响（超宽截断为 2 列），手区 TwoHand（单独配色）。
+        // 无前缀并击码 wCs（3 列）宽于单字词格（2 列）→ 撑宽完整显示，手区 TwoHand。
         let hints3 = vec![hint("wCs")];
         let cells3 = layout_code_hint_line(&words, &hints3, &[]);
-        assert_eq!(cells_text(&cells3), "wC");
+        assert_eq!(cells_text(&cells3), "wCs");
         assert_eq!(cells3[0].hand, HintHand::TwoHand);
     }
 
@@ -352,6 +412,19 @@ mod tests {
     }
 
     #[test]
+    fn layout_grid_widens_body_to_fit_overwide_code() {
+        // 提示码宽于词时，正文词补尾随空格让位（而非截断提示），两行仍锁步对齐。
+        // 「中」格宽 2（码 k）；「腕间」词宽 4、码 HjYIw 宽 5 → 格宽 5，正文补 1 空格。
+        let words = vec!["中".to_string(), "腕间".to_string()];
+        let hints = vec![hint("k"), hint("HjYIw")];
+        let rows = layout_code_hint_grid(&words, &hints, &[], 20);
+        assert_eq!(rows.len(), 1);
+        assert_lockstep_aligned(&rows);
+        assert_eq!(rows[0].1, "中 腕间 ");
+        assert_eq!(cells_text(&rows[0].0), "k  HjYIw");
+    }
+
+    #[test]
     fn layout_chord_centered_in_wide_word_width() {
         // T05：3 码并击 wCs 在双字（CJK 宽 4）提示区内居中为 "wCs "（右补 1 空格）。
         let words = vec!["世界".to_string()];
@@ -364,10 +437,22 @@ mod tests {
 
     // ---- T06 长文折行对齐 ----
 
-    /// 断言提示行与正文行逐词锁步对齐：整行列宽一致，且提示行在各词位置处恰为对应词宽的单元。
-    ///
-    /// 提示单元可能内含居中/留空空格，故不能简单按空格切分；改为由正文行（仅词间有单空格）
-    /// 推断各词宽，再校验提示行在同样分隔下逐单元列宽一致、总宽相等。
+    /// 取字符串在显示列区间 `[start, start+cols)` 内的内容（CJK 记 2 列）。
+    fn slice_cols(s: &str, start: usize, cols: usize) -> String {
+        let mut out = String::new();
+        let mut col = 0usize;
+        for c in s.chars() {
+            let cw = char_width(c);
+            if col >= start && col + cw <= start + cols {
+                out.push(c);
+            }
+            col += cw;
+        }
+        out
+    }
+
+    /// 断言提示行与正文行逐词锁步对齐：整行列宽一致，且按提示单元列宽切分正文行时，
+    /// 每一格都恰为「词 + 尾随空格」的定宽单元（提示码超词宽时由正文补空格让位）。
     fn assert_lockstep_aligned(rows: &[(Vec<HintCell>, String)]) {
         for (cells, b) in rows {
             let h = cells_text(cells);
@@ -378,19 +463,23 @@ mod tests {
                 h,
                 b
             );
-            let body_words: Vec<&str> = b.split(' ').filter(|w| !w.is_empty()).collect();
-            let mut pos = 0usize;
-            for w in body_words {
-                let ww = display_width(w);
-                // 提示行在 [pos, pos+ww) 必须是宽为 ww 的单元（居中/留空/截断后均恰为 ww）。
-                assert!(
-                    display_width(&h) >= pos + ww,
-                    "hint too short vs body at pos {}: hint={:?} body={:?}",
-                    pos,
-                    h,
+            let widths: Vec<usize> = cells.iter().map(|c| display_width(&c.text)).collect();
+            let mut start = 0usize;
+            for (i, &w) in widths.iter().enumerate() {
+                let seg = slice_cols(b, start, w);
+                assert_eq!(
+                    display_width(&seg),
+                    w,
+                    "正文第 {i} 格应占 {w} 列，实得 {:?}（body={:?}）",
+                    seg,
                     b
                 );
-                pos += ww + 1; // 跳过词间单空格分隔
+                assert!(
+                    !seg.starts_with(' '),
+                    "正文第 {i} 格不应以空格开头：{seg:?}"
+                );
+                assert!(!seg.trim().is_empty(), "正文第 {i} 格不应为空：{seg:?}");
+                start += w + 1; // 跳过词间单空格分隔
             }
         }
     }
@@ -441,20 +530,21 @@ mod tests {
 
     #[test]
     fn layout_code_hint_grid_typed_word_blank_but_aligned() {
-        // 已全对上屏的词提示留空（仍按词宽占位），折行后仍与其下方字词对齐。
+        // 已全对上屏的词提示留空（仍按词格宽占位），折行后仍与其下方字词对齐。
         let words = vec!["中".to_string(), "中国".to_string()];
         let hints = vec![hint("k"), hint("lgyinay")];
         let typed = vec![true, false];
         let rows = layout_code_hint_grid(&words, &hints, &typed, 10);
         assert_eq!(rows.len(), 1);
         assert_lockstep_aligned(&rows);
-        assert_eq!(rows[0].1, "中 中国");
-        assert_eq!(cells_text(&rows[0].0), "   lgyi"); // 「中」(2) 留空→2空格 + 词间1空格 = 3 前导空格；「中国」(4) 显示 lgyi
+        // 「中国」格宽 7（码 lgyinay 宽于词）→ 正文补 3 空格让位。
+        assert_eq!(rows[0].1, "中 中国   ");
+        assert_eq!(cells_text(&rows[0].0), "   lgyinay"); // 「中」(2) 留空→2空格 + 词间1空格 = 3 前导空格
     }
 
     #[test]
     fn layout_code_hint_grid_oversized_word_still_aligned() {
-        // 超长单字（宽 14）超过 max：独占一行，提示码截断到词宽、仍与正文对齐。
+        // 超长单字（宽 14）超过 max：独占一行，提示码按词格宽居中、仍与正文对齐。
         let words = vec!["中华人民共和国".to_string()];
         let hints = vec![hint("abc")];
         let rows = layout_code_hint_grid(&words, &hints, &[], 5);

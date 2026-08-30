@@ -13,7 +13,8 @@ mod settings;
 mod online;
 
 pub use code_hint::{
-    HintCell, HintHand, layout_code_hint_grid, layout_code_hint_line, pack_words_by_width,
+    HintCell, HintHand, hint_cell_widths, layout_code_hint_grid, layout_code_hint_line,
+    pack_words_by_width,
 };
 pub use db::{
     DbError, DbTask, DbWorker, ErrorRecordItem, GlobalStatsSummary, KeypressRecordItem,

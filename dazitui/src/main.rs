@@ -14,11 +14,11 @@ use dazitui_core::{
     HintCell, HintHand, KeyboardMode, KeypressRecordItem, LoadError, LoadOptions, Rgb, SchemeDict,
     SchemeInfo, Session, SessionRecord, Settings, SettingsStore, Stats, StatsDb, Text, TextSource,
     Theme, TokenStore, default_rime_data_dir, discover_schemes, env_credentials,
-    format_stats_share_text, format_time, is_auth_failure, key_accuracy_pct, layout_code_hint_line,
-    load_builtin_text, load_builtin_text_shuffled, load_text_from_clipboard, load_text_from_file,
-    load_text_from_string, lttb_downsample, normalize_scheme_to_id, osc52_clipboard,
-    pack_words_by_width, prewarm_segmenter, resolve_scheme_path_via_discovery, save_text_to_file,
-    word_ratio_pct,
+    format_stats_share_text, format_time, hint_cell_widths, is_auth_failure, key_accuracy_pct,
+    layout_code_hint_line, load_builtin_text, load_builtin_text_shuffled, load_text_from_clipboard,
+    load_text_from_file, load_text_from_string, lttb_downsample, normalize_scheme_to_id,
+    osc52_clipboard, pack_words_by_width, prewarm_segmenter, resolve_scheme_path_via_discovery,
+    save_text_to_file, word_ratio_pct,
 };
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -3413,6 +3413,13 @@ fn ui(frame: &mut Frame, app: &App) {
         let dict_ok = code_hint_dict_usable(app.scheme_dict.as_ref());
         // 非内置长文 + 开启提示 + 已配置可用词典：走双行词格（按词边界锁步折行）路径。
         let use_code_hint_grid = app.settings.code_hint && !is_builtin && dict_ok;
+        // 内置词组赛文 + 遍码提示：预计算词格列宽，供对照区正文行与跟打区行共用
+        // （提示码宽于词时由正文补空格让位，保证两区与提示行三者词列一致）。
+        let word_cell_widths = if app.settings.code_hint && dict_ok {
+            builtin_words_cell_widths(&app.session, &app.text, app.scheme_dict.as_ref())
+        } else {
+            None
+        };
 
         let ref_inner_width = ref_area.width.saturating_sub(2);
         let ref_inner_height = ref_area.height.saturating_sub(2);
@@ -3443,10 +3450,22 @@ fn ui(frame: &mut Frame, app: &App) {
                 ref_inner_width as usize,
             )
             .unwrap_or_else(|| {
-                original_line(&app.session, &app.text, app.theme(), app.settings.bold)
+                original_line(
+                    &app.session,
+                    &app.text,
+                    app.theme(),
+                    app.settings.bold,
+                    word_cell_widths.as_deref(),
+                )
             })
         } else {
-            original_line(&app.session, &app.text, app.theme(), app.settings.bold)
+            original_line(
+                &app.session,
+                &app.text,
+                app.theme(),
+                app.settings.bold,
+                word_cell_widths.as_deref(),
+            )
         };
         // 遍码提示（编码提示）：开启时，有可用词典走正常提示路径，否则显示占位引导。
         if app.settings.code_hint {
@@ -3528,8 +3547,13 @@ fn ui(frame: &mut Frame, app: &App) {
 
         let type_inner_width = type_area.width.saturating_sub(2);
         let type_inner_height = type_area.height.saturating_sub(2);
-        let rendered_type_lines =
-            type_line(&app.session, &app.text, app.theme(), app.settings.bold);
+        let rendered_type_lines = type_line(
+            &app.session,
+            &app.text,
+            app.theme(),
+            app.settings.bold,
+            word_cell_widths.as_deref(),
+        );
 
         let (type_cursor_line, type_cursor_col) = if is_current_page_empty(&app.session, &app.text)
         {
@@ -6577,6 +6601,9 @@ fn builtin_page_start(session: &Session) -> usize {
 }
 
 /// 对照区：将当前页指定数量词的原文按跟打状态着色，词间插入空格 span（不可打）。
+///
+/// `cell_widths` 为遍码提示开启时的词格列宽（`max(词宽, 提示码宽)`，按页内词条序）；
+/// 为 `None` 时按纯词宽渲染。提示码宽于词时正文补尾随空格让位，保证提示行逐词对齐。
 fn build_word_spans(
     session: &Session,
     word_boundaries: &[(usize, usize)],
@@ -6584,6 +6611,7 @@ fn build_word_spans(
     page_end_word: usize,
     theme: Theme,
     bold: bool,
+    cell_widths: Option<&[usize]>,
 ) -> Vec<Span<'static>> {
     let statuses = session.original_status();
     let mut spans: Vec<Span<'static>> = Vec::new();
@@ -6597,16 +6625,26 @@ fn build_word_spans(
             // 词间空格（不可打的分隔符，用默认色）
             spans.push(Span::raw(" "));
         }
+        let mut cell_width = 0usize;
         for &(c, status) in &statuses[ws..we] {
             let style = match status {
                 Some(CharStatus::Correct) => Style::default().fg(color(theme.correct)),
                 Some(CharStatus::Wrong) => Style::default().fg(color(theme.wrong)),
                 None => Style::default(),
             };
+            cell_width += c.width().unwrap_or(1);
             spans.push(Span::styled(
                 c.to_string(),
                 style.add_modifier(bold_modifier(bold)),
             ));
+        }
+        // 提示码宽于词 → 补尾随空格把词格撑到列宽，与上方提示行锁步。
+        if let Some(extra) = cell_widths
+            .and_then(|w| w.get(word_i - page_start_word))
+            .and_then(|&cw| cw.checked_sub(cell_width))
+            .filter(|&n| n > 0)
+        {
+            spans.push(Span::raw(" ".repeat(extra)));
         }
     }
     spans
@@ -6656,6 +6694,46 @@ fn code_hint_overlay_line(
     let hints: Vec<CodeHint> = dict.build_code_hints(&words);
     let cells = layout_code_hint_line(&words, &hints, &typed_mask);
     Some(code_hint_line_from_cells(&cells, theme))
+}
+
+/// 内置词组赛文开启遍码提示时，当前页词条的词格列宽（`max(词宽, 提示码宽)`）。
+///
+/// 提示码宽于词（如「腕间」4 列 vs 码 `HjYIw` 5 列）时词格需撑宽，对照区正文行与
+/// 跟打区行共用本列宽补空格，两区词列才不会错位、提示行也才能逐词对齐。
+/// 非词组赛文、无词典或当前页已越界时返回 `None`（退化为纯词宽，与关闭提示时一致）。
+fn builtin_words_cell_widths(
+    session: &Session,
+    text: &Text,
+    scheme_dict: Option<&SchemeDict>,
+) -> Option<Vec<usize>> {
+    let set = match text.source {
+        TextSource::Builtin { set } => set,
+        _ => return None,
+    };
+    if !set.is_words() {
+        return None;
+    }
+    let dict = scheme_dict?;
+    let owned_boundaries;
+    let boundaries: &[(usize, usize)] = match &text.word_boundaries {
+        Some(b) if !b.is_empty() => b,
+        _ => {
+            owned_boundaries = set.word_boundaries();
+            &owned_boundaries
+        }
+    };
+    let page_start_word = builtin_page_start(session);
+    let page_end_word = (page_start_word + session.group_size()).min(boundaries.len());
+    if page_start_word >= boundaries.len() {
+        return None;
+    }
+    let statuses = session.original_status();
+    let words: Vec<String> = boundaries[page_start_word..page_end_word]
+        .iter()
+        .map(|&(ws, we)| statuses[ws..we].iter().map(|(c, _)| *c).collect())
+        .collect();
+    let hints = dict.build_code_hints(&words);
+    Some(hint_cell_widths(&words, &hints))
 }
 
 /// 将提示单元（已去皮手区前缀、携手区归属）拼为带色 `Line`：
@@ -6749,7 +6827,8 @@ fn code_hint_grid_text(
     }
 
     let hints: Vec<CodeHint> = dict.build_code_hints(&words);
-    let widths: Vec<usize> = words.iter().map(|w| w.width()).collect();
+    // 词格列宽 = max(词宽, 提示码宽)：提示码宽于词时不截断提示，而由正文补空格让位。
+    let widths: Vec<usize> = hint_cell_widths(&words, &hints);
     let rows = pack_words_by_width(&widths, max_width);
 
     let mut text_lines = TextLines::default();
@@ -6768,6 +6847,7 @@ fn code_hint_grid_text(
                 spans.push(Span::raw(" "));
             }
             let (ws, we) = word_ranges[wi];
+            let mut cell_width = 0usize;
             for ci in ws..we {
                 if let Some((c, status)) = statuses.get(ci) {
                     let style = match status {
@@ -6775,11 +6855,16 @@ fn code_hint_grid_text(
                         Some(CharStatus::Wrong) => Style::default().fg(color(theme.wrong)),
                         None => Style::default(),
                     };
+                    cell_width += c.width().unwrap_or(1);
                     spans.push(Span::styled(
                         c.to_string(),
                         style.add_modifier(bold_modifier(bold)),
                     ));
                 }
+            }
+            // 提示码宽于词 → 补尾随空格到词格宽，与上方提示行锁步。
+            if let Some(extra) = widths[wi].checked_sub(cell_width).filter(|&n| n > 0) {
+                spans.push(Span::raw(" ".repeat(extra)));
             }
         }
         text_lines.push_line(Line::from(spans));
@@ -6802,6 +6887,9 @@ fn code_hint_placeholder_line(theme: Theme) -> Line<'static> {
 }
 
 /// 跟打区：将当前页指定数量词的已打字符按对/错着色，词间插入空格 span。
+///
+/// `cell_widths` 与 `build_word_spans` 同源：对照区正文行被提示码撑宽时，跟打区须同步补空格，
+/// 否则两区词列错位。为 `None` 时按纯词宽渲染。
 fn build_word_type_spans(
     display: &[(char, CharStatus)],
     word_boundaries: &[(usize, usize)],
@@ -6809,6 +6897,7 @@ fn build_word_type_spans(
     page_end_word: usize,
     theme: Theme,
     bold: bool,
+    cell_widths: Option<&[usize]>,
 ) -> Vec<Span<'static>> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     for (word_i, &(ws, we)) in word_boundaries
@@ -6823,6 +6912,7 @@ fn build_word_type_spans(
         if word_i > page_start_word {
             spans.push(Span::raw(" "));
         }
+        let mut cell_width = 0usize;
         for ci in ws..we {
             if ci < display.len() {
                 let (c, status) = display[ci];
@@ -6830,11 +6920,20 @@ fn build_word_type_spans(
                     CharStatus::Correct => Style::default().fg(color(theme.correct)),
                     CharStatus::Wrong => Style::default().fg(color(theme.wrong)),
                 };
+                cell_width += c.width().unwrap_or(1);
                 spans.push(Span::styled(
                     c.to_string(),
                     style.add_modifier(bold_modifier(bold)),
                 ));
             }
+        }
+        // 与对照区同源撑宽：未打完时补尾随空格保持两区词列一致。
+        if let Some(extra) = cell_widths
+            .and_then(|w| w.get(word_i - page_start_word))
+            .and_then(|&cw| cw.checked_sub(cell_width))
+            .filter(|&n| n > 0)
+        {
+            spans.push(Span::raw(" ".repeat(extra)));
         }
     }
     spans
@@ -6844,7 +6943,16 @@ fn build_word_type_spans(
 ///
 /// 内置赛文只显示当前页：单字赛文每页 group_size 字、词组赛文每页 group_size 个词（词间加空格、去逗号）；
 /// 打完当前页自动翻页；其余来源显示全文（由终端宽度自动折行）。
-fn original_line(session: &Session, text: &Text, theme: Theme, bold: bool) -> TextLines<'static> {
+///
+/// `cell_widths` 为遍码提示开启时内置词组赛文当前页的词格列宽（见 `build_word_spans`）；
+/// 其余场景（单字赛文、非内置、提示关闭）传 `None`，按纯词宽渲染。
+fn original_line(
+    session: &Session,
+    text: &Text,
+    theme: Theme,
+    bold: bool,
+    cell_widths: Option<&[usize]>,
+) -> TextLines<'static> {
     let source = text.source;
     let group_size = session.group_size();
     if let TextSource::Builtin { set } = source {
@@ -6869,6 +6977,7 @@ fn original_line(session: &Session, text: &Text, theme: Theme, bold: bool) -> Te
                 page_end_word,
                 theme,
                 bold,
+                cell_widths,
             );
             let mut text_lines = TextLines::default();
             text_lines.push_line(Line::from(spans));
@@ -6915,7 +7024,16 @@ fn original_line(session: &Session, text: &Text, theme: Theme, bold: bool) -> Te
 ///
 /// 内置赛文只显示当前页：单字赛文每页 group_size 字、词组赛文每页 group_size 个词（词间加空格、去逗号）；
 /// 打完当前页自动翻页；其余来源显示全文（由终端宽度自动折行）。
-fn type_line(session: &Session, text: &Text, theme: Theme, bold: bool) -> TextLines<'static> {
+///
+/// `cell_widths` 与 `original_line` 同源：内置词组赛文开启遍码提示时，跟打区须与对照区
+/// 共用同一套词格列宽，否则两区词列错位。其余场景传 `None`。
+fn type_line(
+    session: &Session,
+    text: &Text,
+    theme: Theme,
+    bold: bool,
+    cell_widths: Option<&[usize]>,
+) -> TextLines<'static> {
     let source = text.source;
     let group_size = session.group_size();
     if let TextSource::Builtin { set } = source {
@@ -6946,6 +7064,7 @@ fn type_line(session: &Session, text: &Text, theme: Theme, bold: bool) -> TextLi
                 page_end_word,
                 theme,
                 bold,
+                cell_widths,
             );
             // 当前页无已打字符时（仅有词间空格 span），显示提示行。
             if spans.is_empty() || spans.iter().all(|s| s.content == " ") {
@@ -7528,7 +7647,7 @@ mod tests {
         let boundaries = text.word_boundaries.as_ref().unwrap();
         assert!(!boundaries.is_empty());
         let session = Session::new_gated_with_words(&text.content, true, boundaries);
-        let rendered = original_line(&session, &text, theme, false);
+        let rendered = original_line(&session, &text, theme, false, None);
         assert_eq!(rendered.lines.len(), 1, "乱序词组对照区应只有一行");
         let first_page_words = boundaries.len().min(session.group_size());
         let space_spans = rendered.lines[0]
@@ -7565,7 +7684,7 @@ mod tests {
         let (ws, we) = boundaries[0];
         let first_word: String = text.content.chars().skip(ws).take(we - ws).collect();
         session.type_text(&first_word);
-        let rendered = type_line(&session, &text, theme, false);
+        let rendered = type_line(&session, &text, theme, false, None);
         assert_eq!(rendered.lines.len(), 1, "乱序词组跟打区应只有一行");
         for ch in first_word.chars() {
             let s = ch.to_string();
@@ -7695,6 +7814,7 @@ mod tests {
             },
             theme,
             false,
+            None,
         );
         let line = &text.lines[0];
         assert_eq!(line.spans.len(), 4);
@@ -7718,6 +7838,7 @@ mod tests {
             },
             theme,
             false,
+            None,
         );
         let line = &text.lines[0];
         assert_eq!(line.spans.len(), 4);
@@ -7744,11 +7865,11 @@ mod tests {
             word_boundaries: None,
             shuffled: false,
         };
-        let text = type_line(&session, &file_text, theme, true);
+        let text = type_line(&session, &file_text, theme, true, None);
         let line = &text.lines[0];
         assert_eq!(line.spans[0].style.add_modifier, Modifier::BOLD);
         assert_eq!(line.spans[1].style.add_modifier, Modifier::BOLD);
-        let plain = type_line(&session, &file_text, theme, false);
+        let plain = type_line(&session, &file_text, theme, false, None);
         let plain_line = &plain.lines[0];
         assert_eq!(plain_line.spans[0].style.add_modifier, Modifier::empty());
     }
@@ -7766,11 +7887,11 @@ mod tests {
             word_boundaries: None,
             shuffled: false,
         };
-        let text = original_line(&session, &file_text, theme, true);
+        let text = original_line(&session, &file_text, theme, true, None);
         let line = &text.lines[0];
         assert_eq!(line.spans[0].style.add_modifier, Modifier::BOLD);
         assert_eq!(line.spans[2].style.add_modifier, Modifier::BOLD);
-        let plain = original_line(&session, &file_text, theme, false);
+        let plain = original_line(&session, &file_text, theme, false, None);
         let plain_line = &plain.lines[0];
         assert_eq!(plain_line.spans[0].style.add_modifier, Modifier::empty());
     }
@@ -8248,8 +8369,8 @@ mod tests {
             word_boundaries: None,
             shuffled: false,
         };
-        let catppuccin_text = original_line(&session, &file_text, catppuccin_theme, false);
-        let dracula_text = original_line(&session, &file_text, dracula_theme, false);
+        let catppuccin_text = original_line(&session, &file_text, catppuccin_theme, false, None);
+        let dracula_text = original_line(&session, &file_text, dracula_theme, false, None);
         let catppuccin_line = &catppuccin_text.lines[0];
         let dracula_line = &dracula_text.lines[0];
         assert_eq!(
@@ -8287,16 +8408,16 @@ mod tests {
         let text = builtin_text(content);
         // 打 5 字（全对）：仍在第一组，跟打区显示当前页已打的 5 字。
         session.type_text("一二三四五");
-        let rendered = type_line(&session, &text, theme, false);
+        let rendered = type_line(&session, &text, theme, false, None);
         assert_eq!(rendered.lines.len(), 1, "第一页应只有一行");
         assert_eq!(rendered.lines[0].spans.len(), 5, "打 5 字应显示 5 字");
         // 打到 10 字（全对）：第一组全对，completed_groups 推进，翻到第二组，跟打区显示提示行。
         session.type_text("六七八九十");
-        let rendered = type_line(&session, &text, theme, false);
+        let rendered = type_line(&session, &text, theme, false, None);
         assert_eq!(rendered.lines.len(), 1, "翻到第二组尚未打字时应显示提示行");
         // 打到 13 字（全对）：第二组已打 3 字，跟打区显示 3 字。
         session.type_text("甲乙丙");
-        let rendered = type_line(&session, &text, theme, false);
+        let rendered = type_line(&session, &text, theme, false, None);
         assert_eq!(rendered.lines.len(), 1, "第二组应只有一行");
         assert_eq!(
             rendered.lines[0].spans.len(),
@@ -8314,7 +8435,7 @@ mod tests {
         let text = builtin_text(content);
         // 打 10 字但第 10 字打错 → 组未全对 → 不翻页
         session.type_text("一二三四五六七八九X");
-        let rendered = type_line(&session, &text, theme, false);
+        let rendered = type_line(&session, &text, theme, false, None);
         assert_eq!(
             rendered.lines[0].spans.len(),
             10,
@@ -8349,7 +8470,7 @@ mod tests {
         assert_eq!(session.completed_groups(), 1, "已完成组不应回退");
         // 页起始仍为第 2 组
         assert_eq!(builtin_page_start(&session), 10);
-        let rendered = type_line(&session, &text, theme, false);
+        let rendered = type_line(&session, &text, theme, false, None);
         assert_eq!(rendered.lines.len(), 1, "未打字时应显示提示行");
     }
 
@@ -8362,7 +8483,7 @@ mod tests {
         let text = builtin_text(content);
         // 打 5 字（全对）：对照区显示第一组 10 字（前 5 已打对，后 5 未打到）。
         session.type_text("一二三四五");
-        let rendered = original_line(&session, &text, theme, false);
+        let rendered = original_line(&session, &text, theme, false, None);
         assert_eq!(rendered.lines.len(), 1, "第一组应只有一行");
         assert_eq!(
             rendered.lines[0].spans.len(),
@@ -8371,7 +8492,7 @@ mod tests {
         );
         // 打到 10 字（全对）：第一组全对，翻到第二组，对照区显示第 11-20 字（10 字）。
         session.type_text("六七八九十");
-        let rendered = original_line(&session, &text, theme, false);
+        let rendered = original_line(&session, &text, theme, false, None);
         assert_eq!(rendered.lines.len(), 1, "第二组应只有一行");
         assert_eq!(
             rendered.lines[0].spans.len(),
@@ -8391,6 +8512,7 @@ mod tests {
             &file_text("一二三四五六七八九十十一十"),
             theme,
             false,
+            None,
         );
         assert_eq!(text.lines.len(), 1);
         assert_eq!(text.lines[0].spans.len(), 13);
@@ -8406,6 +8528,7 @@ mod tests {
             &builtin_text("一二三四五六七八九十"),
             theme,
             false,
+            None,
         );
         assert_eq!(text.lines.len(), 1, "空输入应只有一行提示");
     }
@@ -8428,7 +8551,7 @@ mod tests {
         };
         // 打第 1 个词「可以」（2 字）
         session.type_text("可以");
-        let rendered = type_line(&session, &text, theme, false);
+        let rendered = type_line(&session, &text, theme, false, None);
         assert_eq!(rendered.lines.len(), 1, "词组赛文应只有一行");
         // 第 1 个词 2 字 + 空格 + 第 2 个词的已打部分…跟打区只显示已打字符
         // 已打 2 字（第 1 词），应在 spans 中。第 2+ 词尚未打，跟打区无内容。
@@ -8462,7 +8585,7 @@ mod tests {
             word_boundaries: None,
             shuffled: false,
         };
-        let rendered = original_line(&session, &text, theme, false);
+        let rendered = original_line(&session, &text, theme, false, None);
         assert_eq!(rendered.lines.len(), 1, "词组赛文应只有一行");
         // 第 1 页 10 个词，词间 9 个空格 span
         let first_page_words = boundaries.len().min(session.group_size());
@@ -8519,7 +8642,7 @@ mod tests {
         session.type_text(&first_page_chars);
         // 全对 → completed_groups 推进 → 翻到第 2 组
         assert_eq!(session.completed_groups(), 1, "第 1 组全对应推进到 1");
-        let rendered = type_line(&session, &text, theme, false);
+        let rendered = type_line(&session, &text, theme, false, None);
         assert_eq!(rendered.lines.len(), 1, "翻到第 2 组应只有一行");
         // 第 2 组尚未打字，应显示空输入提示
         let placeholder_spans: Vec<_> = rendered.lines[0]
@@ -8562,7 +8685,7 @@ mod tests {
             "打 5 个词（10 字符）不应推进 completed_groups，一组应为 10 词"
         );
         // 跟打区应仍显示当前页（第 1-10 词），不应空白
-        let rendered = type_line(&session, &text, theme, false);
+        let rendered = type_line(&session, &text, theme, false, None);
         let non_placeholder: Vec<_> = rendered.lines[0]
             .spans
             .iter()
@@ -8813,7 +8936,7 @@ mod tests {
             word_boundaries: None,
             shuffled: false,
         };
-        let rendered = original_line(&session, &word_text, theme, false);
+        let rendered = original_line(&session, &word_text, theme, false, None);
         assert_eq!(rendered.lines.len(), 1, "第 2 组应只有一行");
         let second_page_words = boundaries.len().min(session.group_size());
         let space_spans = rendered.lines[0]
@@ -12293,7 +12416,7 @@ mod tests {
         let mut session = Session::new_gated_with_words_and_size(&text.content, true, &wb, 5);
         assert_eq!(session.group_size(), 5);
 
-        let rendered = original_line(&session, &text, theme, false);
+        let rendered = original_line(&session, &text, theme, false, None);
         assert_eq!(
             rendered.lines[0].spans.len(),
             5,
@@ -12305,7 +12428,7 @@ mod tests {
         session.type_text(&first_5);
         assert_eq!(session.completed_groups(), 1);
 
-        let rendered_p2 = original_line(&session, &text, theme, false);
+        let rendered_p2 = original_line(&session, &text, theme, false, None);
         assert_eq!(rendered_p2.lines[0].spans.len(), 5, "翻页后第二页也是 5 字");
     }
 }
