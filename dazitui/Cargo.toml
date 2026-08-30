@@ -11,6 +11,7 @@ description.workspace = true
 crossterm = "0.29.0"
 dazitui-core = { version = "1.0.4", path = "../dazitui-core", features = ["online"] }
 image = "0.25.10"
+notify = "8.2.0"
 ratatui = "0.30.2"
 ratatui-image = { version = "11.0.6", default-features = false, features = ["crossterm", "image-defaults"] }
 ratatui-themes = "0.3.0"

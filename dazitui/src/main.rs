@@ -20,6 +20,10 @@ use dazitui_core::{
     osc52_clipboard, pack_words_by_width, prewarm_segmenter, resolve_scheme_path_via_discovery,
     save_text_to_file, word_ratio_pct,
 };
+
+/// 方案源文件热监控封装（issue #91 / #93），基于 `notify`。
+mod scheme_watcher;
+
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::prelude::Stylize;
