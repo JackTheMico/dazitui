@@ -3970,7 +3970,7 @@ fn render_online_rank_view(frame: &mut Frame, app: &App, rank_state: &OnlineRank
     }
 
     // 底部快捷键提示栏（圆角边框 + 结构化标题），与统计视图一致。
-    let hint = " 1/2/3 比赛 | Tab/←→ 切换 | ↑↓ 滚动 | R 刷新 | Esc/q 返回 ";
+    let hint = " 1/2/3 比赛 | Tab/←→ 切换 | ↑↓ 滚动 | c 列定制 | R 刷新 | Esc/q 返回 ";
     let hint_title = Line::from(vec![Span::styled(
         " 快捷键 ",
         Style::default().bold().fg(palette.accent),
