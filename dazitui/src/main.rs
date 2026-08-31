@@ -4074,13 +4074,22 @@ fn render_rank_table(
 ) {
     let accent = Style::default().fg(palette.accent).bold();
     let fg = Style::default().fg(palette.fg);
-    let widths = compute_rank_column_widths(visible, area.width as usize);
+    // 相邻列之间插入固定间隔，避免右对齐列的值与下一列起点贴死
+    // （如「排名↔用户名」「速度↔输入法」）。间隔计入可用宽度，防止溢出。
+    let n = visible.len();
+    let gap = 2usize;
+    let gap_total = gap * n.saturating_sub(1);
+    let content_avail = area.width.saturating_sub(gap_total as u16) as usize;
+    let widths = compute_rank_column_widths(visible, content_avail);
     let mut header_spans: Vec<Span> = Vec::new();
     for (i, &id) in visible.iter().enumerate() {
         header_spans.push(Span::styled(
             pad_display(id.title(), widths[i], id.align_right()),
             accent,
         ));
+        if i + 1 < n {
+            header_spans.push(Span::styled(" ".repeat(gap), accent));
+        }
     }
     let header = Line::from(header_spans);
     let available = area.height.saturating_sub(1) as usize;
@@ -4102,6 +4111,9 @@ fn render_rank_table(
                 pad_display(&val, widths[i], id.align_right()),
                 row_style,
             ));
+            if i + 1 < n {
+                spans.push(Span::styled(" ".repeat(gap), row_style));
+            }
         }
         lines.push(Line::from(spans));
     }
