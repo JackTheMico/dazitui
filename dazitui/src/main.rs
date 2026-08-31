@@ -266,7 +266,7 @@ fn rank_column_modal_input(
     let n = RankColumnId::ALL.len();
     match key.code {
         KeyCode::Up | KeyCode::Char('k') => {
-            modal.selected = modal.selected.wrapping_sub(1) % n;
+            modal.selected = (modal.selected + n - 1) % n;
         }
         KeyCode::Down | KeyCode::Char('j') => {
             modal.selected = (modal.selected + 1) % n;
@@ -3987,7 +3987,13 @@ fn render_rank_column_modal(frame: &mut Frame, app: &App, palette: &ThemePalette
     let Some(modal) = app.rank_column_modal.as_ref() else {
         return;
     };
-    let area = centered_rect(frame.area(), 40, 11);
+    // 高度随列数变化：内容行（标题 1 + 空行 1 + 各列 N + 空行 1 + 提示 1），
+    // 外加 Block 上下边框各占 1 行，故再 +2。
+    let area = centered_rect(
+        frame.area(),
+        44,
+        (RankColumnId::ALL.len() as u16) + 6,
+    );
     frame.render_widget(Clear, area);
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(" 自定义展示列 ").bold().fg(palette.fg));
@@ -4033,6 +4039,13 @@ fn rank_cell_value(id: RankColumnId, row: &CompetitionRankRow) -> String {
         RankColumnId::Username => row.username.clone(),
         RankColumnId::Speed => format!("{:.2}", row.speed),
         RankColumnId::InputMethod => row.input_method.clone(),
+        RankColumnId::Keystrokes => format!("{:.2}", row.keystrokes),
+        RankColumnId::MaChang => format!("{:.2}", row.ma_chang),
+        RankColumnId::JianZhun => row.jian_zhun.clone(),
+        RankColumnId::JianShu => row.jian_shu.to_string(),
+        RankColumnId::HuiGai => row.hui_gai.to_string(),
+        RankColumnId::DaCi => row.da_ci.clone(),
+        RankColumnId::Time => row.typing_time.clone(),
     }
 }
 
@@ -11758,11 +11771,20 @@ mod tests {
     /// `rank_column_modal_input` 的 Space 应切换显隐写入 `config`，且至少保留 1 列；Esc 返回 Close。
     #[test]
     fn rank_column_modal_space_toggles_visibility_and_keeps_at_least_one() {
+        let total = RankColumnId::ALL.len();
+        let speed_idx = RankColumnId::ALL
+            .iter()
+            .position(|&id| id == RankColumnId::Speed)
+            .unwrap();
+        let im_idx = RankColumnId::ALL
+            .iter()
+            .position(|&id| id == RankColumnId::InputMethod)
+            .unwrap();
         let mut config = RankColumnConfig::default();
-        assert_eq!(config.visible_count(), 4, "默认应四列全显");
+        assert_eq!(config.visible_count(), total, "默认应全部列可见");
 
-        // 选中第 3 列（速度，下标 2），Space 隐藏它。
-        let mut modal = RankColumnModal { selected: 2 };
+        // 选中「速度」列，Space 隐藏它。
+        let mut modal = RankColumnModal { selected: speed_idx };
         let action = rank_column_modal_input(
             &mut modal,
             &mut config,
@@ -11770,7 +11792,7 @@ mod tests {
         );
         assert!(matches!(action, RankColumnModalAction::None));
         assert!(!config.is_visible(RankColumnId::Speed), "Space 后应隐藏速度列");
-        assert_eq!(config.visible_count(), 3);
+        assert_eq!(config.visible_count(), total - 1);
 
         // 再按 Space 恢复显示。
         rank_column_modal_input(
@@ -11779,14 +11801,16 @@ mod tests {
             KeyEvent::from(KeyCode::Char(' ')),
         );
         assert!(config.is_visible(RankColumnId::Speed), "再次 Space 应恢复显示");
-        assert_eq!(config.visible_count(), 4);
+        assert_eq!(config.visible_count(), total);
 
         // 隐藏到仅剩 1 列后，Space 隐藏最后一列应被拒绝。
-        config.set_visible(RankColumnId::Rank, false);
-        config.set_visible(RankColumnId::Username, false);
-        config.set_visible(RankColumnId::Speed, false);
+        for id in RankColumnId::ALL {
+            if id != RankColumnId::InputMethod {
+                config.set_visible(id, false);
+            }
+        }
         assert_eq!(config.visible_count(), 1, "应只剩输入法列");
-        let mut last = RankColumnModal { selected: 3 };
+        let mut last = RankColumnModal { selected: im_idx };
         rank_column_modal_input(
             &mut last,
             &mut config,
@@ -11847,9 +11871,12 @@ mod tests {
         };
         let mut app = test_app(file_text("x"));
         app.state = AppState::OnlineRank(state);
-        // 隐藏「输入法」列，保留其余三列。
+        // 隐藏「输入法」列，保留其余列。
         app.settings.rank_columns.set_visible(RankColumnId::InputMethod, false);
-        assert_eq!(app.settings.rank_columns.visible_count(), 3);
+        assert_eq!(
+            app.settings.rank_columns.visible_count(),
+            RankColumnId::ALL.len() - 1
+        );
 
         let backend = ratatui::backend::TestBackend::new(80, 24);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
