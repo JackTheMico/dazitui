@@ -250,10 +250,13 @@ pub struct CompetitionRank {
 }
 
 /// 灵活反序列化：数字或数字字符串都接受为数值类型 `T`（服务端数值字段多为字符串）。
+///
+/// 服务端对「无数据」的统计字段（如 `keystrokes`/`maChang`/`jianShu`）会回传占位串
+/// `"--"`（或 `"-"`/空串），此时按 `T` 的缺省值（0）处理，而非令整条榜单解析失败。
 fn de_flex_num<'de, D, T>(d: D) -> Result<T, D::Error>
 where
     D: Deserializer<'de>,
-    T: Deserialize<'de> + std::str::FromStr,
+    T: Deserialize<'de> + std::str::FromStr + Default,
     T::Err: std::fmt::Display,
 {
     #[derive(Deserialize)]
@@ -264,7 +267,18 @@ where
     }
     match V::<T>::deserialize(d)? {
         V::Num(n) => Ok(n),
-        V::Str(s) => s.trim().parse().map_err(serde::de::Error::custom),
+        V::Str(s) => {
+            let t = s.trim();
+            // 占位串：仅含连字符/短横/空白（如 "--"、"-"、""）→ 视为缺省值。
+            let is_placeholder = t.is_empty()
+                || t.chars()
+                    .all(|c| c == '-' || c == '\u{2014}' || c == '\u{2013}');
+            if is_placeholder {
+                Ok(T::default())
+            } else {
+                t.parse().map_err(serde::de::Error::custom)
+            }
+        }
     }
 }
 
@@ -806,6 +820,36 @@ mod tests {
     fn parse_competition_rank_server_error_is_server_error() {
         let err = parse_competition_rank_response(r#"{"error":1,"msg":"暂无赛文！"}"#).unwrap_err();
         assert_eq!(err, ApiError::Server("暂无赛文！".into()));
+    }
+
+    #[test]
+    fn parse_competition_rank_treats_dash_placeholder_as_zero() {
+        // 服务端对「无数据」的统计字段回传 "--" 占位（极速杯等榜单常见），
+        // 不应令整条榜单解析失败，而应回退为 0。回归测试：修复前此用例会整体解析失败（极速杯一直显示「加载失败」）。
+        let body = r#"{"error":0,"msg":{
+            "total":2,"textTitle":"极速杯","textLength":369,
+            "rankResult":[
+                {"rank":1,"username":"a","speed":"163.13","keystrokes":"7.38","maChang":"2.71","jianShu":"1419","huiGai":"56","inputMethod":"","from":"x","sectName":""},
+                {"rank":11,"username":"b","speed":"--","keystrokes":"--","maChang":"--","jianShu":"--","huiGai":"--","inputMethod":"","from":"x","sectName":""}
+            ],
+            "myRankResult":[]
+        }}"#;
+        let r = parse_competition_rank_response(body).expect("含 '--' 占位的榜单应解析成功");
+        assert_eq!(r.rank_result.len(), 2);
+        let bad = &r.rank_result[1];
+        assert_eq!(bad.rank, 11);
+        assert!((bad.speed - 0.0).abs() < 1e-9, "speed '--' 应回退为 0，得到 {}", bad.speed);
+        assert!((bad.keystrokes - 0.0).abs() < 1e-9);
+        assert!((bad.ma_chang - 0.0).abs() < 1e-9);
+        assert_eq!(bad.jian_shu, 0, "jianShu '--' 应回退为 0");
+        assert_eq!(bad.hui_gai, 0, "huiGai '--' 应回退为 0");
+    }
+
+    #[test]
+    fn parse_competition_rank_rejects_genuinely_malformed_number() {
+        // 边界：非占位的非法数字串仍应报错，避免静默吞掉真实异常。
+        let body = r#"{"error":0,"msg":{"total":1,"rankResult":[{"rank":1,"username":"a","speed":"not-a-number","inputMethod":""}],"myRankResult":[]}}"#;
+        assert!(parse_competition_rank_response(body).is_err());
     }
 
     #[test]
