@@ -369,15 +369,36 @@ pub enum RankColumnId {
     Speed,
     /// 输入法。
     InputMethod,
+    /// 击键次数（每秒按键数）。
+    Keystrokes,
+    /// 码长（平均每个汉字的按键数）。
+    MaChang,
+    /// 键准（百分比字符串）。
+    JianZhun,
+    /// 键数。
+    JianShu,
+    /// 回改次数。
+    HuiGai,
+    /// 打词率（百分比字符串）。
+    DaCi,
+    /// 用时（`MM:SS.mmm`）。
+    Time,
 }
 
 impl RankColumnId {
     /// 固定展示顺序（与默认表头一致）。
-    pub const ALL: [RankColumnId; 4] = [
+    pub const ALL: [RankColumnId; 11] = [
         RankColumnId::Rank,
         RankColumnId::Username,
         RankColumnId::Speed,
         RankColumnId::InputMethod,
+        RankColumnId::Keystrokes,
+        RankColumnId::MaChang,
+        RankColumnId::JianZhun,
+        RankColumnId::JianShu,
+        RankColumnId::HuiGai,
+        RankColumnId::DaCi,
+        RankColumnId::Time,
     ];
     /// 持久化紧凑键。
     pub fn key(&self) -> &'static str {
@@ -386,6 +407,13 @@ impl RankColumnId {
             RankColumnId::Username => "username",
             RankColumnId::Speed => "speed",
             RankColumnId::InputMethod => "input_method",
+            RankColumnId::Keystrokes => "keystrokes",
+            RankColumnId::MaChang => "ma_chang",
+            RankColumnId::JianZhun => "jian_zhun",
+            RankColumnId::JianShu => "jian_shu",
+            RankColumnId::HuiGai => "hui_gai",
+            RankColumnId::DaCi => "da_ci",
+            RankColumnId::Time => "time",
         }
     }
     /// 展示用标题。
@@ -395,20 +423,45 @@ impl RankColumnId {
             RankColumnId::Username => "用户名",
             RankColumnId::Speed => "速度(WPM)",
             RankColumnId::InputMethod => "输入法",
+            RankColumnId::Keystrokes => "击键",
+            RankColumnId::MaChang => "码长",
+            RankColumnId::JianZhun => "键准",
+            RankColumnId::JianShu => "键数",
+            RankColumnId::HuiGai => "回改",
+            RankColumnId::DaCi => "打词率",
+            RankColumnId::Time => "时间",
         }
     }
-    /// 列最小宽度（显示宽度），至少容纳标题。
+    /// 列最小宽度（显示宽度），至少容纳标题与典型数值。
     pub fn min_width(&self) -> usize {
         match self {
             RankColumnId::Rank => 5,
             RankColumnId::Username => 20,
             RankColumnId::Speed => 11,
             RankColumnId::InputMethod => 12,
+            RankColumnId::Keystrokes => 7,
+            RankColumnId::MaChang => 6,
+            RankColumnId::JianZhun => 7,
+            RankColumnId::JianShu => 6,
+            RankColumnId::HuiGai => 5,
+            RankColumnId::DaCi => 8,
+            RankColumnId::Time => 10,
         }
     }
     /// 数值列右对齐。
     pub fn align_right(&self) -> bool {
-        matches!(self, RankColumnId::Rank | RankColumnId::Speed)
+        matches!(
+            self,
+            RankColumnId::Rank
+                | RankColumnId::Speed
+                | RankColumnId::Keystrokes
+                | RankColumnId::MaChang
+                | RankColumnId::JianZhun
+                | RankColumnId::JianShu
+                | RankColumnId::HuiGai
+                | RankColumnId::DaCi
+                | RankColumnId::Time
+        )
     }
     /// 由持久化键解析。
     pub fn from_key(s: &str) -> Option<RankColumnId> {
@@ -417,6 +470,13 @@ impl RankColumnId {
             "username" => Some(RankColumnId::Username),
             "speed" => Some(RankColumnId::Speed),
             "input_method" => Some(RankColumnId::InputMethod),
+            "keystrokes" => Some(RankColumnId::Keystrokes),
+            "ma_chang" => Some(RankColumnId::MaChang),
+            "jian_zhun" => Some(RankColumnId::JianZhun),
+            "jian_shu" => Some(RankColumnId::JianShu),
+            "hui_gai" => Some(RankColumnId::HuiGai),
+            "da_ci" => Some(RankColumnId::DaCi),
+            "time" => Some(RankColumnId::Time),
             _ => None,
         }
     }
@@ -433,6 +493,20 @@ pub struct RankColumnConfig {
     pub speed: bool,
     /// 输入法列。
     pub input_method: bool,
+    /// 击键列。
+    pub keystrokes: bool,
+    /// 码长列。
+    pub ma_chang: bool,
+    /// 键准列。
+    pub jian_zhun: bool,
+    /// 键数列。
+    pub jian_shu: bool,
+    /// 回改列。
+    pub hui_gai: bool,
+    /// 打词率列。
+    pub da_ci: bool,
+    /// 时间列。
+    pub time: bool,
 }
 
 impl Default for RankColumnConfig {
@@ -443,6 +517,13 @@ impl Default for RankColumnConfig {
             username: true,
             speed: true,
             input_method: true,
+            keystrokes: true,
+            ma_chang: true,
+            jian_zhun: true,
+            jian_shu: true,
+            hui_gai: true,
+            da_ci: true,
+            time: true,
         }
     }
 }
@@ -455,6 +536,13 @@ impl RankColumnConfig {
             RankColumnId::Username => self.username,
             RankColumnId::Speed => self.speed,
             RankColumnId::InputMethod => self.input_method,
+            RankColumnId::Keystrokes => self.keystrokes,
+            RankColumnId::MaChang => self.ma_chang,
+            RankColumnId::JianZhun => self.jian_zhun,
+            RankColumnId::JianShu => self.jian_shu,
+            RankColumnId::HuiGai => self.hui_gai,
+            RankColumnId::DaCi => self.da_ci,
+            RankColumnId::Time => self.time,
         }
     }
     /// 设置该列显隐；至少保留一列可见，避免空表。
@@ -467,14 +555,33 @@ impl RankColumnConfig {
             RankColumnId::Username => self.username = visible,
             RankColumnId::Speed => self.speed = visible,
             RankColumnId::InputMethod => self.input_method = visible,
+            RankColumnId::Keystrokes => self.keystrokes = visible,
+            RankColumnId::MaChang => self.ma_chang = visible,
+            RankColumnId::JianZhun => self.jian_zhun = visible,
+            RankColumnId::JianShu => self.jian_shu = visible,
+            RankColumnId::HuiGai => self.hui_gai = visible,
+            RankColumnId::DaCi => self.da_ci = visible,
+            RankColumnId::Time => self.time = visible,
         }
     }
     /// 当前可见列数量。
     pub fn visible_count(&self) -> usize {
-        [self.rank, self.username, self.speed, self.input_method]
-            .iter()
-            .filter(|&&v| v)
-            .count()
+        [
+            self.rank,
+            self.username,
+            self.speed,
+            self.input_method,
+            self.keystrokes,
+            self.ma_chang,
+            self.jian_zhun,
+            self.jian_shu,
+            self.hui_gai,
+            self.da_ci,
+            self.time,
+        ]
+        .iter()
+        .filter(|&&v| v)
+        .count()
     }
     /// 可见列标识（固定顺序），供渲染遍历。
     pub fn visible_ids(&self) -> Vec<RankColumnId> {
@@ -500,6 +607,13 @@ impl RankColumnConfig {
             username: false,
             speed: false,
             input_method: false,
+            keystrokes: false,
+            ma_chang: false,
+            jian_zhun: false,
+            jian_shu: false,
+            hui_gai: false,
+            da_ci: false,
+            time: false,
         };
         for tok in s.split(',') {
             if let Some(id) = RankColumnId::from_key(tok) {
@@ -1360,23 +1474,28 @@ mod tests {
     fn rank_columns_roundtrips_through_store() {
         let store = SettingsStore::new(temp_path("rank_columns_roundtrip"));
         let mut s = Settings::default();
-        // 隐藏「用户名」与「输入法」两列，仅保留排名/速度。
-        s.rank_columns.set_visible(RankColumnId::Username, false);
-        s.rank_columns.set_visible(RankColumnId::InputMethod, false);
+        // 仅保留「排名」与「速度」两列，其余全部隐藏。
+        for id in RankColumnId::ALL {
+            if id != RankColumnId::Rank && id != RankColumnId::Speed {
+                s.rank_columns.set_visible(id, false);
+            }
+        }
         assert_eq!(s.rank_columns.visible_count(), 2);
         store.save(&s).unwrap();
         let loaded = store.load();
         assert!(loaded.rank_columns.is_visible(RankColumnId::Rank));
         assert!(loaded.rank_columns.is_visible(RankColumnId::Speed));
         assert!(!loaded.rank_columns.is_visible(RankColumnId::Username));
-        assert!(!loaded.rank_columns.is_visible(RankColumnId::InputMethod));
-        // 至少保留一列：尝试关掉最后一列应被拒绝。
+        // 至少保留一列：仅留第一列后再尝试关掉它应被拒绝。
         let mut all = Settings::default();
-        all.rank_columns.set_visible(RankColumnId::Rank, false);
-        all.rank_columns.set_visible(RankColumnId::Username, false);
-        all.rank_columns.set_visible(RankColumnId::Speed, false);
+        for id in RankColumnId::ALL {
+            if id != RankColumnId::ALL[0] {
+                all.rank_columns.set_visible(id, false);
+            }
+        }
+        all.rank_columns.set_visible(RankColumnId::ALL[0], false);
         assert!(
-            all.rank_columns.is_visible(RankColumnId::InputMethod),
+            all.rank_columns.is_visible(RankColumnId::ALL[0]),
             "至少应保留一列可见"
         );
         let _ = std::fs::remove_file(store.path());
@@ -1387,7 +1506,11 @@ mod tests {
         let store = SettingsStore::new(temp_path("rank_columns_absent"));
         std::fs::write(store.path(), "theme=catppuccin-mocha\nreference_ratio=62\n").unwrap();
         let loaded = store.load();
-        assert_eq!(loaded.rank_columns.visible_count(), 4, "旧配置缺列应默认全显");
+        assert_eq!(
+            loaded.rank_columns.visible_count(),
+            RankColumnId::ALL.len(),
+            "旧配置缺列应默认全显"
+        );
         let _ = std::fs::remove_file(store.path());
     }
 }
