@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::fs;
 use std::io;
@@ -227,6 +227,8 @@ struct RankBoard {
     error: Option<String>,
     /// 榜单列表滚动偏移。
     scroll: u16,
+    /// 最近一次渲染时表格可用行数（用于滚动上界夹紧）；由 `render_rank_table` 经 `&` 写入。
+    viewport_rows: Cell<usize>,
 }
 
 /// 在线排行榜视图状态：三个比赛 Tab 各自缓存一份榜单。
@@ -1348,13 +1350,26 @@ impl App {
     }
 
     /// 调整当前 Tab 榜单滚动偏移（`delta < 0` 上滚，`> 0` 下滚）。
+    ///
+    /// 必须将偏移夹紧到 `[0, max_scroll]`：`max_scroll = 行数 - 可见行数`。
+    /// 否则 `scroll` 会越过下界继续累加，触底后再上滚会出现「多按无效」的死区，
+    /// 表现即为「排行榜无法上下滚动」。
     fn rank_scroll(&mut self, delta: i32) {
         if let AppState::OnlineRank(state) = &mut self.state {
             if let Some(board) = state.boards.get_mut(&state.active_tab) {
-                if delta < 0 {
-                    board.scroll = board.scroll.saturating_sub((-delta) as u16);
+                let next = if delta < 0 {
+                    board.scroll.saturating_sub((-delta) as u16)
                 } else {
-                    board.scroll = board.scroll.saturating_add(delta as u16);
+                    board.scroll.saturating_add(delta as u16)
+                };
+                // 仅当已渲染过（已知可见行数）且存在数据时夹紧；未渲染/空榜保持原行为。
+                let known = board.viewport_rows.get();
+                let rows = board.data.as_ref().map(|d| d.rank_result.len()).unwrap_or(0);
+                if known > 0 && rows > 0 {
+                    let max_scroll = rows.saturating_sub(known) as u16;
+                    board.scroll = next.min(max_scroll);
+                } else {
+                    board.scroll = next;
                 }
             }
         }
@@ -2809,7 +2824,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                                 stats_state.error_ranking_focus =
                                     stats_state.error_ranking_focus.toggle();
                             }
-                            KeyCode::Up | KeyCode::Char('k') => {
+                            KeyCode::Char('k') => {
                                 if stats_state.tab == StatsTab::ErrorRanking {
                                     match stats_state.error_ranking_focus {
                                         ErrorRankingFocus::Chars => {
@@ -2829,7 +2844,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                                     }
                                 }
                             }
-                            KeyCode::Down | KeyCode::Char('j') => {
+                            KeyCode::Char('j') => {
                                 if stats_state.tab == StatsTab::ErrorRanking {
                                     let db = StatsDb::with_default_path().ok();
                                     match stats_state.error_ranking_focus {
@@ -3039,8 +3054,8 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                             app.switch_rank_tab(prev);
                         }
                         KeyCode::Char('r') | KeyCode::Char('R') => app.refresh_rank(),
-                        KeyCode::Up | KeyCode::Char('k') => app.rank_scroll(-1),
-                        KeyCode::Down | KeyCode::Char('j') => app.rank_scroll(1),
+                        KeyCode::Char('k') => app.rank_scroll(-1),
+                        KeyCode::Char('j') => app.rank_scroll(1),
                         KeyCode::Char('c') | KeyCode::Char('C') => app.open_rank_column_modal(),
                         _ => {}
                     },
@@ -3961,6 +3976,7 @@ fn render_online_rank_view(frame: &mut Frame, app: &App, rank_state: &OnlineRank
                         b.scroll,
                         table_area,
                         &visible,
+                        b,
                     );
                 }
                 None => render_rank_note(frame, body_area, "加载中…", palette.muted),
@@ -3970,7 +3986,7 @@ fn render_online_rank_view(frame: &mut Frame, app: &App, rank_state: &OnlineRank
     }
 
     // 底部快捷键提示栏（圆角边框 + 结构化标题），与统计视图一致。
-    let hint = " 1/2/3 比赛 | Tab/←→ 切换 | ↑↓ 滚动 | c 列定制 | R 刷新 | Esc/q 返回 ";
+    let hint = " 1/2/3 比赛 | Tab/←→ 切换 | jk 滚动 | c 列定制 | R 刷新 | Esc/q 返回 ";
     let hint_title = Line::from(vec![Span::styled(
         " 快捷键 ",
         Style::default().bold().fg(palette.accent),
@@ -4076,6 +4092,9 @@ fn compute_rank_column_widths(visible: &[RankColumnId], avail: usize) -> Vec<usi
 
 /// 渲染榜单：仅展示 `visible` 指定的列（顺序即 `RankColumnId::ALL` 中可见者），
 /// 按 `scroll` 偏移可滚动；当前用户行高亮。列宽按可见列动态分配（#105/#108 列定制）。
+///
+/// `board` 仅用于把本次表格可用行数回写进 `board.viewport_rows`，
+/// 供 `rank_scroll` 计算滚动上界（`Cell` 经 `&` 即可写入，无需改动 `ui` 的不可变借用）。
 fn render_rank_table(
     frame: &mut Frame,
     palette: &ThemePalette,
@@ -4084,6 +4103,7 @@ fn render_rank_table(
     scroll: u16,
     area: Rect,
     visible: &[RankColumnId],
+    board: &RankBoard,
 ) {
     let accent = Style::default().fg(palette.accent).bold();
     let fg = Style::default().fg(palette.fg);
@@ -4106,6 +4126,8 @@ fn render_rank_table(
     }
     let header = Line::from(header_spans);
     let available = area.height.saturating_sub(1) as usize;
+    // 回写可见行数，使 rank_scroll 能据此夹紧滚动上界。
+    board.viewport_rows.set(available);
     let rows = &data.rank_result;
     let max_scroll = rows.len().saturating_sub(available);
     let start = (scroll as usize).min(max_scroll);
@@ -4304,48 +4326,67 @@ fn ui(frame: &mut Frame, app: &App) {
 
         let ref_inner_width = ref_area.width.saturating_sub(2);
         let ref_inner_height = ref_area.height.saturating_sub(2);
-        let ref_scroll_y = if !is_builtin && ref_inner_height > 0 {
-            let (ref_target_line, _) = calculate_text_layout_position(
-                app.text.content.chars().take(app.session.len()),
-                ref_inner_width,
-            );
-            // 双行词格下正文行前各有一行提示，故折行后目标行号翻倍以对齐滚动。
-            let target = if use_code_hint_grid {
-                ref_target_line.saturating_mul(2)
-            } else {
-                ref_target_line
-            };
-            target.saturating_sub(ref_inner_height / 2)
+
+        // 跟打区滚动偏移：先于对照区计算，二者共用同一偏移以保证严格同步
+        // （对照区/跟打区垂直等宽布局、换行一致，仅因占比不同导致高度不同；
+        //  若各自按自身高度居中，会出现对照区滞后、不跟随打字位置的错位）。
+        let type_inner_width = type_area.width.saturating_sub(2);
+        let type_inner_height = type_area.height.saturating_sub(2);
+        let rendered_type_lines = type_line(
+            &app.session,
+            &app.text,
+            app.theme(),
+            app.settings.bold,
+            word_cell_widths.as_deref(),
+        );
+        let (type_cursor_line, type_cursor_col) = if is_current_page_empty(&app.session, &app.text) {
+            (0, 0)
+        } else {
+            let rendered_chars = rendered_type_lines
+                .lines
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .flat_map(|span| span.content.chars());
+            calculate_text_layout_position(rendered_chars, type_inner_width)
+        };
+        let type_scroll_y = if !is_builtin && type_inner_height > 0 {
+            type_cursor_line.saturating_sub(type_inner_height / 2)
         } else {
             0
         };
 
-        let mut ref_text = if use_code_hint_grid {
+        let (mut ref_text, ref_cursor_grid_line) = if use_code_hint_grid {
             // 非内置长文双行词格：提示行与正文行已按词宽锁步预排版（无需 Paragraph 再折行）。
-            code_hint_grid_text(
+            match code_hint_grid_text(
                 &app.session,
                 &app.text,
                 app.scheme_dict.as_ref(),
                 app.theme(),
                 app.settings.bold,
                 ref_inner_width as usize,
-            )
-            .unwrap_or_else(|| {
+            ) {
+                Some((grid, cursor_line)) => (grid, Some(cursor_line)),
+                None => (
+                    original_line(
+                        &app.session,
+                        &app.text,
+                        app.theme(),
+                        app.settings.bold,
+                        word_cell_widths.as_deref(),
+                    ),
+                    None,
+                ),
+            }
+        } else {
+            (
                 original_line(
                     &app.session,
                     &app.text,
                     app.theme(),
                     app.settings.bold,
                     word_cell_widths.as_deref(),
-                )
-            })
-        } else {
-            original_line(
-                &app.session,
-                &app.text,
-                app.theme(),
-                app.settings.bold,
-                word_cell_widths.as_deref(),
+                ),
+                None,
             )
         };
         // 遍码提示（编码提示）：开启时，有可用词典走正常提示路径，否则显示占位引导。
@@ -4368,6 +4409,17 @@ fn ui(frame: &mut Frame, app: &App) {
                     .insert(0, code_hint_placeholder_line(app.theme()));
             }
         }
+        // 对照区滚动：编码提示双行词格路径按光标真实网格行定位，保证严格跟随打字位置；
+        // 其余路径（含词格生成失败回退）与跟打区共用同一偏移（type_scroll_y），二者垂直等宽、换行一致。
+        let ref_scroll_y = if use_code_hint_grid {
+            match ref_cursor_grid_line {
+                Some(gl) => gl.saturating_sub(ref_inner_height / 2),
+                None => type_scroll_y,
+            }
+        } else {
+            type_scroll_y
+        };
+
         frame.render_widget(
             Paragraph::new(ref_text)
                 .block(ref_block)
@@ -4426,33 +4478,7 @@ fn ui(frame: &mut Frame, app: &App) {
         typing_title_spans.push(Span::styled(progress_str, Style::default().fg(palette.fg)));
         let typing_title = Line::from(typing_title_spans);
 
-        let type_inner_width = type_area.width.saturating_sub(2);
-        let type_inner_height = type_area.height.saturating_sub(2);
-        let rendered_type_lines = type_line(
-            &app.session,
-            &app.text,
-            app.theme(),
-            app.settings.bold,
-            word_cell_widths.as_deref(),
-        );
-
-        let (type_cursor_line, type_cursor_col) = if is_current_page_empty(&app.session, &app.text)
-        {
-            (0, 0)
-        } else {
-            let rendered_chars = rendered_type_lines
-                .lines
-                .iter()
-                .flat_map(|line| line.spans.iter())
-                .flat_map(|span| span.content.chars());
-            calculate_text_layout_position(rendered_chars, type_inner_width)
-        };
-        let type_scroll_y = if !is_builtin && type_inner_height > 0 {
-            type_cursor_line.saturating_sub(type_inner_height / 2)
-        } else {
-            0
-        };
-
+        // 跟打区尺寸/滚动变量已在上方对照区之前计算，此处直接复用。
         frame.render_widget(
             Paragraph::new(rendered_type_lines)
                 .block(themed_block(&palette, typing_active).title(typing_title))
@@ -7640,6 +7666,10 @@ fn code_hint_overlay_line(
 /// 若相邻若干词拼接后正好命中方案词典中的整词码，则合并为一个提示单元并反查整词码。
 /// 仅当拼接命中时才合并；否则保持原分词不变，行为向后兼容。
 ///
+/// 短语合并时允许的最大词单元数。真实输入短语（含自定义短语）极少超过 4 词，
+/// 上限设为 6 已绰绰有余；关键是避免对超长文做无界的最长匹配拼接（见下方复杂度修复）。
+const MAX_PHRASE_WORDS: usize = 6;
+
 /// 同时合并 `word_ranges` 与 `typed_mask`，使提示行、正文行的索引与合并后的词单元锁步。
 fn merge_phrase_hints(
     words: &[String],
@@ -7653,16 +7683,25 @@ fn merge_phrase_hints(
     let mut out_r: Vec<(usize, usize)> = Vec::new();
     let mut i = 0;
     while i < n {
-        // 从最长拼接（覆盖余下全部词）向短回溯，命中词典整词码即采用。
+        // 取最长命中词典整词码的拼接（best_k 记录最大命中词数）。
+        // 复杂度修复：拼接长度上限为 MAX_PHRASE_WORDS，且逐词增量拼接、
+        // 不再每次从零 `concat` 重建——原先无界 + 全量重建是 O(n³)，
+        // 长文下每帧重建词格耗时数百毫秒，表现为「打开编码提示后对照区滚动不及时」。
         let mut best_k = 1usize;
         let mut merged = words[i].clone();
         let mut merged_range = word_ranges[i];
-        for k in 2..=n - i {
-            let cand: String = words[i..i + k].concat();
-            if dict.get_primary_code(&cand).is_some() {
-                merged = cand;
+        // candidate 逐词增量拼接（避免每次从零重建），但仅在命中词典时才提交为 merged；
+        // 不命中时 merged 始终保持为最初的单词（与原实现语义一致）。
+        let mut candidate = words[i].clone();
+        let upper = MAX_PHRASE_WORDS.min(n - i);
+        for k in 2..=upper {
+            let wi = i + k - 1;
+            candidate.push_str(&words[wi]);
+            let cand_range = (word_ranges[i].0, word_ranges[wi].1);
+            if dict.get_primary_code(&candidate).is_some() {
+                merged = candidate.clone();
                 best_k = k;
-                merged_range = (word_ranges[i].0, word_ranges[i + k - 1].1);
+                merged_range = cand_range;
             }
         }
         out_w.push(merged);
@@ -7750,6 +7789,40 @@ fn code_hint_hand_style(hand: HintHand, theme: Theme) -> Style {
 ///
 /// 仅对非内置长文生效；内置词组赛文仍走 `code_hint_overlay_line` 单页路径。
 /// 未配置方案（`dict` 为 `None`）或内置词组赛文或文本无词边界时返回 `None`，交由上层回退到普通渲染。
+/// 计算双行词格中「光标所在词」对应的网格正文行行号（提示行在偶数行、正文行在奇数行）。
+///
+/// 返回值为该词**正文行**在 `code_hint_grid_text` 输出 `TextLines` 中的行索引，
+/// 供对照区 `.scroll()` 据此居中，使对照区严格跟随打字位置（修复「打开编码提示后滚动不跟随」）。
+///
+/// * `word_ranges`：与 `words`/`rows` 同序的词单元在原文中的字符区间（已含短语合并）。
+/// * `cursor`：`session.len()`，即已上屏字符数（光标在原文中的偏移）。
+/// * `rows`：`pack_words_by_width` 产出的词格分行（每行含若干词索引）。
+///
+/// 与 `calculate_text_layout_position` 的「按字折行行号 ×2」启发式不同：词格按词边界锁步行，
+/// 二者行号并不成 2 倍关系，必须直接定位光标词所在行才能得到正确的滚动目标。
+fn grid_cursor_line(
+    word_ranges: &[(usize, usize)],
+    cursor: usize,
+    rows: &[Vec<usize>],
+) -> Option<u16> {
+    // 定位光标所在词：优先命中含有光标的区间 [start, end)；
+    // 光标恰好落在某词尾边界时归到下一词（刚打完的词上滚、正在打的词进入视野）。
+    let mut wi = None;
+    for (i, &(s, e)) in word_ranges.iter().enumerate() {
+        if s <= cursor && cursor < e {
+            wi = Some(i);
+            break;
+        }
+    }
+    if wi.is_none() {
+        // 全文已打完（cursor == 末词 end）或落在词间空白：回退到最后一个 start <= cursor 的词。
+        wi = word_ranges.iter().rposition(|&(s, _)| s <= cursor);
+    }
+    let wi = wi?;
+    let row = rows.iter().position(|r| r.contains(&wi))?;
+    Some(2u16.saturating_mul(row as u16).saturating_add(1))
+}
+
 fn code_hint_grid_text(
     session: &Session,
     text: &Text,
@@ -7757,7 +7830,7 @@ fn code_hint_grid_text(
     theme: Theme,
     bold: bool,
     max_width: usize,
-) -> Option<TextLines<'static>> {
+) -> Option<(TextLines<'static>, u16)> {
     // 内置词组赛文由 code_hint_overlay_line 单页路径处理，不走双行词格。
     if matches!(text.source, TextSource::Builtin { .. }) {
         return None;
@@ -7813,6 +7886,8 @@ fn code_hint_grid_text(
     // 词格列宽 = max(词宽, 提示码宽)：提示码宽于词时不截断提示，而由正文补空格让位。
     let widths: Vec<usize> = hint_cell_widths(&words, &hints);
     let rows = pack_words_by_width(&widths, max_width);
+    // 计算光标所在词格的网格正文行，供对照区滚动严格跟随打字位置。
+    let cursor_grid_line = grid_cursor_line(&word_ranges, session.len(), &rows).unwrap_or(0);
 
     let mut text_lines = TextLines::default();
     for row in rows {
@@ -7852,7 +7927,7 @@ fn code_hint_grid_text(
         }
         text_lines.push_line(Line::from(spans));
     }
-    Some(text_lines)
+    Some((text_lines, cursor_grid_line))
 }
 
 /// 当前方案是否具备可用词典（用于遍码提示）：须已载入且含至少一个词条。
@@ -8125,7 +8200,7 @@ fn group_spans(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dazitui_core::{TextSource, ThemePreset};
+    use dazitui_core::{CompetitionType, TextSource, ThemePreset};
     use std::fs;
 
     fn temp_dir(suffix: &str) -> PathBuf {
@@ -9859,8 +9934,8 @@ mod tests {
                    生活\twvi\n社会\twpww\n主义\tuyit\n事业\tsira\n发展\tvzoi\n越来越好\tylyh\n";
         let dict = SchemeDict::parse(tsv);
         let max_width = 12; // 窄：约 2 个双字词一行
-        let grid = code_hint_grid_text(&session, &text, Some(&dict), theme, false, max_width);
-        let grid = grid.expect("非内置长文应生成双行词格");
+        let (grid, _cursor) = code_hint_grid_text(&session, &text, Some(&dict), theme, false, max_width)
+            .expect("非内置长文应生成双行词格");
         let lines: Vec<String> = grid
             .lines
             .iter()
@@ -9949,7 +10024,7 @@ mod tests {
             )
             .unwrap();
             let session = Session::new(&text.content);
-            let grid = code_hint_grid_text(&session, &text, Some(&dict), theme, false, 40)
+            let (grid, _cursor) = code_hint_grid_text(&session, &text, Some(&dict), theme, false, 40)
                 .unwrap_or_else(|| panic!("[{label}] 应生成词格"));
             let joined: String = grid
                 .lines
@@ -9967,6 +10042,74 @@ mod tests {
                 joined
             );
         }
+    }
+
+    #[test]
+    fn grid_cursor_line_maps_cursor_to_word_row() {
+        // 双行词格滚动核心：把光标（已上屏字符数）映射到「光标词所在行的正文行行号」(2*row+1)。
+        // 词单元区间连续、每行 2 个词：[0,1] 行含词 0/1，[2,3] 行含词 2/3，[4,5] 行含词 4/5。
+        let word_ranges: Vec<(usize, usize)> = (0..6u32)
+            .map(|i| (i as usize * 2, i as usize * 2 + 2))
+            .collect();
+        let rows: Vec<Vec<usize>> = vec![vec![0, 1], vec![2, 3], vec![4, 5]];
+
+        // 光标落在词单元内部 → 命中该词所在行。
+        assert_eq!(grid_cursor_line(&word_ranges, 8, &rows), Some(5), "词4 在第2行 → 正文行 5");
+        assert_eq!(grid_cursor_line(&word_ranges, 3, &rows), Some(1), "词1 在第0行 → 正文行 1");
+        // 光标恰落在词边界（= 上一词尾 = 下一词头）→ 归到下一词（正在打的词进入视野）。
+        assert_eq!(grid_cursor_line(&word_ranges, 2, &rows), Some(1), "边界 0/1 → 词1 → 正文行 1");
+        assert_eq!(grid_cursor_line(&word_ranges, 4, &rows), Some(3), "边界 1/2 → 词2 → 正文行 3");
+        // 打完全文（光标 = 末词尾）仍定位末词。
+        assert_eq!(grid_cursor_line(&word_ranges, 12, &rows), Some(5), "全文打完 → 末词 → 正文行 5");
+        // 空分行 → 无光标行。
+        assert_eq!(grid_cursor_line(&word_ranges, 0, &[]), None);
+    }
+
+    #[test]
+    fn reference_area_grid_scroll_follows_cursor_with_code_hints() {
+        // 回归：打开编码提示（双行词格）时，对照区滚动必须严格跟随打字位置。
+        // 旧实现用「按字折行行号 ×2」近似，与按词边界锁步的词格行号并不成 2 倍关系，
+        // 在长文/放大终端（可视行少）下会把光标推出可视窗口，表现为「滚动不及时」。
+        let theme = Theme::preset(ThemePreset::CatppuccinMocha);
+        let base = "我们看着这个美丽的世界，人民在静静地生活。社会主义事业发展得越来越好。";
+        let content = base.repeat(4);
+        let text = load_text_from_string(
+            "长文",
+            content.clone(),
+            TextSource::File,
+            &LoadOptions::default(),
+        )
+        .unwrap();
+        let mut session = Session::new(&text.content);
+        session.type_text(&text.content); // 打完全文，光标置于末尾（最坏情况）
+        let tsv = "我们\twm\n看着\tva\n这个\tvi\n美丽\tmwi\n世界\twj\n人民\trvww\n\
+                   生活\twvi\n社会\twpww\n主义\tuyit\n事业\tsira\n发展\tvzoi\n越来越好\tylyh\n";
+        let dict = SchemeDict::parse(tsv);
+        let max_width = 12u16; // 窄：放大终端下的近似列数
+        let (grid, cursor_line) = code_hint_grid_text(&session, &text, Some(&dict), theme, false, max_width as usize)
+            .expect("长文应生成双行词格");
+        let inner_height = 10u16;
+
+        // 固定公式：光标真实网格行居中 → 光标行必落在可视窗口内。
+        let new_scroll = cursor_line.saturating_sub(inner_height / 2);
+        assert!(
+            usize::from(cursor_line) < grid.lines.len(),
+            "光标行应在内容范围内: cursor_line={cursor_line} lines={}",
+            grid.lines.len()
+        );
+        assert!(
+            new_scroll <= cursor_line && cursor_line < new_scroll + inner_height,
+            "修复后光标行应落在可视窗口内: scroll={new_scroll} cursor={cursor_line} h={inner_height}"
+        );
+
+        // 复现旧公式（按字折行行号 ×2 − h/2）：在长文下会把光标推出可视窗口（即此前的「滚动不及时」）。
+        let (plain_line, _) =
+            calculate_text_layout_position(text.content.chars().take(session.len()), max_width);
+        let old_scroll = (plain_line * 2).saturating_sub(inner_height / 2);
+        assert!(
+            !(old_scroll <= cursor_line && cursor_line < old_scroll + inner_height),
+            "旧公式 ×2 启发式会把光标推出可视窗口（bug 复现）: old_scroll={old_scroll} cursor={cursor_line} h={inner_height}"
+        );
     }
 
     #[test]
@@ -11623,6 +11766,7 @@ mod tests {
                     loading: false,
                     error: None,
                     scroll: 0,
+                    viewport_rows: Cell::new(0),
                 },
             )]),
             error: None,
@@ -11677,6 +11821,7 @@ mod tests {
                     loading: false,
                     error: None,
                     scroll: 0,
+                    viewport_rows: Cell::new(0),
                 },
             )]),
             error: None,
@@ -11730,6 +11875,7 @@ mod tests {
                     loading: false,
                     error: None,
                     scroll: 0,
+                    viewport_rows: Cell::new(0),
                 },
             )]),
             error: None,
@@ -11865,6 +12011,7 @@ mod tests {
                     loading: false,
                     error: None,
                     scroll: 0,
+                    viewport_rows: Cell::new(0),
                 },
             )]),
             error: None,
@@ -11937,6 +12084,7 @@ mod tests {
                     loading: false,
                     error: None,
                     scroll: 0,
+                    viewport_rows: Cell::new(0),
                 },
             )]),
             error: None,
@@ -11994,6 +12142,7 @@ mod tests {
                     loading: false,
                     error: Some("连接超时".into()),
                     scroll: 0,
+                    viewport_rows: Cell::new(0),
                 },
             )]),
             error: None,
@@ -12045,6 +12194,7 @@ mod tests {
                     loading: false,
                     error: None,
                     scroll: 0,
+                    viewport_rows: Cell::new(0),
                 },
             )]),
             error: None,
@@ -12106,6 +12256,7 @@ mod tests {
                     loading: false,
                     error: None,
                     scroll: 3,
+                    viewport_rows: Cell::new(0),
                 },
             )]),
             error: None,
@@ -12126,6 +12277,80 @@ mod tests {
             }
             _ => panic!("状态应保持为 OnlineRank"),
         }
+    }
+
+    /// 回归：榜单滚动应真实改变可见首行；并且「过滚」到末尾后上滚一行必须能回退
+    /// （复现「无法上下滚动」：scroll 不夹紧上界，导致触底后上滚出现多按无效的死区）。
+    #[test]
+    fn rank_scroll_moves_visible_rows_and_clamps_at_bottom() {
+        let mut rows = Vec::new();
+        for i in 1..=30u32 {
+            rows.push(dazitui_core::CompetitionRankRow {
+                rank: i,
+                username: format!("u{i}"),
+                speed: 100.0 + i as f64,
+                input_method: "虎码".into(),
+                ..Default::default()
+            });
+        }
+        let data = CompetitionRank {
+            rank_result: rows,
+            my_rank_result: vec![],
+            total: 30,
+            text_title: "t".into(),
+            text_length: 100,
+        };
+        let mut app = test_app(file_text("x"));
+        app.state = AppState::OnlineRank(OnlineRankState {
+            active_tab: CompetitionType::Jisu,
+            date: "2026-08-30".into(),
+            boards: HashMap::from([(
+                CompetitionType::Jisu,
+                RankBoard {
+                    data: Some(data),
+                    loading: false,
+                    error: None,
+                    scroll: 0,
+                    viewport_rows: Cell::new(0),
+                },
+            )]),
+            error: None,
+        });
+
+        let render_top = |app: &App| -> String {
+            let backend = ratatui::backend::TestBackend::new(80, 24);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal.draw(|f| ui(f, app)).unwrap();
+            let buffer = terminal.backend().buffer();
+            (0..buffer.area.height)
+                .map(|y| {
+                    (0..buffer.area.width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+                .replace(' ', "")
+        };
+
+        // 初始：榜首应为 u1
+        assert!(render_top(&app).contains("u1"), "scroll=0 时榜首应是 u1");
+
+        // 下滚 1：榜首应变 u2
+        app.rank_scroll(1);
+        assert!(render_top(&app).contains("u2"), "scroll=1 时榜首应是 u2");
+
+        // 反复下滚越过末尾（过滚），再上滚 1 应回退一行
+        for _ in 0..50 {
+            app.rank_scroll(1);
+        }
+        app.rank_scroll(-1);
+        let after_up = render_top(&app);
+        // available≈15 → max_scroll≈15 → 触底后上滚一行榜首应从 u16 变为 u15
+        assert!(
+            after_up.contains("u15"),
+            "过滚后上滚一行，榜首应变 u15，实际未变（存在死区）：{after_up}"
+        );
     }
 
     #[test]
@@ -13436,6 +13661,178 @@ mod tests {
             content.contains(recent_char),
             "缓冲区应包含当前打字处字符: {}",
             recent_char
+        );
+    }
+
+    /// 从 TestBackend 缓冲区提取「对照区」可见正文（对照区标题行之后、跟打区标题行之前）。
+    /// `sidebar_width` 为侧边栏列宽（可见时 24，否则 0）。标题定位在完整行上做，
+    /// 正文提取时去掉侧边栏列，以免侧边栏菜单项污染比较。
+    fn reference_region(
+        term: &ratatui::Terminal<ratatui::backend::TestBackend>,
+        sidebar_width: u16,
+    ) -> String {
+        let buf = term.backend().buffer();
+        let w = buf.area.width;
+        let h = buf.area.height;
+        let full_rows: Vec<String> = (0..h)
+            .map(|y| {
+                (0..w)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    .replace(' ', "")
+            })
+            .collect();
+        let content_rows: Vec<String> = (0..h)
+            .map(|y| {
+                (sidebar_width..w)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    .replace(' ', "")
+            })
+            .collect();
+        let ref_title = full_rows
+            .iter()
+            .position(|r| r.contains("对照区"))
+            .expect("缓冲区应包含对照区标题");
+        let type_title = full_rows
+            .iter()
+            .position(|r| r.contains("跟打区"))
+            .expect("缓冲区应包含跟打区标题");
+        let start = ref_title + 1;
+        let end = type_title.saturating_sub(1);
+        content_rows[start..end].join("\n")
+    }
+
+    #[test]
+    fn test_online_text_reference_area_scrolls_with_typing() {
+        // 构造超长在线赛文：前 600 字为普通字符，第 600 字处插入唯一标记，
+        // 用于验证对照区随打字下滚到当前打字位置。
+        let base: Vec<char> = (0..800)
+            .map(|i| std::char::from_u32(0x4E00 + (i % 800) as u32).unwrap_or('字'))
+            .collect();
+        let marker: Vec<char> = "【标一甲】".chars().collect();
+        let mut chars = base.clone();
+        chars.splice(500..500, marker.clone()); // 标记置于第 500 字（超出首屏，确保触发滚动）
+        let long_raw: String = chars.iter().collect();
+        let marker_str: String = marker.iter().collect();
+
+        let text = Text {
+            title: "在线长文".to_string(),
+            content: long_raw.clone(),
+            source: TextSource::Online {
+                competition_type: CompetitionType::Jisu,
+            },
+            word_boundaries: None,
+            shuffled: false,
+        };
+        let mut app = test_app(text);
+        app.sidebar_visible = false;
+
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+
+        // 进度 0：对照区可见正文
+        term.draw(|f| ui(f, &app)).unwrap();
+        let ref0 = reference_region(&term, 0);
+
+        // 打入前 500 字（恰好抵达标记之前），触发对照区下滚
+        let prefix: String = long_raw.chars().take(500).collect();
+        app.session.type_text(&prefix);
+        term.draw(|f| ui(f, &app)).unwrap();
+        let ref500 = reference_region(&term, 0);
+
+        // 在线赛文对照区应随打字下滚：两时刻可见正文不同，
+        // 且第 500 字处的标记应已进入对照区可见范围。
+        assert_ne!(
+            ref0, ref500,
+            "在线赛文对照区应随打字下滚，可见正文应改变"
+        );
+        assert!(
+            ref500.contains(&marker_str),
+            "对照区应已滚动到第 500 字附近，包含标记 {}",
+            marker_str
+        );
+    }
+
+    /// 提取「跟打区」可见正文（跟打区标题行之后、快捷键栏之前）。`sidebar_width` 含义同上。
+    fn typing_region(
+        term: &ratatui::Terminal<ratatui::backend::TestBackend>,
+        sidebar_width: u16,
+    ) -> String {
+        let buf = term.backend().buffer();
+        let w = buf.area.width;
+        let h = buf.area.height;
+        let full_rows: Vec<String> = (0..h)
+            .map(|y| {
+                (0..w)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    .replace(' ', "")
+            })
+            .collect();
+        let content_rows: Vec<String> = (0..h)
+            .map(|y| {
+                (sidebar_width..w)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    .replace(' ', "")
+            })
+            .collect();
+        let type_title = full_rows
+            .iter()
+            .position(|r| r.contains("跟打区"))
+            .expect("缓冲区应包含跟打区标题");
+        let help_title = full_rows
+            .iter()
+            .position(|r| r.contains("快捷键"))
+            .expect("缓冲区应包含快捷键栏");
+        let start = type_title + 1;
+        let end = help_title.saturating_sub(1);
+        content_rows[start..end].join("\n")
+    }
+
+    #[test]
+    fn test_online_reference_and_typing_stay_aligned() {
+        // 验证：在线赛文跟打时，对照区与跟打区首行可见正文应一致（同一行原文），
+        // 即对照区随打字滚动且与跟打区同步，不会停滞/错位。
+        let base: Vec<char> = (0..800)
+            .map(|i| std::char::from_u32(0x4E00 + (i % 800) as u32).unwrap_or('字'))
+            .collect();
+        let long_raw: String = base.iter().collect();
+
+        let text = Text {
+            title: "在线长文".to_string(),
+            content: long_raw.clone(),
+            source: TextSource::Online {
+                competition_type: CompetitionType::Jisu,
+            },
+            word_boundaries: None,
+            shuffled: false,
+        };
+        let mut app = test_app(text); // 保留默认侧边栏可见，贴近真实使用
+
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+
+        // 打入 400 字（跨越多行，触发滚动）
+        let prefix: String = long_raw.chars().take(400).collect();
+        app.session.type_text(&prefix);
+
+        term.draw(|f| ui(f, &app)).unwrap();
+        let ref_region = reference_region(&term, 24);
+        let type_region = typing_region(&term, 24);
+
+        let ref_first = ref_region.lines().find(|l| !l.is_empty()).unwrap_or("");
+        let type_first = type_region.lines().find(|l| !l.is_empty()).unwrap_or("");
+
+        assert!(
+            !ref_first.is_empty() && !type_first.is_empty(),
+            "对照区与跟打区首行均应有可见正文"
+        );
+        assert_eq!(
+            ref_first, type_first,
+            "对照区与跟打区首行应显示同一行原文（滚动同步）；对照区首行={} 跟打区首行={}",
+            ref_first, type_first
         );
     }
 
