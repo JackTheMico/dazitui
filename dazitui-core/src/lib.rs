@@ -28,8 +28,9 @@ pub use scheme::{
 pub use segmenter::{WordIndex, WordToken, prewarm_segmenter};
 pub use session::{CharStatus, ErrorPoint, ErrorType, GROUP_SIZE, Session, Stats, TypeResult};
 pub use settings::{
-    BuiltinProgress, FONT_SIZE_PT, HeatmapLayout, KeyboardMode, Rgb, Settings, SettingsStore,
-    Theme, ThemePreset, normalize_scheme_to_id, osc_font_size_sequence,
+    BuiltinProgress, FONT_SIZE_PT, HeatmapLayout, KeyboardMode, RankColumnConfig, RankColumnId,
+    Rgb, Settings, SettingsStore, Theme, ThemePreset, normalize_scheme_to_id,
+    osc_font_size_sequence,
 };
 
 #[cfg(feature = "online")]

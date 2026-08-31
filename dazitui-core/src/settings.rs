@@ -358,6 +358,161 @@ pub struct BuiltinProgress {
 }
 
 /// 应用外观设置。
+/// 在线排行榜可展示的列标识（v2：可配置显隐）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RankColumnId {
+    /// 排名。
+    Rank,
+    /// 用户名。
+    Username,
+    /// 速度（WPM）。
+    Speed,
+    /// 输入法。
+    InputMethod,
+}
+
+impl RankColumnId {
+    /// 固定展示顺序（与默认表头一致）。
+    pub const ALL: [RankColumnId; 4] = [
+        RankColumnId::Rank,
+        RankColumnId::Username,
+        RankColumnId::Speed,
+        RankColumnId::InputMethod,
+    ];
+    /// 持久化紧凑键。
+    pub fn key(&self) -> &'static str {
+        match self {
+            RankColumnId::Rank => "rank",
+            RankColumnId::Username => "username",
+            RankColumnId::Speed => "speed",
+            RankColumnId::InputMethod => "input_method",
+        }
+    }
+    /// 展示用标题。
+    pub fn title(&self) -> &'static str {
+        match self {
+            RankColumnId::Rank => "排名",
+            RankColumnId::Username => "用户名",
+            RankColumnId::Speed => "速度(WPM)",
+            RankColumnId::InputMethod => "输入法",
+        }
+    }
+    /// 列最小宽度（显示宽度），至少容纳标题。
+    pub fn min_width(&self) -> usize {
+        match self {
+            RankColumnId::Rank => 5,
+            RankColumnId::Username => 20,
+            RankColumnId::Speed => 11,
+            RankColumnId::InputMethod => 12,
+        }
+    }
+    /// 数值列右对齐。
+    pub fn align_right(&self) -> bool {
+        matches!(self, RankColumnId::Rank | RankColumnId::Speed)
+    }
+    /// 由持久化键解析。
+    pub fn from_key(s: &str) -> Option<RankColumnId> {
+        match s.trim() {
+            "rank" => Some(RankColumnId::Rank),
+            "username" => Some(RankColumnId::Username),
+            "speed" => Some(RankColumnId::Speed),
+            "input_method" => Some(RankColumnId::InputMethod),
+            _ => None,
+        }
+    }
+}
+
+/// 在线排行榜各列的显隐配置（默认全部显示）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RankColumnConfig {
+    /// 排名列。
+    pub rank: bool,
+    /// 用户名列。
+    pub username: bool,
+    /// 速度列。
+    pub speed: bool,
+    /// 输入法列。
+    pub input_method: bool,
+}
+
+impl Default for RankColumnConfig {
+    /// 默认全部列可见。
+    fn default() -> Self {
+        Self {
+            rank: true,
+            username: true,
+            speed: true,
+            input_method: true,
+        }
+    }
+}
+
+impl RankColumnConfig {
+    /// 该列是否可见。
+    pub fn is_visible(&self, id: RankColumnId) -> bool {
+        match id {
+            RankColumnId::Rank => self.rank,
+            RankColumnId::Username => self.username,
+            RankColumnId::Speed => self.speed,
+            RankColumnId::InputMethod => self.input_method,
+        }
+    }
+    /// 设置该列显隐；至少保留一列可见，避免空表。
+    pub fn set_visible(&mut self, id: RankColumnId, visible: bool) {
+        if !visible && self.visible_count() <= 1 {
+            return;
+        }
+        match id {
+            RankColumnId::Rank => self.rank = visible,
+            RankColumnId::Username => self.username = visible,
+            RankColumnId::Speed => self.speed = visible,
+            RankColumnId::InputMethod => self.input_method = visible,
+        }
+    }
+    /// 当前可见列数量。
+    pub fn visible_count(&self) -> usize {
+        [self.rank, self.username, self.speed, self.input_method]
+            .iter()
+            .filter(|&&v| v)
+            .count()
+    }
+    /// 可见列标识（固定顺序），供渲染遍历。
+    pub fn visible_ids(&self) -> Vec<RankColumnId> {
+        RankColumnId::ALL
+            .iter()
+            .copied()
+            .filter(|&id| self.is_visible(id))
+            .collect()
+    }
+    /// 持久化键：逗号分隔的可见列标识；全显时即四个键。
+    pub fn to_keys(&self) -> String {
+        self.visible_ids()
+            .iter()
+            .map(|id| id.key())
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+    /// 从持久化键解析：列出的为可见列，未列出者视为隐藏。
+    /// 空串或全不可识别时回退全显，避免空表。
+    pub fn apply_keys(&mut self, s: &str) {
+        let mut cfg = RankColumnConfig {
+            rank: false,
+            username: false,
+            speed: false,
+            input_method: false,
+        };
+        for tok in s.split(',') {
+            if let Some(id) = RankColumnId::from_key(tok) {
+                cfg.set_visible(id, true);
+            }
+        }
+        if cfg.visible_count() == 0 {
+            cfg = RankColumnConfig::default();
+        }
+        *self = cfg;
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
     /// 主题预设。
@@ -386,6 +541,8 @@ pub struct Settings {
     pub monitor_scheme: bool,
     /// 各内置赛文的练习进度（跨会话保留），key 为赛文名。
     pub builtin_progress: HashMap<String, BuiltinProgress>,
+    /// 在线排行榜各列显隐配置（v2：可定制展示哪些列，默认全显）。
+    pub rank_columns: RankColumnConfig,
 }
 
 impl Settings {
@@ -446,6 +603,7 @@ impl Default for Settings {
             code_hint: false,
             monitor_scheme: true,
             builtin_progress: HashMap::new(),
+            rank_columns: RankColumnConfig::default(),
         }
     }
 }
@@ -515,7 +673,7 @@ impl SettingsStore {
             std::fs::create_dir_all(parent)?;
         }
         let mut content = format!(
-            "theme={}\nreference_ratio={}\nbold={}\nkeyboard_mode={}\nscheme={}\ninput_method={}\nheatmap_layout={}\ngroup_size={}\ncode_hint={}\nmonitor_scheme={}\n",
+            "theme={}\nreference_ratio={}\nbold={}\nkeyboard_mode={}\nscheme={}\ninput_method={}\nheatmap_layout={}\ngroup_size={}\ncode_hint={}\nmonitor_scheme={}\nrank_columns={}\n",
             settings.theme.as_str(),
             settings.reference_ratio,
             settings.bold,
@@ -526,6 +684,7 @@ impl SettingsStore {
             settings.group_size,
             settings.code_hint,
             settings.monitor_scheme,
+            settings.rank_columns.to_keys(),
         );
         for (scheme, path) in &settings.scheme_dict_paths {
             content.push_str(&format!("scheme_dict.{}={}\n", scheme, path));
@@ -611,6 +770,7 @@ impl SettingsStore {
                         settings.group_size = Settings::clamp_group_size(size);
                     }
                 }
+                "rank_columns" => settings.rank_columns.apply_keys(value),
                 _ => {
                     if let Some(scheme) = key
                         .strip_prefix("scheme_dict.")
@@ -789,6 +949,7 @@ mod tests {
             code_hint: false,
             monitor_scheme: true,
             builtin_progress: HashMap::new(),
+            rank_columns: RankColumnConfig::default(),
         };
         store.save(&s).unwrap();
         assert_eq!(store.load(), s);
@@ -1192,6 +1353,41 @@ mod tests {
             store.load().monitor_scheme,
             "旧配置缺省 monitor_scheme 时应默认 true"
         );
+        let _ = std::fs::remove_file(store.path());
+    }
+
+    #[test]
+    fn rank_columns_roundtrips_through_store() {
+        let store = SettingsStore::new(temp_path("rank_columns_roundtrip"));
+        let mut s = Settings::default();
+        // 隐藏「用户名」与「输入法」两列，仅保留排名/速度。
+        s.rank_columns.set_visible(RankColumnId::Username, false);
+        s.rank_columns.set_visible(RankColumnId::InputMethod, false);
+        assert_eq!(s.rank_columns.visible_count(), 2);
+        store.save(&s).unwrap();
+        let loaded = store.load();
+        assert!(loaded.rank_columns.is_visible(RankColumnId::Rank));
+        assert!(loaded.rank_columns.is_visible(RankColumnId::Speed));
+        assert!(!loaded.rank_columns.is_visible(RankColumnId::Username));
+        assert!(!loaded.rank_columns.is_visible(RankColumnId::InputMethod));
+        // 至少保留一列：尝试关掉最后一列应被拒绝。
+        let mut all = Settings::default();
+        all.rank_columns.set_visible(RankColumnId::Rank, false);
+        all.rank_columns.set_visible(RankColumnId::Username, false);
+        all.rank_columns.set_visible(RankColumnId::Speed, false);
+        assert!(
+            all.rank_columns.is_visible(RankColumnId::InputMethod),
+            "至少应保留一列可见"
+        );
+        let _ = std::fs::remove_file(store.path());
+    }
+
+    #[test]
+    fn rank_columns_absent_in_old_file_defaults_all_visible() {
+        let store = SettingsStore::new(temp_path("rank_columns_absent"));
+        std::fs::write(store.path(), "theme=catppuccin-mocha\nreference_ratio=62\n").unwrap();
+        let loaded = store.load();
+        assert_eq!(loaded.rank_columns.visible_count(), 4, "旧配置缺列应默认全显");
         let _ = std::fs::remove_file(store.path());
     }
 }
