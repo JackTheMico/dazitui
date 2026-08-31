@@ -11,8 +11,8 @@ use dazitui_core::ThemePreset;
 use dazitui_core::normalize_online_content;
 use dazitui_core::{
     ApiClient, ApiError, AuthSession, BUILTIN_SETS, BuiltinProgress, BuiltinSet, CharStatus,
-    CodeHint, CompetitionRank, CompetitionType, DbTask, DbWorker, ErrorRecordItem, ErrorType,
-    HeatmapLayout,
+    CodeHint, CompetitionRank, CompetitionRankRow, CompetitionType, DbTask, DbWorker,
+    ErrorRecordItem, ErrorType, HeatmapLayout, RankColumnConfig, RankColumnId,
     HintCell, HintHand, KeyboardMode, KeypressRecordItem, LoadError, LoadOptions, Rgb, SchemeDict,
     SchemeInfo, Session, SessionRecord, Settings, SettingsStore, Stats, StatsDb, Text, TextSource,
     Theme, TokenStore, default_rime_data_dir, discover_schemes, env_credentials,
@@ -240,6 +240,46 @@ struct OnlineRankState {
     boards: HashMap<CompetitionType, RankBoard>,
     /// 全局错误提示（网络失败等），优先于各 board 局部错误展示。
     error: Option<String>,
+}
+
+/// 在线排行榜「自定义列」弹窗：列出四列并支持勾选显隐。
+#[derive(Debug, Default)]
+struct RankColumnModal {
+    /// 当前高亮选中的列下标（对应 `RankColumnId::ALL` 顺序）。
+    selected: usize,
+}
+
+/// 列定制弹窗的按键动作。
+enum RankColumnModalAction {
+    /// 关闭弹窗（并落盘）。
+    Close,
+    /// 维持打开。
+    None,
+}
+
+/// 处理列定制弹窗按键：↑↓/kj 移动选择，Space 切换显隐，Esc/q/Q 关闭。
+fn rank_column_modal_input(
+    modal: &mut RankColumnModal,
+    config: &mut RankColumnConfig,
+    key: KeyEvent,
+) -> RankColumnModalAction {
+    let n = RankColumnId::ALL.len();
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => {
+            modal.selected = modal.selected.wrapping_sub(1) % n;
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            modal.selected = (modal.selected + 1) % n;
+        }
+        KeyCode::Char(' ') => {
+            let id = RankColumnId::ALL[modal.selected];
+            let visible = config.is_visible(id);
+            config.set_visible(id, !visible);
+        }
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => return RankColumnModalAction::Close,
+        _ => {}
+    }
+    RankColumnModalAction::None
 }
 
 /// 跟打应用状态。
@@ -773,6 +813,8 @@ struct App {
     scheme_loader: SchemeLoader,
     /// 异步排行榜加载器：后台线程拉取比赛榜单，经通道回传，主循环每帧 poll（避免 TUI 冻结）。
     rank_loader: RankLoader,
+    /// 在线排行榜「自定义列」弹窗（`None` = 未打开）。
+    rank_column_modal: Option<RankColumnModal>,
     /// 方案源文件热监控器（issue #91/#93/#94）。`None` 表示 `notify` 初始化失败，
     /// 此时安全降级为「不监控」（不影响既有加载/切换逻辑）。
     /// 开/关开关（设置项 `monitor_scheme`，默认开启）由 #96 接入；关闭时
@@ -1058,6 +1100,7 @@ impl App {
             scheme_loading: None,
             scheme_loader: SchemeLoader::new(),
             rank_loader: RankLoader::new(),
+            rank_column_modal: None,
             scheme_watcher: scheme_watcher::SchemeWatcher::new().ok(),
             scheme_watch_paths: None,
             scheme_reload_pending_at: None,
@@ -1249,6 +1292,17 @@ impl App {
         });
         self.fetch_rank(CompetitionType::Jisu, &date);
         Ok(())
+    }
+
+    /// 打开「自定义列」弹窗（从在线排行榜视图内）。
+    fn open_rank_column_modal(&mut self) {
+        self.rank_column_modal = Some(RankColumnModal::default());
+    }
+
+    /// 关闭「自定义列」弹窗，并将当前列显隐配置落盘持久化。
+    fn close_rank_column_modal(&mut self) {
+        self.rank_column_modal = None;
+        let _ = self.settings_store.save(&self.settings);
     }
 
     /// 触发指定比赛榜单的后台拉取：先标记该 Tab 加载中，再派发后台线程。
@@ -2313,6 +2367,20 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                     }
                     continue;
                 }
+                // 列定制弹窗打开时优先处理其按键（↑↓ 选择 / Space 切换 / Esc 完成）。
+                if app.rank_column_modal.is_some() {
+                    let action = rank_column_modal_input(
+                        app.rank_column_modal
+                            .as_mut()
+                            .expect("rank_column_modal open"),
+                        &mut app.settings.rank_columns,
+                        key,
+                    );
+                    if matches!(action, RankColumnModalAction::Close) {
+                        app.close_rank_column_modal();
+                    }
+                    continue;
+                }
                 if is_open_login(key) {
                     app.open_login();
                     continue;
@@ -2973,6 +3041,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                         KeyCode::Char('r') | KeyCode::Char('R') => app.refresh_rank(),
                         KeyCode::Up | KeyCode::Char('k') => app.rank_scroll(-1),
                         KeyCode::Down | KeyCode::Char('j') => app.rank_scroll(1),
+                        KeyCode::Char('c') | KeyCode::Char('C') => app.open_rank_column_modal(),
                         _ => {}
                     },
                     AppState::Countdown { source, .. } => {
@@ -3820,6 +3889,10 @@ fn render_online_rank_view(frame: &mut Frame, app: &App, rank_state: &OnlineRank
     let inner = outer.inner(total_area);
     frame.render_widget(outer, total_area);
 
+    // 主内容区 + 底部快捷键栏（占 3 行），与其他全屏视图（统计等）保持一致。
+    let [content_area, hint_area] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(3)]).areas(inner);
+
     // 三 Tab 行：极速杯 / 锦标赛 / 键神杯，当前 Tab 高亮（顺序由 `CompetitionType::ALL` 统一）。
     let mut tab_spans: Vec<Span> = Vec::new();
     for (i, ct) in CompetitionType::ALL.iter().enumerate() {
@@ -3838,7 +3911,7 @@ fn render_online_rank_view(frame: &mut Frame, app: &App, rank_state: &OnlineRank
     // 榜单区内容（按当前 Tab 的缓存状态分支：加载 / 错误 / 空 / 表格）
     let board = rank_state.boards.get(&rank_state.active_tab);
     let [tab_area, body_area] =
-        Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).areas(inner);
+        Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).areas(content_area);
     frame.render_widget(
         Paragraph::new(Line::from(tab_spans))
             .alignment(ratatui::layout::Alignment::Center),
@@ -3879,13 +3952,69 @@ fn render_online_rank_view(frame: &mut Frame, app: &App, rank_state: &OnlineRank
                     let [bar_area, table_area] =
                         Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(body_area);
                     frame.render_widget(Paragraph::new(rankbar), bar_area);
-                    render_rank_table(frame, &palette, data, my_rank, b.scroll, table_area);
+                    let visible = app.settings.rank_columns.visible_ids();
+                    render_rank_table(
+                        frame,
+                        &palette,
+                        data,
+                        my_rank,
+                        b.scroll,
+                        table_area,
+                        &visible,
+                    );
                 }
                 None => render_rank_note(frame, body_area, "加载中…", palette.muted),
             },
         },
         None => render_rank_note(frame, body_area, "加载中…", palette.muted),
     }
+
+    // 底部快捷键提示栏（圆角边框 + 结构化标题），与统计视图一致。
+    let hint = " 1/2/3 比赛 | Tab/←→ 切换 | ↑↓ 滚动 | R 刷新 | Esc/q 返回 ";
+    let hint_title = Line::from(vec![Span::styled(
+        " 快捷键 ",
+        Style::default().bold().fg(palette.accent),
+    )]);
+    frame.render_widget(
+        Paragraph::new(hint_bar_line(hint, &palette))
+            .block(themed_block(&palette, false).title(hint_title)),
+        hint_area,
+    );
+}
+
+/// 在线排行榜「自定义列」弹窗：居中列出四列，带勾选与选中高亮。
+fn render_rank_column_modal(frame: &mut Frame, app: &App, palette: &ThemePalette) {
+    let Some(modal) = app.rank_column_modal.as_ref() else {
+        return;
+    };
+    let area = centered_rect(frame.area(), 40, 11);
+    frame.render_widget(Clear, area);
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(" 自定义展示列 ").bold().fg(palette.fg));
+    lines.push(Line::from(""));
+    for (i, id) in RankColumnId::ALL.iter().enumerate() {
+        let checked = if app.settings.rank_columns.is_visible(*id) {
+            "[x]"
+        } else {
+            "[ ]"
+        };
+        let mark = if i == modal.selected { "▸" } else { " " };
+        let style = if i == modal.selected {
+            Style::default().fg(palette.accent).bold()
+        } else {
+            Style::default().fg(palette.fg)
+        };
+        lines.push(Line::from(format!(" {mark} {checked} {}", id.title())).style(style));
+    }
+    lines.push(Line::from(""));
+    lines.push(hint_bar_line(
+        " ↑↓ 选择 | Space 切换 | Esc 完成 ",
+        palette,
+    ));
+    let block = themed_block(palette, true)
+        .title(" 自定义列 ")
+        .style(Style::default().bg(palette.bg).fg(palette.fg));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 /// 榜单区居中提示（加载中 / 空数据等）。
@@ -3897,8 +4026,43 @@ fn render_rank_note(frame: &mut Frame, area: Rect, note: &str, color: Color) {
     );
 }
 
-/// 渲染四列榜单：排名 / 用户名 / 速度(WPM) / 输入法，按 `scroll` 偏移可滚动。
-/// 列宽在窄终端下等比缩小以适配可用宽度，避免溢出（#105）。
+/// 取某行在指定列上的展示文本。
+fn rank_cell_value(id: RankColumnId, row: &CompetitionRankRow) -> String {
+    match id {
+        RankColumnId::Rank => row.rank.to_string(),
+        RankColumnId::Username => row.username.clone(),
+        RankColumnId::Speed => format!("{:.2}", row.speed),
+        RankColumnId::InputMethod => row.input_method.clone(),
+    }
+}
+
+/// 按可见列与可用宽度计算各列宽度：宽终端放大填满，窄终端等比缩小（每列下限 4）。
+fn compute_rank_column_widths(visible: &[RankColumnId], avail: usize) -> Vec<usize> {
+    let mins: Vec<usize> = visible.iter().map(|id| id.min_width()).collect();
+    let total_min: usize = mins.iter().sum();
+    if total_min == 0 {
+        return mins;
+    }
+    if avail <= total_min {
+        return mins.iter().map(|m| (*m).max(4)).collect();
+    }
+    // 放大到填满 avail：按比例分配余量，最少保留各列 min；舍入误差修正到最后一列。
+    let slack = avail - total_min;
+    let mut widths: Vec<usize> = mins.clone();
+    let mut distributed: usize = 0;
+    for i in 0..mins.len() {
+        let add = ((mins[i] as f64 / total_min as f64) * slack as f64).round() as usize;
+        widths[i] += add;
+        distributed += add;
+    }
+    let diff = slack as isize - distributed as isize;
+    let last = widths.len() - 1;
+    widths[last] = (widths[last] as isize + diff).max(mins[last] as isize) as usize;
+    widths
+}
+
+/// 渲染榜单：仅展示 `visible` 指定的列（顺序即 `RankColumnId::ALL` 中可见者），
+/// 按 `scroll` 偏移可滚动；当前用户行高亮。列宽按可见列动态分配（#105/#108 列定制）。
 fn render_rank_table(
     frame: &mut Frame,
     palette: &ThemePalette,
@@ -3906,48 +4070,40 @@ fn render_rank_table(
     my_rank: Option<u32>,
     scroll: u16,
     area: Rect,
+    visible: &[RankColumnId],
 ) {
     let accent = Style::default().fg(palette.accent).bold();
     let fg = Style::default().fg(palette.fg);
-    // 各列最小宽度（排名/用户名/速度/输入法），窄终端等比缩放。
-    let min_widths: [usize; 4] = [5, 20, 9, 12];
-    let min_total: usize = min_widths.iter().sum();
-    let avail = area.width as usize;
-    let widths = if avail >= min_total {
-        min_widths
-    } else {
-        let mut w = min_widths;
-        let scale = avail as f64 / min_total as f64;
-        for slot in w.iter_mut() {
-            *slot = ((*slot as f64 * scale).max(4.0)) as usize;
-        }
-        w
-    };
-    let header = Line::from(vec![
-        Span::styled(pad_display("排名", widths[0], true), accent),
-        Span::styled(pad_display("用户名", widths[1], false), accent),
-        Span::styled(pad_display("速度(WPM)", widths[2], true), accent),
-        Span::styled(pad_display("输入法", widths[3], false), accent),
-    ]);
+    let widths = compute_rank_column_widths(visible, area.width as usize);
+    let mut header_spans: Vec<Span> = Vec::new();
+    for (i, &id) in visible.iter().enumerate() {
+        header_spans.push(Span::styled(
+            pad_display(id.title(), widths[i], id.align_right()),
+            accent,
+        ));
+    }
+    let header = Line::from(header_spans);
     let available = area.height.saturating_sub(1) as usize;
     let rows = &data.rank_result;
     let max_scroll = rows.len().saturating_sub(available);
     let start = (scroll as usize).min(max_scroll);
     let mut lines = vec![header];
     for row in rows.iter().skip(start).take(available) {
-        let speed = format!("{:.2}", row.speed);
         // 当前用户所在行高亮（与名次条呼应）。
         let row_style = if Some(row.rank) == my_rank {
             Style::default().fg(palette.accent).bold()
         } else {
             fg
         };
-        lines.push(Line::from(vec![
-            Span::styled(pad_display(&row.rank.to_string(), widths[0], true), row_style),
-            Span::styled(pad_display(&row.username, widths[1], false), row_style),
-            Span::styled(pad_display(&speed, widths[2], true), row_style),
-            Span::styled(pad_display(&row.input_method, widths[3], false), row_style),
-        ]));
+        let mut spans: Vec<Span> = Vec::new();
+        for (i, &id) in visible.iter().enumerate() {
+            let val = rank_cell_value(id, row);
+            spans.push(Span::styled(
+                pad_display(&val, widths[i], id.align_right()),
+                row_style,
+            ));
+        }
+        lines.push(Line::from(spans));
     }
     frame.render_widget(Paragraph::new(lines), area);
 }
@@ -3997,6 +4153,11 @@ fn ui(frame: &mut Frame, app: &App) {
     }
     if let AppState::OnlineRank(rank_state) = &app.state {
         render_online_rank_view(frame, app, rank_state);
+        // 列定制弹窗为覆盖层，需在返回前渲染（否则被 OnlineRank 提前 return 跳过）。
+        if app.rank_column_modal.is_some() {
+            let palette = app.palette();
+            render_rank_column_modal(frame, app, &palette);
+        }
         return;
     }
     let palette = app.palette();
@@ -11464,6 +11625,240 @@ mod tests {
         assert!(clean.contains("输入法"), "应包含表头「输入法」");
         assert!(clean.contains("虹"), "应包含榜首用户名「虹」");
         assert!(clean.contains("197.18"), "应渲染榜首速度");
+    }
+
+    #[test]
+    fn render_online_rank_view_renders_bottom_help_bar() {
+        let data = CompetitionRank {
+            rank_result: vec![dazitui_core::CompetitionRankRow {
+                rank: 1,
+                username: "虹".into(),
+                speed: 197.18,
+                input_method: "虎码".into(),
+                ..Default::default()
+            }],
+            my_rank_result: vec![],
+            total: 1,
+            text_title: "t".into(),
+            text_length: 100,
+        };
+        let state = OnlineRankState {
+            active_tab: CompetitionType::Jisu,
+            date: "2026-08-30".into(),
+            boards: HashMap::from([(
+                CompetitionType::Jisu,
+                RankBoard {
+                    data: Some(data),
+                    loading: false,
+                    error: None,
+                    scroll: 0,
+                },
+            )]),
+            error: None,
+        };
+        let mut app = test_app(file_text("x"));
+        app.state = AppState::OnlineRank(state);
+
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| ui(f, &app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let content = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let clean = content.replace(' ', "");
+        assert!(clean.contains("快捷键"), "排行榜应渲染底部快捷键栏标题「快捷键」");
+        assert!(clean.contains("返回"), "快捷键栏应包含「返回」提示");
+        assert!(clean.contains("刷新"), "快捷键栏应包含「刷新」提示");
+        assert!(clean.contains("切换"), "快捷键栏应包含「切换」提示");
+    }
+
+    /// 列定制弹窗应列出全部四列，并据 `settings.rank_columns` 显隐渲染 `[x]`/`[ ]`。
+    #[test]
+    fn rank_column_modal_lists_columns_with_checkbox_state() {
+        let data = CompetitionRank {
+            rank_result: vec![dazitui_core::CompetitionRankRow {
+                rank: 1,
+                username: "虹".into(),
+                speed: 197.18,
+                input_method: "虎码".into(),
+                ..Default::default()
+            }],
+            my_rank_result: vec![],
+            total: 1,
+            text_title: "t".into(),
+            text_length: 100,
+        };
+        let state = OnlineRankState {
+            active_tab: CompetitionType::Jisu,
+            date: "2026-08-30".into(),
+            boards: HashMap::from([(
+                CompetitionType::Jisu,
+                RankBoard {
+                    data: Some(data),
+                    loading: false,
+                    error: None,
+                    scroll: 0,
+                },
+            )]),
+            error: None,
+        };
+        let mut app = test_app(file_text("x"));
+        app.state = AppState::OnlineRank(state);
+        // 默认全显：把「输入法」藏起来，验证勾选框反映显隐。
+        app.settings.rank_columns.set_visible(RankColumnId::InputMethod, false);
+        app.rank_column_modal = Some(RankColumnModal::default());
+
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| ui(f, &app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let content = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let clean = content.replace(' ', "");
+        assert!(clean.contains("自定义列"), "弹窗应显示标题「自定义列」");
+        for title in ["排名", "用户名", "速度(WPM)", "输入法"] {
+            assert!(clean.contains(title), "弹窗应列出列「{}」", title);
+        }
+        assert!(clean.contains("[x]"), "可见列应渲染为已勾选 `[x]`");
+        // 注意：`[ ]` 中间带空格，去除空白后变为 `[]`。
+        assert!(clean.contains("[]"), "隐藏列「输入法」应渲染为未勾选 `[ ]`");
+        // 快捷键提示按 `◖key◗desc` 渲染，键与描述间有符号，故分开断言。
+        assert!(clean.contains("Space"), "弹窗提示应含 Space 键");
+        assert!(clean.contains("切换"), "弹窗提示应含「切换」描述");
+        assert!(clean.contains("Esc"), "弹窗提示应含 Esc 键");
+        assert!(clean.contains("完成"), "弹窗提示应含「完成」描述");
+    }
+
+    /// `rank_column_modal_input` 的 Space 应切换显隐写入 `config`，且至少保留 1 列；Esc 返回 Close。
+    #[test]
+    fn rank_column_modal_space_toggles_visibility_and_keeps_at_least_one() {
+        let mut config = RankColumnConfig::default();
+        assert_eq!(config.visible_count(), 4, "默认应四列全显");
+
+        // 选中第 3 列（速度，下标 2），Space 隐藏它。
+        let mut modal = RankColumnModal { selected: 2 };
+        let action = rank_column_modal_input(
+            &mut modal,
+            &mut config,
+            KeyEvent::from(KeyCode::Char(' ')),
+        );
+        assert!(matches!(action, RankColumnModalAction::None));
+        assert!(!config.is_visible(RankColumnId::Speed), "Space 后应隐藏速度列");
+        assert_eq!(config.visible_count(), 3);
+
+        // 再按 Space 恢复显示。
+        rank_column_modal_input(
+            &mut modal,
+            &mut config,
+            KeyEvent::from(KeyCode::Char(' ')),
+        );
+        assert!(config.is_visible(RankColumnId::Speed), "再次 Space 应恢复显示");
+        assert_eq!(config.visible_count(), 4);
+
+        // 隐藏到仅剩 1 列后，Space 隐藏最后一列应被拒绝。
+        config.set_visible(RankColumnId::Rank, false);
+        config.set_visible(RankColumnId::Username, false);
+        config.set_visible(RankColumnId::Speed, false);
+        assert_eq!(config.visible_count(), 1, "应只剩输入法列");
+        let mut last = RankColumnModal { selected: 3 };
+        rank_column_modal_input(
+            &mut last,
+            &mut config,
+            KeyEvent::from(KeyCode::Char(' ')),
+        );
+        assert!(
+            config.is_visible(RankColumnId::InputMethod),
+            "至少应保留 1 列可见，最后一列不允许被隐藏"
+        );
+        assert_eq!(config.visible_count(), 1);
+
+        // ↑/↓ 在边界取模回绕。
+        let mut wrap = RankColumnModal { selected: 0 };
+        rank_column_modal_input(&mut wrap, &mut config, KeyEvent::from(KeyCode::Up));
+        assert_eq!(wrap.selected, RankColumnId::ALL.len() - 1, "上移到顶应回绕到末列");
+        rank_column_modal_input(&mut wrap, &mut config, KeyEvent::from(KeyCode::Down));
+        assert_eq!(wrap.selected, 0, "下移到末应回绕到首列");
+
+        // Esc 返回 Close 动作。
+        let mut esc_modal = RankColumnModal::default();
+        let close = rank_column_modal_input(
+            &mut esc_modal,
+            &mut config,
+            KeyEvent::from(KeyCode::Esc),
+        );
+        assert!(matches!(close, RankColumnModalAction::Close));
+    }
+
+    /// 隐藏某列后，榜单表头不再渲染该列标题，其余可见列仍正常出现（#108 列定制）。
+    #[test]
+    fn render_online_rank_view_only_renders_visible_columns() {
+        let data = CompetitionRank {
+            rank_result: vec![dazitui_core::CompetitionRankRow {
+                rank: 1,
+                username: "虹".into(),
+                speed: 197.18,
+                input_method: "虎码".into(),
+                ..Default::default()
+            }],
+            my_rank_result: vec![],
+            total: 1,
+            text_title: "t".into(),
+            text_length: 100,
+        };
+        let state = OnlineRankState {
+            active_tab: CompetitionType::Jisu,
+            date: "2026-08-30".into(),
+            boards: HashMap::from([(
+                CompetitionType::Jisu,
+                RankBoard {
+                    data: Some(data),
+                    loading: false,
+                    error: None,
+                    scroll: 0,
+                },
+            )]),
+            error: None,
+        };
+        let mut app = test_app(file_text("x"));
+        app.state = AppState::OnlineRank(state);
+        // 隐藏「输入法」列，保留其余三列。
+        app.settings.rank_columns.set_visible(RankColumnId::InputMethod, false);
+        assert_eq!(app.settings.rank_columns.visible_count(), 3);
+
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| ui(f, &app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let content = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let clean = content.replace(' ', "");
+        assert!(
+            !clean.contains("输入法"),
+            "隐藏「输入法」列后表头不应再出现该标题"
+        );
+        assert!(clean.contains("用户名"), "其余可见列（用户名）应仍出现");
+        assert!(clean.contains("速度(WPM)"), "其余可见列（速度）应仍出现");
     }
 
     #[test]
