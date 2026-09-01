@@ -14,7 +14,13 @@
 //!    真实文件，否则监控的是软链 inode，收不到真实改动。
 //! 3. **`set_paths` 可重复调用**：先移除旧监控、再加入新监控，因此「切换方案」时能安全重建
 //!    监控闭包。
+//! 4. **只读访问不算改动**（issue #109 根因）：Linux/inotify 后端会把「打开」与「读完关闭」
+//!    也上报为 `Access(Open(Any))` / `Access(Close(Read))`。而热重载本身就是重新解析这些
+//!    `.dict.yaml`——若把读事件当成改动，就形成「读文件 → 判定为已改动 → 再读一次」的自激
+//!    循环，表现为右上角「方案加载中」角标约每秒闪一次（用户并未改动任何方案）。因此
+//!    `drain_changed` 只接受真正表示内容/元数据变化的事件。
 
+use notify::event::{AccessKind, AccessMode, EventKind};
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -76,12 +82,15 @@ impl SchemeWatcher {
         }
     }
 
-    /// 非阻塞排空事件通道：当且仅当其中有「命中被监控文件集合」的事件时返回 `true`。
-    /// 无事件、仅有未监控路径的事件、或 `notify` 内部错误事件时返回 `false`。
+    /// 非阻塞排空事件通道：当且仅当其中有「命中被监控文件集合」的**变更类**事件时返回 `true`。
+    /// 无事件、仅有未监控路径的事件、仅只读访问事件、或 `notify` 内部错误事件时返回 `false`。
     pub fn drain_changed(&mut self) -> bool {
         let mut changed = false;
         while let Ok(res) = self.receiver.try_recv() {
             if let Ok(event) = res {
+                if !is_content_change(event.kind) {
+                    continue;
+                }
                 for p in &event.paths {
                     let canon = canonicalize(p);
                     if self.watched_files.contains(&canon) {
@@ -92,6 +101,24 @@ impl SchemeWatcher {
         }
         changed
     }
+}
+
+/// 事件是否表示「文件内容发生变化」。
+///
+/// 只读访问（`Access(Open(_))` / `Access(Close(Read))` / `Access(Read)`）必须排除：
+/// inotify 会为**读取者自己**产生这些事件，而热重载正是靠读取 `.dict.yaml` 完成的，
+/// 不过滤就会自激重载（issue #109，右上角「方案加载中」角标持续闪烁）。
+///
+/// `Access(Close(Write))`（inotify 的 `IN_CLOSE_WRITE`）保留为改动：它意味着有人
+/// 以写方式打开并关闭了该文件，是部分编辑器写入路径上的唯一信号。
+fn is_content_change(kind: EventKind) -> bool {
+    !matches!(
+        kind,
+        EventKind::Access(AccessKind::Any)
+            | EventKind::Access(AccessKind::Read)
+            | EventKind::Access(AccessKind::Open(_))
+            | EventKind::Access(AccessKind::Close(AccessMode::Read))
+    )
 }
 
 /// 规范路径：解析软链到真实文件；失败则回退原路径（与 `SchemeDict::source_paths` 策略一致）。
@@ -121,9 +148,41 @@ mod tests {
         f.sync_all().unwrap();
     }
 
+    /// 只读打开并读取文件内容（模拟热重载时解析 `.dict.yaml`）。
+    fn read_only(path: &Path) {
+        let content = std::fs::read(path).unwrap();
+        assert!(!content.is_empty());
+    }
+
     /// 等事件经后台线程投递到 mpsc 通道（inotify 事件有极短同步窗口）。
     fn settle() {
         sleep(Duration::from_millis(80));
+    }
+
+    #[test]
+    fn ignores_read_only_access_events() {
+        // T109（issue #109 回归）：只读打开文件不应被判为改动。
+        // 热重载本身要重新解析 .dict.yaml，若读事件算改动，就会「读→判为改动→再读」
+        // 无限自激，用户界面上「方案加载中」角标每秒闪一次（用户并未改动任何方案）。
+        let dir = std::env::temp_dir().join(format!("dazitui_watch_read_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let file = touch(&dir, "a.dict.yaml");
+
+        let mut w = SchemeWatcher::new().unwrap();
+        w.set_paths(&[file.clone()]);
+        settle();
+
+        // 只读读取：不应触发。
+        read_only(&file);
+        settle();
+        assert!(!w.drain_changed(), "只读读取不应被当作改动");
+
+        // 真正的写入仍应触发（回归保护：过滤不能把真改动一起滤掉）。
+        modify(&file);
+        settle();
+        assert!(w.drain_changed(), "写入仍应触发改动");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
