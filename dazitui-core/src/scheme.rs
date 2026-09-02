@@ -25,6 +25,13 @@ pub struct SchemeDict {
     /// 主 `.dict.yaml`、以及经 `import_tables` 递归导入的所有 `.dict.yaml`。
     /// 供热监控器据此配置 watch 集合，无需重新扫目录。
     source_paths: Vec<PathBuf>,
+    /// 是否为「纯并击」方案（如空明码）。
+    ///
+    /// 纯并击方案的特征：其 `chord_composer.algebra` 通过 `xform|^\S{3,}$||` 之类的规则
+    /// 将长度 ≥ 3 的编码整体删除，约束所有可达编码均为单次并击（单码元）。在此类方案下，
+    /// 每条命中编码对应 **1 击**，而非按字符逐个数（不像 yoyo-pure-km 那样每个逻辑码元计 1 击）。
+    /// 该标记由 `load_from_file` 依据 algebra 规则自动判定，默认 false。
+    pure_chord: bool,
 }
 
 /// 规范路径：解析软链到真实文件，失败则回退原路径（与 watcher canonicalize 策略一致）。
@@ -254,6 +261,13 @@ impl SchemeDict {
         self.chord_algebra.as_ref()
     }
 
+    /// 是否为纯并击方案（空明码式）：每条命中编码对应一次并击（1 击）。
+    ///
+    /// 由 `load_from_file` 依据 `chord_composer.algebra` 中是否存在「删除长码」规则自动判定。
+    pub fn is_pure_chord(&self) -> bool {
+        self.pure_chord
+    }
+
     /// 设置并击代数指法规则引擎。
     pub fn set_chord_algebra(&mut self, algebra: ChordAlgebra) {
         self.chord_algebra = Some(algebra);
@@ -307,6 +321,7 @@ impl SchemeDict {
             // 记录 schema 自身路径（热监控闭包的一部分）
             dict.source_paths.push(canonicalize_path(path));
 
+            dict.pure_chord = algebra.is_some() && rules_have_long_code_cap(&rules);
             if let Some(alg) = algebra {
                 dict.set_chord_algebra(alg);
             }
@@ -341,6 +356,8 @@ impl SchemeDict {
             if !rules.is_empty() {
                 dict.set_chord_algebra(ChordAlgebra::from_rules(&rules));
             }
+            dict.pure_chord =
+                dict.chord_algebra.is_some() && rules_have_long_code_cap(&rules);
             if let Some(name) = Self::extract_schema_name(&schema_candidate) {
                 dict.set_name(name);
             }
@@ -473,9 +490,31 @@ impl SchemeDict {
         }
         code.chars()
             .filter(|&c| {
-                c != '_' && c != '+' && c != '-' && c != '\'' && c != '/' && !c.is_whitespace()
+                c != '_'
+                    && c != '+'
+                    && c != '-'
+                    && c != '\''
+                    && c != '/'
+                    && c != '='
+                    && !c.is_whitespace()
             })
             .count() as u32
+    }
+
+    /// 计算指定编码在当前方案下的实际击数（结合 `pure_chord` 标记）。
+    ///
+    /// - 纯并击方案（空明码式）：每条命中编码对应一次并击，固定记 **1 击**，
+    ///   不受编码字符长度影响（`a=` 与 `Ab` 同为 1 击）。
+    /// - 其他方案（如 yoyo-pure-km）：沿用「每个独立逻辑码元计 1 击」模型
+    ///   （见 [`SchemeDict::calculate_code_strokes`]）。
+    pub fn code_strokes(&self, code: &str) -> u32 {
+        if code.is_empty() {
+            return 0;
+        }
+        if self.pure_chord {
+            return 1;
+        }
+        Self::calculate_code_strokes(code)
     }
 
     /// 解析指定文本对应的物理击数与展开的按键列表。
@@ -488,7 +527,7 @@ impl SchemeDict {
             return (0, Vec::new());
         }
         if let Some(code) = self.get_primary_code(text) {
-            let strokes = Self::calculate_code_strokes(code).max(1);
+            let strokes = self.code_strokes(code).max(1);
             let keys = self.decompose_code(code);
             return (strokes, keys);
         }
@@ -504,7 +543,7 @@ impl SchemeDict {
             for len in (1..=(chars.len() - start)).rev() {
                 let sub: String = chars[start..start + len].iter().collect();
                 if let Some(code) = self.get_primary_code(&sub) {
-                    let strokes = Self::calculate_code_strokes(code).max(1);
+                    let strokes = self.code_strokes(code).max(1);
                     let keys = self.decompose_code(code);
                     total_strokes += strokes;
                     all_keys.extend(keys);
@@ -650,8 +689,8 @@ impl SchemeDict {
         };
         let best = pool
             .iter()
-            .min_by_key(|c| (Self::calculate_code_strokes(c), c.len()))?;
-        Some(((*best).clone(), Self::calculate_code_strokes(best)))
+            .min_by_key(|c| (self.code_strokes(c), c.len()))?;
+        Some(((*best).clone(), self.code_strokes(best)))
     }
 
     /// 取某词条「优先简码（击数最少）、其次并击/全码」的编码及其击数；未登录返回 `None`。
@@ -676,9 +715,9 @@ impl SchemeDict {
             } else {
                 0
             };
-            (Self::calculate_code_strokes(c), pref, c.len())
+            (self.code_strokes(c), pref, c.len())
         })?;
-        Some((best.clone(), Self::calculate_code_strokes(best)))
+        Some((best.clone(), self.code_strokes(best)))
     }
 
     /// 分解编码为物理按键序列。
@@ -919,6 +958,18 @@ fn is_left_hand_key(c: char) -> bool {
 fn is_right_hand_key(c: char) -> bool {
     let lower = c.to_ascii_lowercase();
     "67890yuiophjkl;nm,./".contains(lower) || c == ';' || c == ',' || c == '.' || c == '/'
+}
+
+fn rules_have_long_code_cap(rules: &[String]) -> bool {
+    rules.iter().any(|r| {
+        if let Some((pat, rep)) = parse_xform_rule(r) {
+            // parse_xform_rule 会剥除反斜杠：`^\S{3,}$` → `^S{3,}$`。
+            // 长码删除规则形如 `xform|^\S{3,}$||`（replacement 为空，pattern 以 ^S{ 起、}$ 止）。
+            rep.is_empty() && pat.starts_with("^S{") && pat.ends_with("}$")
+        } else {
+            false
+        }
+    })
 }
 
 /// 解析 `xform` 规则：`xform|pattern|replacement|` 或 `xform/pattern/replacement/`。
@@ -1468,6 +1519,8 @@ pub fn resolve_scheme_path_via_discovery(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::Session;
+    use std::time::Duration;
 
     #[test]
     fn test_plain_tsv_dict_parsing() {
@@ -2002,6 +2055,87 @@ algebra:
         assert_eq!(SchemeDict::calculate_code_strokes("%_v"), 1);
         assert_eq!(SchemeDict::calculate_code_strokes("%+X"), 1);
         assert_eq!(SchemeDict::calculate_code_strokes("%XY"), 1);
+    }
+
+    #[test]
+    fn calculate_code_strokes_filters_chord_terminator() {
+        // 空明码式并击终止符 `=` 应被过滤（与 `-` 一致），不计入击数。
+        // 注意：纯并击方案的「整码=1并击」由 code_strokes/pure_chord 负责，
+        // 此处仅验证静态方法在回退路径下不会把 `=` 错算成独立一击。
+        assert_eq!(SchemeDict::calculate_code_strokes("a="), 1);
+        assert_eq!(SchemeDict::calculate_code_strokes("y="), 1);
+        // 无 `=` 的多字符码（如非纯并击方案的逐码元计数）仍按字符数计。
+        assert_eq!(SchemeDict::calculate_code_strokes("Ab"), 2);
+    }
+
+    #[test]
+    fn kongming_pure_chord_counts_one_stroke_per_code() {
+        // 空明码为纯并击方案：每条命中编码（无论字符长度）对应 1 次并击 = 1 击。
+        // schema 通过 `xform|^\S{3,}$||` 删除长码，约束所有可达编码为单次并击。
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!("dazitui_km_pure_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let schema = dir.join("km.schema.yaml");
+        let dict = dir.join("km.dict.yaml");
+        // 最小复现：含长码删除规则的 chord_composer.algebra + 空明码式编码（a= / Ab / U-）。
+        let schema_content = "schema:\n  name: 空明码测试\n  schema_id: km\ntranslator:\n  dictionary: km\nchord_composer:\n  algebra:\n    - xform|a|b|\n    - xform|^\\S{3,}$||\n";
+        fs::write(&schema, schema_content).unwrap();
+        fs::write(&dict, "啊\ta=\n艾\tAb\n是\tU-\n").unwrap();
+
+        let loaded = SchemeDict::load_from_file(&schema).expect("加载空明码测试方案");
+        assert!(
+            loaded.pure_chord,
+            "含长码删除规则应判定为纯并击（pure_chord=true）"
+        );
+
+        // 单键并击 a= ：a 与 `=` 同按 = 1 并击 = 1 击（此前被错算成 2 击）。
+        let (s_ah, _) = loaded.resolve_strokes_and_keys("啊");
+        assert_eq!(s_ah, 1, "单键并击 a= 应计 1 击");
+        // 双键并击 Ab ：A 与 b 同按 = 1 并击 = 1 击（此前被错算成 2 击）。
+        let (s_ai, _) = loaded.resolve_strokes_and_keys("艾");
+        assert_eq!(s_ai, 1, "双键并击 Ab 应计 1 击（整码=1并击）");
+        // U- 整码（2 键并击）亦为 1 击。
+        let (s_shi, _) = loaded.resolve_strokes_and_keys("是");
+        assert_eq!(s_shi, 1, "U- 应计 1 击");
+
+        // 复合文本按「每命中编码 1 并击」累加：两字 = 2 击。
+        let (s_combo, _) = loaded.resolve_strokes_and_keys("啊艾");
+        assert_eq!(s_combo, 2, "两字应计 2 并击");
+
+        // 码长口径校验：总击数 / 已上屏字数 = 1.0（修复前约 2.0）。
+        let mut session = Session::new("啊艾");
+        session.type_text_with_strokes_at("啊", s_ah, Duration::from_secs(1));
+        session.type_text_with_strokes_at("艾", s_ai, Duration::from_secs(2));
+        let stats = session.finish(Duration::from_secs(2));
+        assert_eq!(stats.key_length, 1.0, "空明码码长应≈1.0（修复前约2.0）");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn non_pure_chord_scheme_keeps_per_codeunit_counting() {
+        // yoyo-pure-km 等非纯并击方案：每个逻辑码元计 1 击，且不会被误判为 pure_chord。
+        // 用自带长码规则缺失的 schema 验证回退行为。
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!("dazitui_np_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let schema = dir.join("yp.schema.yaml");
+        let dict = dir.join("yp.dict.yaml");
+        // 无长码删除规则，不应判定为纯并击。
+        let schema_content = "schema:\n  name: 非纯并击\n  schema_id: yp\ntranslator:\n  dictionary: yp\nchord_composer:\n  algebra:\n    - xform|abcdef|Z|\n";
+        fs::write(&schema, schema_content).unwrap();
+        fs::write(&dict, "是\twCs\n").unwrap();
+
+        let loaded = SchemeDict::load_from_file(&schema).expect("加载非纯并击方案");
+        assert!(
+            !loaded.pure_chord,
+            "无长码删除规则不应判定为纯并击"
+        );
+        // 多码元编码仍按码元数计击（wCs = w + C + s = 3 击）。
+        let (s, _) = loaded.resolve_strokes_and_keys("是");
+        assert_eq!(s, 3, "非纯并击方案 wCs 应计 3 击");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
