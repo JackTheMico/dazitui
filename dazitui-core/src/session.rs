@@ -53,9 +53,9 @@ struct TypingEvent {
 /// 跟打进行中的实时指标读数（用于 TUI 对照区右下角实时渲染）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct RealtimeMetrics {
-    /// 累计平均 WPM（正确字数 / 已用时分钟）。
+    /// 累计平均 WPM（总录入字数 / 已用时分钟，毛速度口径，错字不扣）。
     pub cumulative_wpm: f64,
-    /// 即时平滑 WPM（近 2.0 秒滑动窗口）。
+    /// 即时平滑 WPM（近 2.0 秒滑动窗口，含错字）。
     pub rolling_wpm: f64,
     /// 累计平均击速 KPS（总击数 / 已用时秒）。
     pub cumulative_kps: f64,
@@ -377,8 +377,11 @@ impl Session {
             return 0.0;
         }
         let (events, dt) = self.events_in_window(t, 2.0);
-        let correct_count = events.filter(|e| e.is_correct).count();
-        (correct_count as f64 / dt) * 60.0
+        // 毛速度口径：统计窗口内"实际录入的字符数"（含错字），退格不计入字符数。
+        let char_count = events
+            .filter(|e| !matches!(e.error, Some(ErrorType::Backspace { .. })))
+            .count();
+        (char_count as f64 / dt) * 60.0
     }
 
     /// 计算给定时间点 `t` 处的即时/平滑 KPS（基于 2 秒滑动窗口）。
@@ -460,16 +463,11 @@ impl Session {
     /// 获取当前时刻的实时复合指标（用于 TUI 对照区右下角实时渲染）。
     pub fn realtime_metrics(&self, elapsed: Duration) -> RealtimeMetrics {
         let secs = elapsed.as_secs_f64();
-        let statuses = self.align();
-        let correct = statuses
-            .iter()
-            .filter(|s| **s == CharStatus::Correct)
-            .count();
         let effective_secs = secs.max(0.5);
         let cumulative_wpm = if secs <= 0.0 {
             0.0
         } else {
-            (correct as f64 / effective_secs) * 60.0
+            (self.input.len() as f64 / effective_secs) * 60.0
         };
         let cumulative_kps = if secs <= 0.0 {
             0.0
@@ -502,13 +500,15 @@ impl Session {
             .count();
         let wrong = statuses.len() - correct;
         let total_secs = elapsed.as_secs_f64();
+        // 毛速度（52dazi 口径）：以"总录入字数"为分子，错字不扣速度。
+        let typed = self.input.len();
         let wpm = if total_secs <= 0.0 {
             0.0
         } else if total_secs < 0.5 {
             // 防御性保护：对于 <0.5s 的极短用时或单次瞬间上屏，按最小 0.5s 分母归一化并硬顶截断在 2000 WPM
-            (correct as f64 / 0.5 * 60.0).min(2000.0)
+            (typed as f64 / 0.5 * 60.0).min(2000.0)
         } else {
-            correct as f64 / total_secs * 60.0
+            typed as f64 / total_secs * 60.0
         };
         let kps = if total_secs <= 0.0 {
             0.0
@@ -1159,6 +1159,23 @@ mod tests {
         // 2 字 / 0.5s * 60 = 240 WPM，而非 579,433 WPM
         assert_eq!(stats.wpm, 240.0);
         assert!(stats.wpm <= 2000.0);
+    }
+
+    #[test]
+    fn finish_gross_wpm_includes_uncorrected_wrong_chars() {
+        // 52dazi 口径：错字不扣速度，毛速度按"总录入字数"计。
+        let mut session = Session::new("你好世界");
+        session.type_text("你好四"); // 「四」错且未改
+        let stats = session.finish(Duration::from_secs(60));
+        // 总录入 3 字 / 60s = 3 WPM（净口径下应为 2 WPM）
+        assert_eq!(stats.typed_chars, 3);
+        assert_eq!(stats.correct_chars, 2);
+        assert_eq!(stats.wrong_chars, 1);
+        assert!(
+            (stats.wpm - 3.0).abs() < 1e-9,
+            "毛速度 WPM 应为 3.0，得到 {}",
+            stats.wpm
+        );
     }
 
     #[test]
