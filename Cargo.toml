@@ -3,7 +3,7 @@ resolver = "2"
 members = ["dazitui-core", "dazitui"]
 
 [workspace.package]
-version = "1.0.6"
+version = "1.0.7"
 edition = "2024"
 license = "MIT"
 authors = ["JackTheMico"]
