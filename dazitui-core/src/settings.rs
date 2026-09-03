@@ -421,7 +421,7 @@ impl RankColumnId {
         match self {
             RankColumnId::Rank => "排名",
             RankColumnId::Username => "用户名",
-            RankColumnId::Speed => "速度(WPM)",
+            RankColumnId::Speed => "速度",
             RankColumnId::InputMethod => "输入法",
             RankColumnId::Keystrokes => "击键",
             RankColumnId::MaChang => "码长",

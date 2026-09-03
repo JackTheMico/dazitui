@@ -1531,7 +1531,7 @@ mod tests {
             .unwrap();
         assert_eq!(outcome.ranking.as_deref(), Some("3"));
         assert!(outcome.share_text.contains("第3名"));
-        assert!(outcome.share_text.contains("WPM 92.5"));
+        assert!(outcome.share_text.contains("速度 92.5"));
         assert_eq!(client.current_token().as_deref(), Some("tok-new-auto"));
 
         unsafe {
@@ -1604,7 +1604,7 @@ mod tests {
         let outcome = client
             .upload_session(&text, &stats, Duration::from_secs(10), "")
             .unwrap();
-        assert!(outcome.share_text.contains("WPM 88.0"));
+        assert!(outcome.share_text.contains("速度 88.0"));
         assert!(outcome.message.contains("上传成功"));
 
         server.join().unwrap();

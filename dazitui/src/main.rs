@@ -103,7 +103,7 @@ impl TrendMetric {
 
     fn label(self) -> &'static str {
         match self {
-            Self::Wpm => "WPM 词速",
+            Self::Wpm => "速度",
             Self::Kps => "KPS 击速",
         }
     }
@@ -4285,7 +4285,7 @@ fn ui(frame: &mut Frame, app: &App) {
                 )
             };
             let mut spans = vec![
-                Span::styled(" WPM ", Style::default().fg(palette.muted)),
+                Span::styled(" 速度 ", Style::default().fg(palette.muted)),
                 Span::styled(
                     format!("{:.1}", metrics.cumulative_wpm),
                     Style::default()
@@ -5552,7 +5552,7 @@ fn render_stats_view(frame: &mut Frame, app: &App, stats_state: &StatsViewState)
     // 3. 底部快捷键提示
     let hint_str = match stats_state.tab {
         StatsTab::WpmTrend => {
-            " 1/2/3 Tab | hl 左右 | r 范围 | v/s 切换指标(WPM/KPS) | Esc/q 返回 | o 设置 | Ctrl-Q 退出 "
+            " 1/2/3 Tab | hl 左右 | r 范围 | v/s 切换指标(速度/KPS) | Esc/q 返回 | o 设置 | Ctrl-Q 退出 "
         }
         StatsTab::Heatmap => {
             " 1/2/3 Tab | hl 左右 | L 键盘布局 | m 视角 | Esc/q 返回 | o 设置 | Ctrl-Q 退出 "
@@ -5633,13 +5633,13 @@ fn render_wpm_trend_tab(
         Line::from(vec![
             Span::styled(" 历史最高: ", Style::default().fg(palette.muted)),
             Span::styled(
-                format!("{:.1} WPM", summary.best_wpm),
+                format!("{:.1} 速度", summary.best_wpm),
                 Style::default().bold().fg(palette.accent),
             ),
             Span::raw("    "),
             Span::styled(" 历史均速: ", Style::default().fg(palette.muted)),
             Span::styled(
-                format!("{:.1} WPM", summary.avg_wpm),
+                format!("{:.1} 速度", summary.avg_wpm),
                 Style::default().bold().fg(palette.fg),
             ),
             Span::raw("    "),
@@ -5675,7 +5675,7 @@ fn render_wpm_trend_tab(
     let range_badge = range.label();
     let metric_badge = metric.label();
     let title_prefix = match metric {
-        TrendMetric::Wpm => "WPM",
+        TrendMetric::Wpm => "速度",
         TrendMetric::Kps => "KPS 击速",
     };
     let chart_title = Line::from(vec![
@@ -5707,7 +5707,7 @@ fn render_wpm_trend_tab(
     }
 
     let (dataset_raw_name, dataset_rolling_name, y_title, min_y_bound) = match metric {
-        TrendMetric::Wpm => ("单场 WPM", "10场滚动平均", "WPM", 30.0),
+        TrendMetric::Wpm => ("单场速度", "10场滚动平均", "速度", 30.0),
         TrendMetric::Kps => ("单场击速 (KPS)", "10场滚动平均", "KPS (击/秒)", 5.0),
     };
 
@@ -6945,7 +6945,7 @@ fn render_result_view(
     let accuracy = key_accuracy_pct(stats);
     let word_ratio = word_ratio_pct(&app.text, stats);
     let mut summary_lines = vec![Line::from(vec![
-        Span::raw(" 🚀WPM: "),
+        Span::raw(" 🚀速度: "),
         Span::styled(
             format!("{:.1}", stats.wpm),
             Style::default().bold().fg(palette.accent),
@@ -7143,7 +7143,7 @@ fn render_result_view(
 
     let datasets = vec![
         Dataset::default()
-            .name("WPM 速度")
+            .name("速度")
             .marker(Marker::Braille)
             .graph_type(GraphType::Line)
             .style(Style::default().fg(palette.accent).bg(palette.bg))
@@ -7157,7 +7157,7 @@ fn render_result_view(
         .unwrap_or(3) as u16;
 
     let chart_title = Line::from(vec![Span::styled(
-        " WPM 速度曲线 ",
+        " 速度曲线 ",
         Style::default()
             .fg(palette.accent)
             .add_modifier(Modifier::BOLD),
@@ -7178,7 +7178,7 @@ fn render_result_view(
         .y_axis(
             Axis::default()
                 .title(Span::styled(
-                    "WPM",
+                    "速度",
                     Style::default().fg(palette.muted).bg(palette.bg),
                 ))
                 .style(Style::default().fg(palette.muted).bg(palette.bg))
@@ -7339,7 +7339,7 @@ fn error_timeline_lines(
                     }),
                 ),
                 Span::styled(
-                    format!(" · WPM {:.1}", ep.wpm),
+                    format!(" · 速度 {:.1}", ep.wpm),
                     Style::default().fg(meta_fg),
                 ),
             ])
@@ -10456,7 +10456,7 @@ mod tests {
         // 仅保留「已复制到剪贴板」提示。
         let lines = upload_lines(
             &UploadState::NotApplicable {
-                copied_stats: Some("自由发文《日常》 · WPM 85.2".into()),
+                copied_stats: Some("自由发文《日常》 · 速度 85.2".into()),
             },
             theme,
             "",
@@ -10480,7 +10480,7 @@ mod tests {
             text.iter()
                 .any(|s| s.contains("第5名") && s.contains("已上传"))
         );
-        assert!(text.iter().all(|s| !s.contains("WPM 85.2")));
+        assert!(text.iter().all(|s| !s.contains("速度 85.2")));
         assert!(text.iter().any(|s| s.contains("上传名称: 虎码")));
         assert!(text.iter().any(|s| s.contains("已复制到剪贴板")));
         // 成功无排名：仍显示已上传；未配置上传名称时不显示该行。
@@ -10493,7 +10493,7 @@ mod tests {
                 message: "网络连接失败".into(),
                 need_relogin: false,
                 detail: Some("传输层错误详情".into()),
-                copied_stats: Some("离线赛文《t》 · WPM 85.2".into()),
+                copied_stats: Some("离线赛文《t》 · 速度 85.2".into()),
             },
             theme,
             "",
@@ -10556,7 +10556,7 @@ mod tests {
                 assert!(need_relogin);
                 assert_eq!(detail, None);
                 let cs = copied_stats.expect("未登录时也应把统计复制到剪贴板");
-                assert!(cs.contains("WPM"), "统计文本应含 WPM: {cs}");
+                assert!(cs.contains("速度"), "统计文本应含 速度: {cs}");
             }
             other => panic!("期望 Failed，得到 {other:?}"),
         }
@@ -10583,7 +10583,7 @@ mod tests {
                 let d = detail.expect("传输错误应透出原始错误详情供诊断");
                 assert!(!d.is_empty(), "原始错误详情不应为空: {d}");
                 let cs = copied_stats.expect("上传失败也应把统计复制到剪贴板");
-                assert!(cs.contains("WPM"), "统计文本应含 WPM: {cs}");
+                assert!(cs.contains("速度"), "统计文本应含 速度: {cs}");
             }
             other => panic!("期望 Failed，得到 {other:?}"),
         }
@@ -10649,7 +10649,7 @@ mod tests {
             AppState::Finished {
                 upload: UploadState::NotApplicable { copied_stats: Some(s) },
                 ..
-            } if s.starts_with("离线赛文《t》") && s.contains("WPM")
+            } if s.starts_with("离线赛文《t》") && s.contains("速度")
         ));
         // 自由发文：同样复制统计结果。
         let mut app = test_app(Text {
@@ -10677,7 +10677,7 @@ mod tests {
             AppState::Finished {
                 upload: UploadState::NotApplicable { copied_stats: Some(s) },
                 ..
-            } if s.starts_with("常用单字前五百") && s.contains("WPM")
+            } if s.starts_with("常用单字前五百") && s.contains("速度")
         ));
         let mut app = test_app(Text {
             title: "剪贴板赛文".into(),
@@ -10693,7 +10693,7 @@ mod tests {
             AppState::Finished {
                 upload: UploadState::NotApplicable { copied_stats: Some(s) },
                 ..
-            } if s.starts_with("剪贴板") && s.contains("WPM")
+            } if s.starts_with("剪贴板") && s.contains("速度")
         ));
         // 在线：进入成绩视图并置为「上传中」，返回成绩与用时。
         let mut app = test_app(online_text("你好"));
@@ -10903,7 +10903,7 @@ mod tests {
                 assert!(need_relogin);
                 assert_eq!(detail.as_deref(), Some("用户名不能为空！"));
                 let cs = copied_stats.expect("上传失败也应把统计复制到剪贴板");
-                assert!(cs.contains("WPM"), "统计文本应含 WPM: {cs}");
+                assert!(cs.contains("速度"), "统计文本应含 速度: {cs}");
             }
             other => panic!("期望 Failed，得到 {other:?}"),
         }
@@ -11143,7 +11143,7 @@ mod tests {
         };
 
         let content = render_buffer_text(&app, 100, 30);
-        assert!(!content.contains("WPM85.2"), "不应重复展示分享文本里的指标");
+        assert!(!content.contains("速度85.2"), "不应重复展示分享文本里的指标");
         assert!(content.contains("排名:第5名·已上传"), "应显示排名行");
         assert!(content.contains("已复制到剪贴板"), "应显示已复制提示");
     }
@@ -11370,7 +11370,7 @@ mod tests {
 
         let clean_content = content.replace(' ', "");
         assert!(clean_content.contains("成绩"));
-        assert!(clean_content.contains("WPM速度曲线"));
+        assert!(clean_content.contains("速度曲线"));
         assert!(clean_content.contains("错字时间线"));
         assert!(clean_content.contains("回改:'四'"));
         assert!(clean_content.contains("四"));
@@ -11901,7 +11901,7 @@ mod tests {
             .join("\n");
         let clean = content.replace(' ', "");
         assert!(clean.contains("自定义列"), "弹窗应显示标题「自定义列」");
-        for title in ["排名", "用户名", "速度(WPM)", "输入法"] {
+        for title in ["排名", "用户名", "速度", "输入法"] {
             assert!(clean.contains(title), "弹窗应列出列「{}」", title);
         }
         assert!(clean.contains("[x]"), "可见列应渲染为已勾选 `[x]`");
@@ -12044,7 +12044,7 @@ mod tests {
             "隐藏「输入法」列后表头不应再出现该标题"
         );
         assert!(clean.contains("用户名"), "其余可见列（用户名）应仍出现");
-        assert!(clean.contains("速度(WPM)"), "其余可见列（速度）应仍出现");
+        assert!(clean.contains("速度"), "其余可见列（速度）应仍出现");
     }
 
     #[test]
@@ -12810,7 +12810,7 @@ mod tests {
         if clean.contains("历史练习总览") {
             found_overview = true;
         }
-        if clean.contains("WPM历史演进趋势") {
+        if clean.contains("速度历史演进趋势") {
             found_chart_title = true;
         }
 
@@ -13481,7 +13481,7 @@ mod tests {
             .chars()
             .filter(|c| *c != ' ' && *c != '─')
             .collect();
-        assert!(clean_typing.contains("WPM"));
+        assert!(clean_typing.contains("速度"));
         assert!(clean_typing.contains("击键"));
 
         // 3. 暂停态（按 Tab / 调用 pause()）：显示 [暂停] 徽标且即时瞬时值锁定为 (0)
@@ -13524,7 +13524,7 @@ mod tests {
             .filter(|c| *c != ' ' && *c != '─')
             .collect();
         assert!(!clean_resumed.contains("[暂停]"));
-        assert!(clean_resumed.contains("WPM"));
+        assert!(clean_resumed.contains("速度"));
     }
 
     #[test]
@@ -14434,7 +14434,7 @@ mod tests {
         let clean = full_text.replace(' ', "");
         assert!(clean.contains("KPS击速历史演进趋势"));
         assert!(clean.contains("KPS(击/秒)"));
-        assert!(clean.contains("切换指标(WPM/KPS)"));
+        assert!(clean.contains("切换指标(速度/KPS)"));
     }
 
     #[test]
