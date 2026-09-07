@@ -202,6 +202,9 @@ pub fn theme_palette(preset: ThemePreset) -> ThemePalette {
         ThemePreset::RosePine => ThemeName::RosePine,
         ThemePreset::Kanagawa => ThemeName::Kanagawa,
         ThemePreset::OneDark => ThemeName::OneDarkPro,
+        ThemePreset::CatppuccinLatte => ThemeName::CatppuccinLatte,
+        ThemePreset::GruvboxLight => ThemeName::GruvboxLight,
+        ThemePreset::SolarizedLight => ThemeName::SolarizedLight,
     };
     name.palette()
 }
@@ -445,7 +448,7 @@ const INPUT_METHOD_PRESETS: &[&str] = &[
     "宇浩",
     "双拼",
     "全拼",
-    "空明码并击",
+    "空明码并击 374971723",
     "拼读并击",
     "麓鸣·空明·并击",
     "虎码并击",
@@ -9413,9 +9416,9 @@ mod tests {
             app.settings_store.load().theme,
             ThemePreset::CatppuccinMocha
         );
-        // 从 CatppuccinMocha 往上退绕到 OneDark。
+        // 从 CatppuccinMocha 往上退，绕到最后一个预设（亮色组的末尾）。
         app.prev_theme();
-        assert_eq!(app.settings.theme, ThemePreset::OneDark);
+        assert_eq!(app.settings.theme, ThemePreset::SolarizedLight);
     }
 
     #[test]
@@ -12440,9 +12443,9 @@ mod tests {
         // 验证循环回绕回到了第一个
         assert_eq!(app.settings.theme, ThemePreset::CatppuccinMocha);
 
-        // 验证向上反向循环
+        // 验证向上反向循环：从第一个退到最后一个预设（亮色组的末尾）。
         app.prev_theme();
-        assert_eq!(app.settings.theme, ThemePreset::OneDark);
+        assert_eq!(app.settings.theme, ThemePreset::SolarizedLight);
     }
 
     #[test]

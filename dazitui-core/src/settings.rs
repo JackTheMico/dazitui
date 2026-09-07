@@ -26,11 +26,17 @@ pub enum ThemePreset {
     Kanagawa,
     /// One Dark。
     OneDark,
+    /// Catppuccin Latte（亮色底）。
+    CatppuccinLatte,
+    /// Gruvbox Light（亮色底）。
+    GruvboxLight,
+    /// Solarized Light（亮色底）。
+    SolarizedLight,
 }
 
 impl ThemePreset {
-    /// 全部预设，按设置视图展示顺序排列。
-    pub const ALL: [ThemePreset; 8] = [
+    /// 全部预设，按设置视图展示顺序排列：先暗色底，后亮色底。
+    pub const ALL: [ThemePreset; 11] = [
         ThemePreset::CatppuccinMocha,
         ThemePreset::Cyberpunk,
         ThemePreset::Nord,
@@ -39,6 +45,9 @@ impl ThemePreset {
         ThemePreset::RosePine,
         ThemePreset::Kanagawa,
         ThemePreset::OneDark,
+        ThemePreset::CatppuccinLatte,
+        ThemePreset::GruvboxLight,
+        ThemePreset::SolarizedLight,
     ];
 
     /// 预设显示名（用于设置视图）。
@@ -52,6 +61,9 @@ impl ThemePreset {
             Self::RosePine => "Rosé Pine",
             Self::Kanagawa => "Kanagawa",
             Self::OneDark => "One Dark",
+            Self::CatppuccinLatte => "Catppuccin Latte",
+            Self::GruvboxLight => "Gruvbox Light",
+            Self::SolarizedLight => "Solarized Light",
         }
     }
 
@@ -66,6 +78,9 @@ impl ThemePreset {
             Self::RosePine => "rose-pine",
             Self::Kanagawa => "kanagawa",
             Self::OneDark => "one-dark",
+            Self::CatppuccinLatte => "catppuccin-latte",
+            Self::GruvboxLight => "gruvbox-light",
+            Self::SolarizedLight => "solarized-light",
         }
     }
 
@@ -81,6 +96,9 @@ impl ThemePreset {
             "rose-pine" | "rosepine" => Some(Self::RosePine),
             "kanagawa" => Some(Self::Kanagawa),
             "one-dark" | "onedark" => Some(Self::OneDark),
+            "catppuccin-latte" | "latte" => Some(Self::CatppuccinLatte),
+            "gruvbox-light" => Some(Self::GruvboxLight),
+            "solarized" | "solarized-light" => Some(Self::SolarizedLight),
             _ => None,
         }
     }
@@ -99,6 +117,14 @@ impl ThemePreset {
     pub fn prev(self) -> Self {
         let len = Self::ALL.len();
         Self::ALL[(self.index() + len - 1) % len]
+    }
+
+    /// 是否为亮色底主题（语义色取深色版，保证在浅色背景上可读）。
+    pub fn is_light(self) -> bool {
+        matches!(
+            self,
+            Self::CatppuccinLatte | Self::GruvboxLight | Self::SolarizedLight
+        )
     }
 }
 
@@ -220,6 +246,41 @@ impl Theme {
                 hand_left: Rgb(0xc6, 0x78, 0xdd),
                 hand_right: Rgb(0xe5, 0xc0, 0x7b),
                 hand_two: Rgb(0x56, 0xb6, 0xc2),
+            },
+            // 以下三组为亮色底主题：语义色一律取各自配色体系的深色版，
+            // 避免浅底浅字（尤其黄色系在白底上几乎不可读）。
+            ThemePreset::CatppuccinLatte => Self {
+                text: Rgb(0x4c, 0x4f, 0x69),
+                correct: Rgb(0x40, 0xa0, 0x2b),
+                wrong: Rgb(0xd2, 0x0f, 0x39),
+                accent: Rgb(0x1e, 0x66, 0xf5),
+                warn: Rgb(0xdf, 0x8e, 0x1d),
+                muted: Rgb(0x8c, 0x8f, 0xa1),
+                hand_left: Rgb(0xc0, 0x45, 0xa3),
+                hand_right: Rgb(0xb5, 0x6a, 0x00),
+                hand_two: Rgb(0x0f, 0x82, 0x8f),
+            },
+            ThemePreset::GruvboxLight => Self {
+                text: Rgb(0x3c, 0x38, 0x36),
+                correct: Rgb(0x79, 0x74, 0x0e),
+                wrong: Rgb(0x9d, 0x00, 0x06),
+                accent: Rgb(0x07, 0x66, 0x78),
+                warn: Rgb(0xb5, 0x76, 0x14),
+                muted: Rgb(0x92, 0x83, 0x74),
+                hand_left: Rgb(0x8f, 0x3f, 0x71),
+                hand_right: Rgb(0xaf, 0x3a, 0x03),
+                hand_two: Rgb(0x42, 0x7b, 0x58),
+            },
+            ThemePreset::SolarizedLight => Self {
+                text: Rgb(0x58, 0x6e, 0x75),
+                correct: Rgb(0x85, 0x99, 0x00),
+                wrong: Rgb(0xdc, 0x32, 0x2f),
+                accent: Rgb(0x26, 0x8b, 0xd2),
+                warn: Rgb(0xb5, 0x89, 0x00),
+                muted: Rgb(0x93, 0xa1, 0xa1),
+                hand_left: Rgb(0xd3, 0x36, 0x82),
+                hand_right: Rgb(0xcb, 0x4b, 0x16),
+                hand_two: Rgb(0x2a, 0xa1, 0x98),
             },
         }
     }
@@ -995,16 +1056,53 @@ mod tests {
             ThemePreset::parse("TOKYO_NIGHT"),
             Some(ThemePreset::CatppuccinMocha)
         );
-        assert_eq!(ThemePreset::parse("solarized"), None);
+        assert_eq!(
+            ThemePreset::parse("solarized"),
+            Some(ThemePreset::SolarizedLight)
+        );
+        assert_eq!(ThemePreset::parse("latte"), Some(ThemePreset::CatppuccinLatte));
+        assert_eq!(ThemePreset::parse("monokai"), None);
         assert_eq!(ThemePreset::parse(""), None);
     }
 
     #[test]
     fn preset_next_and_prev_wrap_around() {
         assert_eq!(ThemePreset::CatppuccinMocha.next(), ThemePreset::Cyberpunk);
-        assert_eq!(ThemePreset::OneDark.next(), ThemePreset::CatppuccinMocha);
-        assert_eq!(ThemePreset::CatppuccinMocha.prev(), ThemePreset::OneDark);
+        assert_eq!(ThemePreset::OneDark.next(), ThemePreset::CatppuccinLatte);
+        assert_eq!(
+            ThemePreset::CatppuccinMocha.prev(),
+            ThemePreset::SolarizedLight
+        );
+        assert_eq!(ThemePreset::SolarizedLight.next(), ThemePreset::CatppuccinMocha);
         assert_eq!(ThemePreset::Cyberpunk.prev(), ThemePreset::CatppuccinMocha);
+    }
+
+    #[test]
+    fn light_presets_are_flagged_and_dark_text() {
+        let light: Vec<ThemePreset> = ThemePreset::ALL
+            .iter()
+            .copied()
+            .filter(|p| p.is_light())
+            .collect();
+        assert_eq!(
+            light,
+            vec![
+                ThemePreset::CatppuccinLatte,
+                ThemePreset::GruvboxLight,
+                ThemePreset::SolarizedLight,
+            ]
+        );
+        // 亮色底的语义色必须比暗色底暗得多（感知亮度 < 128），否则浅底浅字不可读。
+        for p in light {
+            let t = Theme::preset(p);
+            for c in [
+                t.text, t.correct, t.wrong, t.accent, t.warn, t.muted, t.hand_left, t.hand_right,
+                t.hand_two,
+            ] {
+                let lum = (c.0 as u32 * 299 + c.1 as u32 * 587 + c.2 as u32 * 114) / 1000;
+                assert!(lum < 160, "{:?} 语义色 rgb{:?} 在亮色底上过浅", p, c);
+            }
+        }
     }
 
     #[test]

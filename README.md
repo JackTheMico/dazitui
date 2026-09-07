@@ -101,7 +101,9 @@ cargo build --release --bin dazitui
 - **❌ 高频错字 / 错词排行榜 Top 50**：结合内置赛文原生词边界与轻量 `jieba-rs` 中文分词引擎，精准定位高频失误词汇与薄弱单字。
 
 ### 🎨 6. 现代化主题与高度可定制 UI
-- **🌈 8 款内置经典主题**：Catppuccin Mocha、Cyberpunk 赛博霓虹、Nord、Dracula、Gruvbox Dark、Rosé Pine、Kanagawa、One Dark。
+- **🌈 11 款内置经典主题**：
+  - 暗色底 8 款：Catppuccin Mocha、Cyberpunk 赛博霓虹、Nord、Dracula、Gruvbox Dark、Rosé Pine、Kanagawa、One Dark。
+  - 亮色底 3 款：Catppuccin Latte、Gruvbox Light、Solarized Light。
 - **✨ 现代化视觉规范**：全界面圆角边框（Rounded Borders）、动态焦点高亮、多段结构化标题与胶囊按键提示。
 - **📐 布局与字号自适应**：对照区/跟打区垂直比例自由调节（30% - 80%），支持粗体开关与 Kitty 终端 OSC 50 字号增强。
 
