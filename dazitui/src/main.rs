@@ -8488,7 +8488,7 @@ mod tests {
 
     #[test]
     fn builtin_sets_in_order() {
-        assert_eq!(BUILTIN_SETS.len(), 7);
+        assert_eq!(BUILTIN_SETS.len(), 8);
         assert_eq!(BUILTIN_SETS[0].name(), "常用单字前五百");
         assert_eq!(BUILTIN_SETS[1].name(), "常用单字中五百");
         assert_eq!(BUILTIN_SETS[2].name(), "常用单字后五百");
@@ -8496,6 +8496,7 @@ mod tests {
         assert_eq!(BUILTIN_SETS[4].name(), "常用词组中五百");
         assert_eq!(BUILTIN_SETS[5].name(), "常用词组后五百");
         assert_eq!(BUILTIN_SETS[6].name(), "yoyo 单字");
+        assert_eq!(BUILTIN_SETS[7].name(), "空明码一击词");
     }
 
     #[test]

@@ -145,6 +145,9 @@ pub enum BuiltinSet {
     CommonWordsHou,
     /// yoyo 方案词典抽取的全部唯一单字（约 6640 字，即社区常说的「6636 单字无重」）。
     YoyoChars,
+    /// 空明码一击词：常用词组中在空明码方案里可单并击输入的词（按词频排序，618 词）。
+    /// 一击判定口径：Rime 词典中存在码长恰为 2 的条目（单并击），数据取自本仓库自有常用词表。
+    KongmingOneHitWords,
 }
 
 impl BuiltinSet {
@@ -158,6 +161,7 @@ impl BuiltinSet {
             Self::CommonWordsZhong => "常用词组中五百",
             Self::CommonWordsHou => "常用词组后五百",
             Self::YoyoChars => "yoyo 单字",
+            Self::KongmingOneHitWords => "空明码一击词",
         }
     }
 
@@ -165,7 +169,10 @@ impl BuiltinSet {
     pub fn is_words(&self) -> bool {
         matches!(
             self,
-            Self::CommonWordsQian | Self::CommonWordsZhong | Self::CommonWordsHou
+            Self::CommonWordsQian
+                | Self::CommonWordsZhong
+                | Self::CommonWordsHou
+                | Self::KongmingOneHitWords
         )
     }
 
@@ -179,6 +186,7 @@ impl BuiltinSet {
             Self::CommonWordsZhong => include_str!("../data/common-words-zhong.txt"),
             Self::CommonWordsHou => include_str!("../data/common-words-hou.txt"),
             Self::YoyoChars => include_str!("../data/yoyo-chars.txt"),
+            Self::KongmingOneHitWords => include_str!("../data/kongming-1hit-words.txt"),
         }
     }
 
@@ -227,7 +235,7 @@ impl BuiltinSet {
 }
 
 /// 所有内置赛文，按功能栏展示顺序。
-pub const BUILTIN_SETS: [BuiltinSet; 7] = [
+pub const BUILTIN_SETS: [BuiltinSet; 8] = [
     BuiltinSet::CommonCharsQian,
     BuiltinSet::CommonCharsZhong,
     BuiltinSet::CommonCharsHou,
@@ -235,6 +243,7 @@ pub const BUILTIN_SETS: [BuiltinSet; 7] = [
     BuiltinSet::CommonWordsZhong,
     BuiltinSet::CommonWordsHou,
     BuiltinSet::YoyoChars,
+    BuiltinSet::KongmingOneHitWords,
 ];
 
 /// 载入内置赛文：内容为纯字符串（已去除换行）。
@@ -822,6 +831,7 @@ mod tests {
             BuiltinSet::CommonWordsQian,
             BuiltinSet::CommonWordsZhong,
             BuiltinSet::CommonWordsHou,
+            BuiltinSet::KongmingOneHitWords,
         ] {
             let text = load_builtin_text(set);
             assert!(
@@ -887,9 +897,36 @@ mod tests {
                 BuiltinSet::CommonWordsQian
                     | BuiltinSet::CommonWordsZhong
                     | BuiltinSet::CommonWordsHou
+                    | BuiltinSet::KongmingOneHitWords
             );
             assert_eq!(set.is_words(), expected, "{} is_words 不正确", set.name());
         }
+    }
+
+    #[test]
+    fn kongming_one_hit_words_content_shape() {
+        // 空明码一击词：618 词、无重复、均为多字纯中文词、按词频排序首词「可以」。
+        let set = BuiltinSet::KongmingOneHitWords;
+        let words: Vec<&str> = set
+            .content()
+            .trim_end_matches(['\n', '\r'])
+            .split('，')
+            .collect();
+        assert_eq!(words.len(), 618, "空明码一击词应为 618 词");
+        let mut sorted = words.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), words.len(), "空明码一击词不应有重复");
+        for w in &words {
+            assert!(
+                w.chars().count() >= 2 && !w.chars().any(|c| c.is_ascii_alphanumeric()),
+                "空明码一击词含非法条目: {}",
+                w
+            );
+        }
+        assert_eq!(words[0], "可以", "首词应为词频最高的「可以」");
+        assert_eq!(set.name(), "空明码一击词");
+        assert!(set.is_words());
     }
 
     #[test]
