@@ -2,3 +2,5 @@
 /.reasonix
 /.codebase-memory/
 /.workbuddy/memory
+/.workbuddy/tmp
+/docs/research
