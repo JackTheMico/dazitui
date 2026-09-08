@@ -824,12 +824,9 @@ pub struct SettingsStore {
 }
 
 impl SettingsStore {
-    /// 默认存储路径：`~/.config/dazitui/settings`。
+    /// 默认存储路径：遵循跨平台规范（Linux: ~/.config/dazitui/settings，Windows: %APPDATA%/dazitui/settings）。
     pub fn with_default_path() -> Self {
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
-        Self::new(home.join(".config").join("dazitui").join("settings"))
+        Self::new(crate::paths::default_settings_path())
     }
 
     /// 指定路径的存储。

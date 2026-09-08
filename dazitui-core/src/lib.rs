@@ -4,6 +4,7 @@ use std::time::Duration;
 mod code_hint;
 mod db;
 mod lttb;
+pub mod paths;
 mod scheme;
 mod segmenter;
 mod session;

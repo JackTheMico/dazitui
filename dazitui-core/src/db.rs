@@ -285,17 +285,9 @@ impl StatsDb {
         Ok(db)
     }
 
-    /// 默认数据文件路径：~/.local/share/dazitui/stats.db。
+    /// 默认数据文件路径：遵循跨平台规范（Linux: ~/.local/share/dazitui/stats.db，Windows: %LOCALAPPDATA%/dazitui/stats.db）。
     pub fn default_path() -> PathBuf {
-        let data_home = std::env::var_os("XDG_DATA_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                let home = std::env::var_os("HOME")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| PathBuf::from("."));
-                home.join(".local").join("share")
-            });
-        data_home.join("dazitui").join("stats.db")
+        crate::paths::default_stats_db_path()
     }
 
     /// 打开默认路径下的统计数据库。

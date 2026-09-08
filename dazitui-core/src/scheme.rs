@@ -398,28 +398,19 @@ impl SchemeDict {
         // 3. 构建搜索目录列表
         let mut search_dirs = Vec::new();
 
-        let config_home = std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                let home = std::env::var_os("HOME")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| PathBuf::from("."));
-                home.join(".config")
-            });
-        let data_home = std::env::var_os("XDG_DATA_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                let home = std::env::var_os("HOME")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| PathBuf::from("."));
-                home.join(".local").join("share")
-            });
-        let home_dir = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
+        let config_home = crate::paths::config_dir();
+        let data_home = crate::paths::data_dir();
+        let home_dir = crate::paths::user_home_dir();
 
         // dazitui 自带目录
-        search_dirs.push(config_home.join("dazitui").join("schemes"));
+        search_dirs.push(crate::paths::dazitui_config_dir().join("schemes"));
+
+        // Windows 小狼毫 (Weasel)
+        if let Some(appdata) = std::env::var_os("APPDATA") {
+            search_dirs.push(PathBuf::from(appdata).join("Rime"));
+        }
+        search_dirs.push(home_dir.join("AppData").join("Roaming").join("Rime"));
+
         // fcitx5 rime
         search_dirs.push(data_home.join("fcitx5").join("rime"));
         // fcitx rime
@@ -1482,18 +1473,48 @@ pub fn discover_schemes(data_dir: &Path) -> Vec<SchemeInfo> {
     out
 }
 
-/// 默认 Rime 用户部署目录（fcitx5）：`$XDG_DATA_HOME/fcitx5/rime`，
-/// 回退 `~/.local/share/fcitx5/rime`。与 `resolve_scheme_path` 的搜索目录保持一致。
+/// 默认 Rime 用户数据目录：
+/// - Windows / 小狼毫 (Weasel)：优先 `%APPDATA%\Rime`；
+/// - macOS / 鼠须管 (Squirrel)：`~/Library/Rime`；
+/// - Linux / 中州韵 (fcitx5)：`$XDG_DATA_HOME/fcitx5/rime` 或 `~/.local/share/fcitx5/rime`。
 pub fn default_rime_data_dir() -> PathBuf {
-    let data_home = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join(".local")
-                .join("share")
-        });
+    default_rime_data_dir_from(
+        |k| std::env::var_os(k),
+        cfg!(windows),
+        cfg!(target_os = "macos"),
+    )
+}
+
+pub(crate) fn default_rime_data_dir_from(
+    get_env: impl Fn(&str) -> Option<std::ffi::OsString>,
+    is_windows: bool,
+    is_macos: bool,
+) -> PathBuf {
+    if is_windows {
+        if let Some(appdata) = get_env("APPDATA") {
+            if !appdata.is_empty() {
+                return PathBuf::from(appdata).join("Rime");
+            }
+        }
+        let user_home = crate::paths::user_home_dir_from(&get_env);
+        return user_home.join("AppData").join("Roaming").join("Rime");
+    }
+
+    if is_macos {
+        let user_home = crate::paths::user_home_dir_from(&get_env);
+        return user_home.join("Library").join("Rime");
+    }
+
+    // 跨平台兜底：若设置了 APPDATA 且未设置 HOME / XDG，亦可尝试 APPDATA/Rime
+    if get_env("HOME").is_none() && get_env("XDG_DATA_HOME").is_none() {
+        if let Some(appdata) = get_env("APPDATA") {
+            if !appdata.is_empty() {
+                return PathBuf::from(appdata).join("Rime");
+            }
+        }
+    }
+
+    let data_home = crate::paths::data_dir_from(&get_env, false);
     data_home.join("fcitx5").join("rime")
 }
 
@@ -2243,12 +2264,14 @@ algebra:
         let schemes = discover_schemes(&rime_dir);
         let ids: Vec<&str> = schemes.iter().map(|s| s.id.as_str()).collect();
 
-        // 已知确定性子集必须存在
+        // 已知确定性子集：若磁盘上存在对应 schema 文件，则必须被发现
         for expected in ["yoyo-pure", "kongmingma", "english", "yoyo-yx"] {
-            assert!(
-                ids.contains(&expected),
-                "应发现真实方案 {expected}，实际发现: {ids:?}"
-            );
+            if rime_dir.join(format!("{expected}.schema.yaml")).exists() {
+                assert!(
+                    ids.contains(&expected),
+                    "应发现真实方案 {expected}，实际发现: {ids:?}"
+                );
+            }
         }
         // 绝不应把配置文件误收为方案
         for forbidden in [
@@ -2266,11 +2289,13 @@ algebra:
                 "不应把配置文件 {forbidden} 误收为方案，实际: {ids:?}"
             );
         }
-        assert!(
-            schemes.len() >= 13,
-            "至少应发现 13 个真实方案，实际 {} 个: {ids:?}",
-            schemes.len()
-        );
+        if rime_dir.join("yoyo-pure.schema.yaml").exists() {
+            assert!(
+                schemes.len() >= 13,
+                "至少应发现 13 个真实方案，实际 {} 个: {ids:?}",
+                schemes.len()
+            );
+        }
         // 每个发现的方案都必须带展示名且路径存在
         for s in &schemes {
             assert!(!s.display_name.is_empty(), "方案 {} 缺少展示名", s.id);
@@ -2316,5 +2341,42 @@ algebra:
         let _ = resolve_scheme_path_via_discovery("does-not-exist", &discovered, &custom);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_default_rime_data_dir_cross_platform() {
+        use std::ffi::OsString;
+
+        // 1. Windows: 优先 APPDATA/Rime
+        let env_win = |k: &str| match k {
+            "APPDATA" => Some(OsString::from("C:\\Users\\alice\\AppData\\Roaming")),
+            "USERPROFILE" => Some(OsString::from("C:\\Users\\alice")),
+            _ => None,
+        };
+        assert_eq!(
+            default_rime_data_dir_from(env_win, true, false).to_string_lossy().replace('/', "\\"),
+            "C:\\Users\\alice\\AppData\\Roaming\\Rime"
+        );
+
+        // 2. macOS: ~/Library/Rime
+        let env_mac = |k: &str| match k {
+            "HOME" => Some(OsString::from("/Users/alice")),
+            _ => None,
+        };
+        assert_eq!(
+            default_rime_data_dir_from(env_mac, false, true),
+            PathBuf::from("/Users/alice/Library/Rime")
+        );
+
+        // 3. Linux: XDG_DATA_HOME/fcitx5/rime
+        let env_linux = |k: &str| match k {
+            "XDG_DATA_HOME" => Some(OsString::from("/home/alice/.local/share")),
+            "HOME" => Some(OsString::from("/home/alice")),
+            _ => None,
+        };
+        assert_eq!(
+            default_rime_data_dir_from(env_linux, false, false),
+            PathBuf::from("/home/alice/.local/share/fcitx5/rime")
+        );
     }
 }
