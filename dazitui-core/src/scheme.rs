@@ -503,8 +503,11 @@ impl SchemeDict {
 
     /// 计算指定编码在当前方案下的实际击数（结合 `pure_chord` 标记）。
     ///
-    /// - 纯并击方案（空明码式）：每条命中编码对应一次并击，固定记 **1 击**，
-    ///   不受编码字符长度影响（`a=` 与 `Ab` 同为 1 击）。
+    /// - 纯并击方案（如空明码等声韵并击方案）：
+    ///   - 空格并击简词（`%` 开头）计 1 击；
+    ///   - 单字并击（如 `a=`、`Ab`、`y'` 等长 1~2 编码）对应 1 次并击，计 1 击；
+    ///   - 双字词全码/双击词（如 `YJyY`、`bGCw`、`AB*=` 等长 3~4 编码）对应 2 次并击，计 2 击；
+    ///   - 多字长词按声韵并击模型 `clean_len.div_ceil(2)` 折算实际击数（过滤 `_`、`+`、`-` 与空白符）；
     /// - 其他方案（如 yoyo-pure-km）：沿用「每个独立逻辑码元计 1 击」模型
     ///   （见 [`SchemeDict::calculate_code_strokes`]）。
     pub fn code_strokes(&self, code: &str) -> u32 {
@@ -512,7 +515,14 @@ impl SchemeDict {
             return 0;
         }
         if self.pure_chord {
-            return 1;
+            if code.starts_with('%') {
+                return 1;
+            }
+            let clean_len = code
+                .chars()
+                .filter(|&c| c != '_' && c != '+' && c != '-' && !c.is_whitespace())
+                .count();
+            return (clean_len as u32).div_ceil(2).max(1);
         }
         Self::calculate_code_strokes(code)
     }
@@ -2077,10 +2087,15 @@ algebra:
         let _ = fs::create_dir_all(&dir);
         let schema = dir.join("km.schema.yaml");
         let dict = dir.join("km.dict.yaml");
-        // 最小复现：含长码删除规则的 chord_composer.algebra + 空明码式编码（a= / Ab / U-）。
+        // 最小复现：含长码删除规则的 chord_composer.algebra + 空明码式编码：
+        // 单字（a= / Ab / U-）、双字词（雨夜 YJyY）、四字词/成语（逼宫 bGCw）、长词（长词句 AACGs）。
         let schema_content = "schema:\n  name: 空明码测试\n  schema_id: km\ntranslator:\n  dictionary: km\nchord_composer:\n  algebra:\n    - xform|a|b|\n    - xform|^\\S{3,}$||\n";
         fs::write(&schema, schema_content).unwrap();
-        fs::write(&dict, "啊\ta=\n艾\tAb\n是\tU-\n").unwrap();
+        fs::write(
+            &dict,
+            "啊\ta=\n艾\tAb\n是\tU-\n雨夜\tYJyY\n逼宫\tbGCw\n长词句\tAACGs\n",
+        )
+        .unwrap();
 
         let loaded = SchemeDict::load_from_file(&schema).expect("加载空明码测试方案");
         assert!(
@@ -2088,26 +2103,41 @@ algebra:
             "含长码删除规则应判定为纯并击（pure_chord=true）"
         );
 
-        // 单键并击 a= ：a 与 `=` 同按 = 1 并击 = 1 击（此前被错算成 2 击）。
+        // 单键并击 a= ：a 与 `=` 同按 = 1 并击 = 1 击。
         let (s_ah, _) = loaded.resolve_strokes_and_keys("啊");
         assert_eq!(s_ah, 1, "单键并击 a= 应计 1 击");
-        // 双键并击 Ab ：A 与 b 同按 = 1 并击 = 1 击（此前被错算成 2 击）。
+        // 双键并击 Ab ：A 与 b 同按 = 1 并击 = 1 击。
         let (s_ai, _) = loaded.resolve_strokes_and_keys("艾");
-        assert_eq!(s_ai, 1, "双键并击 Ab 应计 1 击（整码=1并击）");
+        assert_eq!(s_ai, 1, "双键并击 Ab 应计 1 击");
         // U- 整码（2 键并击）亦为 1 击。
         let (s_shi, _) = loaded.resolve_strokes_and_keys("是");
         assert_eq!(s_shi, 1, "U- 应计 1 击");
 
-        // 复合文本按「每命中编码 1 并击」累加：两字 = 2 击。
-        let (s_combo, _) = loaded.resolve_strokes_and_keys("啊艾");
-        assert_eq!(s_combo, 2, "两字应计 2 并击");
+        // 双字词 YJyY ：两声韵并击 = 2 击（此前被误算为 1 击导致高打词率下码长腰斩为 0.5）。
+        let (s_yuye, _) = loaded.resolve_strokes_and_keys("雨夜");
+        assert_eq!(s_yuye, 2, "两字词 YJyY 应计 2 并击");
 
-        // 码长口径校验：总击数 / 已上屏字数 = 1.0（修复前约 2.0）。
-        let mut session = Session::new("啊艾");
+        // 四字词/成语 bGCw ：两声韵并击 = 2 击。
+        let (s_bigong, _) = loaded.resolve_strokes_and_keys("逼宫");
+        assert_eq!(s_bigong, 2, "成语 bGCw 应计 2 并击");
+
+        // 长词 AACGs (5码元) 应计 3 并击。
+        let (s_long, _) = loaded.resolve_strokes_and_keys("长词句");
+        assert_eq!(s_long, 3, "5码元长词 AACGs 应计 3 并击");
+
+        // 复合文本未命中整词时按贪心最长匹配累加：两字 = 2 击。
+        let (s_combo, _) = loaded.resolve_strokes_and_keys("啊艾");
+        assert_eq!(s_combo, 2, "两字未命中整词时应计 2 并击");
+
+        // 码长口径校验：单字 + 打词场景综合验证。
+        // "啊"(1击) + "艾"(1击) + "雨夜"(2击) = 4 个字，共 4 击，码长 1.0（修复前雨夜被算成 1 击导致码长跌至 0.75 / 0.5）。
+        let mut session = Session::new("啊艾雨夜");
         session.type_text_with_strokes_at("啊", s_ah, Duration::from_secs(1));
         session.type_text_with_strokes_at("艾", s_ai, Duration::from_secs(2));
-        let stats = session.finish(Duration::from_secs(2));
-        assert_eq!(stats.key_length, 1.0, "空明码码长应≈1.0（修复前约2.0）");
+        session.type_text_with_strokes_at("雨夜", s_yuye, Duration::from_secs(3));
+        let stats = session.finish(Duration::from_secs(3));
+        assert_eq!(stats.total_strokes, 4, "总击数应为 4 击（1+1+2）");
+        assert_eq!(stats.key_length, 1.0, "打词场景下空明码码长应稳定在 1.0 左右");
 
         let _ = fs::remove_dir_all(&dir);
     }
