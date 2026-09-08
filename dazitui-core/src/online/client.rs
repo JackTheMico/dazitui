@@ -191,13 +191,13 @@ pub struct CompetitionRankRow {
     #[serde(default, deserialize_with = "de_flex_num")]
     pub rank: u32,
     /// 用户名。
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_flex_str")]
     pub username: String,
     /// 速度（WPM）。
     #[serde(default, deserialize_with = "de_flex_num")]
     pub speed: f64,
     /// 输入法（如「虎码」）。
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_flex_str")]
     pub input_method: String,
     /// 击键（每秒按键数），v2 可配置列预留。
     #[serde(default, deserialize_with = "de_flex_num")]
@@ -206,7 +206,7 @@ pub struct CompetitionRankRow {
     #[serde(default, deserialize_with = "de_flex_num")]
     pub ma_chang: f64,
     /// 键准（百分号字符串），v2 可配置列预留。
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_flex_str")]
     pub jian_zhun: String,
     /// 键数，v2 可配置列预留。
     #[serde(default, deserialize_with = "de_flex_num")]
@@ -215,16 +215,16 @@ pub struct CompetitionRankRow {
     #[serde(default, deserialize_with = "de_flex_num")]
     pub hui_gai: u32,
     /// 打词率（百分号字符串），v2 可配置列预留。
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_flex_str")]
     pub da_ci: String,
     /// 用时（`MM:SS.mmm`），v2 可配置列预留。
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_flex_str")]
     pub typing_time: String,
     /// 设备（如「极速跟打器v1.82」），v2 可配置列预留。
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_flex_str")]
     pub from: String,
     /// 门派，v2 可配置列预留。
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_flex_str")]
     pub sect_name: String,
 }
 
@@ -242,17 +242,36 @@ pub struct CompetitionRank {
     #[serde(default, deserialize_with = "de_flex_num")]
     pub total: u32,
     /// 当期赛文标题（视图可显示）。
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_flex_str")]
     pub text_title: String,
     /// 当期赛文字数。
     #[serde(default, deserialize_with = "de_flex_num")]
     pub text_length: u32,
 }
 
+/// 灵活反序列化字符串：接受字符串、数字或 null（服务端对未填字段常返回 null，或数字编码）。
+fn de_flex_str<'de, D>(d: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum S {
+        Str(String),
+        Num(serde_json::Number),
+        Null,
+    }
+    match S::deserialize(d)? {
+        S::Str(s) => Ok(s),
+        S::Num(n) => Ok(n.to_string()),
+        S::Null => Ok(String::new()),
+    }
+}
+
 /// 灵活反序列化：数字或数字字符串都接受为数值类型 `T`（服务端数值字段多为字符串）。
 ///
 /// 服务端对「无数据」的统计字段（如 `keystrokes`/`maChang`/`jianShu`）会回传占位串
-/// `"--"`（或 `"-"`/空串），此时按 `T` 的缺省值（0）处理，而非令整条榜单解析失败。
+/// `"--"`（或 `"-"`/空串/null），此时按 `T` 的缺省值（0）处理，而非令整条榜单解析失败。
 fn de_flex_num<'de, D, T>(d: D) -> Result<T, D::Error>
 where
     D: Deserializer<'de>,
@@ -264,9 +283,11 @@ where
     enum V<T> {
         Num(T),
         Str(String),
+        Null,
     }
     match V::<T>::deserialize(d)? {
         V::Num(n) => Ok(n),
+        V::Null => Ok(T::default()),
         V::Str(s) => {
             let t = s.trim();
             // 占位串：仅含连字符/短横/空白（如 "--"、"-"、""）→ 视为缺省值。
@@ -843,6 +864,54 @@ mod tests {
         assert!((bad.ma_chang - 0.0).abs() < 1e-9);
         assert_eq!(bad.jian_shu, 0, "jianShu '--' 应回退为 0");
         assert_eq!(bad.hui_gai, 0, "huiGai '--' 应回退为 0");
+    }
+
+    #[test]
+    fn parse_competition_rank_handles_null_fields() {
+        // 服务端对未填或缺省字段可能回传 null，而非空字符串或省略键；
+        // 门派/设备等有时可能以数字返回。均应宽容容错，不使整榜解析失败。
+        let body = r#"{"error":0,"msg":{
+            "total": null,
+            "textTitle": null,
+            "textLength": null,
+            "rankResult": [
+                {
+                    "rank": 19,
+                    "username": null,
+                    "speed": null,
+                    "keystrokes": null,
+                    "maChang": null,
+                    "jianZhun": null,
+                    "jianShu": null,
+                    "huiGai": null,
+                    "daCi": null,
+                    "typingTime": null,
+                    "from": null,
+                    "sectName": 12345,
+                    "inputMethod": null
+                }
+            ],
+            "myRankResult": []
+        }}"#;
+        let r = parse_competition_rank_response(body).expect("含 null 字段的榜单行应解析成功");
+        assert_eq!(r.total, 0);
+        assert_eq!(r.text_title, "");
+        assert_eq!(r.text_length, 0);
+        assert_eq!(r.rank_result.len(), 1);
+        let row = &r.rank_result[0];
+        assert_eq!(row.rank, 19);
+        assert_eq!(row.username, "");
+        assert_eq!(row.speed, 0.0);
+        assert_eq!(row.keystrokes, 0.0);
+        assert_eq!(row.ma_chang, 0.0);
+        assert_eq!(row.jian_zhun, "");
+        assert_eq!(row.jian_shu, 0);
+        assert_eq!(row.hui_gai, 0);
+        assert_eq!(row.da_ci, "");
+        assert_eq!(row.typing_time, "");
+        assert_eq!(row.from, "");
+        assert_eq!(row.sect_name, "12345");
+        assert_eq!(row.input_method, "");
     }
 
     #[test]
@@ -1656,7 +1725,17 @@ mod tests {
         assert!(res.is_ok(), "极速杯载文应当成功: {res:?}");
         let text = res.unwrap();
         assert!(!text.content.is_empty(), "极速杯内容不应为空");
-        assert_eq!(text.title, "市井人间烟火的生活本真");
+    }
+
+    #[test]
+    #[ignore = "requires live 52dazi network access"]
+    fn real_gateway_get_competition_rank() {
+        let client = ApiClient::new();
+        let date = today_ymd();
+        let res = client.get_competition_rank(CompetitionType::Jisu, &date);
+        assert!(res.is_ok(), "极速杯排行榜应当获取成功: {res:?}");
+        let rank = res.unwrap();
+        assert!(!rank.rank_result.is_empty(), "极速杯榜单不应为空");
     }
 
     #[test]
