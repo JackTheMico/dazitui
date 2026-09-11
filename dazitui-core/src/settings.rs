@@ -1469,7 +1469,7 @@ mod tests {
         let store = SettingsStore::new(temp_path("builtin_progress_roundtrip"));
         let mut s = Settings::default();
         s.builtin_progress.insert(
-            "yoyo 单字".to_string(),
+            "常用单字前五百".to_string(),
             BuiltinProgress {
                 completed_groups: 37,
                 group_size: 20,
@@ -1479,14 +1479,14 @@ mod tests {
         let loaded = store.load();
         let p = loaded
             .builtin_progress
-            .get("yoyo 单字")
+            .get("常用单字前五百")
             .expect("进度应被持久化");
         assert_eq!(p.completed_groups, 37);
         assert_eq!(p.group_size, 20);
 
         // 清除后回退为空
         let mut s2 = loaded;
-        s2.builtin_progress.remove("yoyo 单字");
+        s2.builtin_progress.remove("常用单字前五百");
         store.save(&s2).unwrap();
         assert!(store.load().builtin_progress.is_empty());
         let _ = std::fs::remove_file(store.path());

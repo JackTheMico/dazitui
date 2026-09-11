@@ -14,8 +14,8 @@ mod settings;
 mod online;
 
 pub use code_hint::{
-    HintCell, HintHand, hint_cell_widths, layout_code_hint_grid, layout_code_hint_line,
-    pack_words_by_width,
+    HintCell, HintHand, KONGMING_1HIT_CHORDS, display_width, hint_cell_widths, kongming_1hit_hint,
+    layout_code_hint_grid, layout_code_hint_line, pack_words_by_width,
 };
 pub use db::{
     DbError, DbTask, DbWorker, ErrorRecordItem, GlobalStatsSummary, KeypressRecordItem,
@@ -144,11 +144,12 @@ pub enum BuiltinSet {
     CommonWordsZhong,
     /// 常用词组后五百。
     CommonWordsHou,
-    /// yoyo 方案词典抽取的全部唯一单字（约 6640 字，即社区常说的「6636 单字无重」）。
-    YoyoChars,
     /// 空明码一击词：常用词组中在空明码方案里可单并击输入的词（按词频排序，618 词）。
     /// 一击判定口径：Rime 词典中存在码长恰为 2 的条目（单并击），数据取自本仓库自有常用词表。
     KongmingOneHitWords,
+    /// 空明码一击字：空明码 208 槽位方案 B（极致速度·Top 100 全覆盖）优化后的一击单字（204 字）。
+    /// 涵盖物理单键、跨键小写、大写码元以及空格并击单字，排除标点。
+    KongmingOneHitChars,
 }
 
 impl BuiltinSet {
@@ -161,8 +162,8 @@ impl BuiltinSet {
             Self::CommonWordsQian => "常用词组前五百",
             Self::CommonWordsZhong => "常用词组中五百",
             Self::CommonWordsHou => "常用词组后五百",
-            Self::YoyoChars => "yoyo 单字",
             Self::KongmingOneHitWords => "空明码一击词",
+            Self::KongmingOneHitChars => "空明码一击字",
         }
     }
 
@@ -186,8 +187,8 @@ impl BuiltinSet {
             Self::CommonWordsQian => include_str!("../data/common-words-qian.txt"),
             Self::CommonWordsZhong => include_str!("../data/common-words-zhong.txt"),
             Self::CommonWordsHou => include_str!("../data/common-words-hou.txt"),
-            Self::YoyoChars => include_str!("../data/yoyo-chars.txt"),
             Self::KongmingOneHitWords => include_str!("../data/kongming-1hit-words.txt"),
+            Self::KongmingOneHitChars => include_str!("../data/kongming-1hit-chars.txt"),
         }
     }
 
@@ -243,8 +244,8 @@ pub const BUILTIN_SETS: [BuiltinSet; 8] = [
     BuiltinSet::CommonWordsQian,
     BuiltinSet::CommonWordsZhong,
     BuiltinSet::CommonWordsHou,
-    BuiltinSet::YoyoChars,
     BuiltinSet::KongmingOneHitWords,
+    BuiltinSet::KongmingOneHitChars,
 ];
 
 /// 载入内置赛文：内容为纯字符串（已去除换行）。
@@ -931,6 +932,37 @@ mod tests {
     }
 
     #[test]
+    fn kongming_one_hit_chars_content_shape() {
+        // 空明码一击字：204 字、无重复、均为纯中文字符、首字「中」。
+        let set = BuiltinSet::KongmingOneHitChars;
+        let chars: Vec<char> = set
+            .content()
+            .trim_end_matches(['\n', '\r'])
+            .chars()
+            .collect();
+        assert_eq!(chars.len(), 204, "空明码一击字应为 204 字");
+        let mut sorted = chars.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), chars.len(), "空明码一击字不应有重复");
+        for &c in &chars {
+            assert!(
+                !c.is_ascii()
+                    && !c.is_whitespace()
+                    && c != '，'
+                    && c != '。'
+                    && c != '；'
+                    && c != '、',
+                "空明码一击字含非法条目: {}",
+                c
+            );
+        }
+        assert_eq!(chars[0], '中', "首字应为 Tier 0 左手核心键「中」");
+        assert_eq!(set.name(), "空明码一击字");
+        assert!(!set.is_words());
+    }
+
+    #[test]
     fn shuffled_text_has_correct_metadata() {
         for &set in &BUILTIN_SETS {
             let text = load_builtin_text_shuffled(set);
@@ -964,6 +996,7 @@ mod tests {
             BuiltinSet::CommonCharsQian,
             BuiltinSet::CommonCharsZhong,
             BuiltinSet::CommonCharsHou,
+            BuiltinSet::KongmingOneHitChars,
         ] {
             let original: Vec<char> = set.content().replace(['\n', '\r'], "").chars().collect();
             let shuffled: Vec<char> = load_builtin_text_shuffled(set).content.chars().collect();

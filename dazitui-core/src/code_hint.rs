@@ -46,6 +46,239 @@ pub fn hand_of_code(code: &str) -> HintHand {
     }
 }
 
+/// 空明码方案 B 权威 204 个一击单字的编码格式与手区归属表（字符、编码提示文本、手区归属）。
+///
+/// 涵盖 8 大槽位规范编码：
+/// - 左手小写（26 字，a-z）
+/// - 右手小写（22 字，b,d,e,f,g,h,i,j,k,l,m,n,o,p,q,r,s,t,u,v,w,y）
+/// - 左手大写（26 字，A-Z）
+/// - 右手大写（26 字，A-Z）
+/// - 左手小写+空格（26 字，a␣-z␣）
+/// - 右手小写+空格（26 字，a␣-z␣）
+/// - 左手大写+空格（26 字，A␣-Z␣）
+/// - 右手大写+空格（26 字，A␣-Z␣）
+pub const KONGMING_1HIT_CHORDS: &[(char, &str, HintHand)] = &[
+    // Tier 0 左手 (15) & 右手 (11)
+    ('中', "f", HintHand::Left),
+    ('来', "r", HintHand::Left),
+    ('上', "s", HintHand::Left),
+    ('大', "d", HintHand::Left),
+    ('为', "w", HintHand::Left),
+    ('国', "g", HintHand::Left),
+    ('地', "a", HintHand::Left),
+    ('要', "q", HintHand::Left),
+    ('会', "v", HintHand::Left),
+    ('而', "e", HintHand::Left),
+    ('下', "x", HintHand::Left),
+    ('成', "c", HintHand::Left),
+    ('天', "t", HintHand::Left),
+    ('部', "b", HintHand::Left),
+    ('在', "z", HintHand::Left),
+    ('的', "d", HintHand::Right),
+    ('是', "s", HintHand::Right),
+    ('不', "b", HintHand::Right),
+    ('人', "r", HintHand::Right),
+    ('我', "w", HintHand::Right),
+    ('他', "t", HintHand::Right),
+    ('这', "v", HintHand::Right),
+    ('个', "g", HintHand::Right),
+    ('发', "f", HintHand::Right),
+    ('到', "e", HintHand::Right),
+    ('去', "q", HintHand::Right),
+    // Tier 1 跨键小写 左手 (11) & 右手 (11)
+    ('以', "i", HintHand::Left),
+    ('也', "y", HintHand::Left),
+    ('能', "n", HintHand::Left),
+    ('于', "u", HintHand::Left),
+    ('过', "o", HintHand::Left),
+    ('里', "l", HintHand::Left),
+    ('家', "j", HintHand::Left),
+    ('方', "p", HintHand::Left),
+    ('么', "m", HintHand::Left),
+    ('看', "k", HintHand::Left),
+    ('好', "h", HintHand::Left),
+    ('一', "y", HintHand::Right),
+    ('了', "l", HintHand::Right),
+    ('有', "i", HintHand::Right),
+    ('们', "m", HintHand::Right),
+    ('和', "h", HintHand::Right),
+    ('就', "j", HintHand::Right),
+    ('可', "k", HintHand::Right),
+    ('你', "n", HintHand::Right),
+    ('年', "p", HintHand::Right),
+    ('用', "u", HintHand::Right),
+    ('多', "o", HintHand::Right),
+    // Tier 2 单手大写码元 左手 (26) & 右手 (26)
+    ('性', "A", HintHand::Left),
+    ('本', "B", HintHand::Left),
+    ('出', "C", HintHand::Left),
+    ('对', "D", HintHand::Left),
+    ('二', "E", HintHand::Left),
+    ('法', "F", HintHand::Left),
+    ('公', "G", HintHand::Left),
+    ('后', "H", HintHand::Left),
+    ('知', "I", HintHand::Left),
+    ('经', "J", HintHand::Left),
+    ('开', "K", HintHand::Left),
+    ('理', "L", HintHand::Left),
+    ('没', "M", HintHand::Left),
+    ('那', "N", HintHand::Left),
+    ('三', "O", HintHand::Left),
+    ('点', "P", HintHand::Left),
+    ('起', "Q", HintHand::Left),
+    ('然', "R", HintHand::Left),
+    ('说', "S", HintHand::Left),
+    ('同', "T", HintHand::Left),
+    ('正', "U", HintHand::Left),
+    ('业', "V", HintHand::Left),
+    ('无', "W", HintHand::Left),
+    ('学', "X", HintHand::Left),
+    ('样', "Y", HintHand::Left),
+    ('子', "Z", HintHand::Left),
+    ('定', "A", HintHand::Right),
+    ('把', "B", HintHand::Right),
+    ('从', "C", HintHand::Right),
+    ('得', "D", HintHand::Right),
+    ('儿', "E", HintHand::Right),
+    ('分', "F", HintHand::Right),
+    ('工', "G", HintHand::Right),
+    ('行', "H", HintHand::Right),
+    ('主', "I", HintHand::Right),
+    ('进', "J", HintHand::Right),
+    ('但', "K", HintHand::Right),
+    ('力', "L", HintHand::Right),
+    ('面', "M", HintHand::Right),
+    ('内', "N", HintHand::Right),
+    ('者', "O", HintHand::Right),
+    ('十', "P", HintHand::Right),
+    ('其', "Q", HintHand::Right),
+    ('如', "R", HintHand::Right),
+    ('时', "S", HintHand::Right),
+    ('她', "T", HintHand::Right),
+    ('第', "U", HintHand::Right),
+    ('使', "V", HintHand::Right),
+    ('外', "W", HintHand::Right),
+    ('现', "X", HintHand::Right),
+    ('因', "Y", HintHand::Right),
+    ('着', "Z", HintHand::Right),
+    // Tier 3 空格并击 左手小写+空格 (26)
+    ('等', "a␣", HintHand::Left),
+    ('并', "b␣", HintHand::Left),
+    ('长', "c␣", HintHand::Left),
+    ('道', "d␣", HintHand::Left),
+    ('新', "e␣", HintHand::Left),
+    ('己', "f␣", HintHand::Left),
+    ('关', "g␣", HintHand::Left),
+    ('还', "h␣", HintHand::Left),
+    ('制', "i␣", HintHand::Left),
+    ('军', "j␣", HintHand::Left),
+    ('身', "k␣", HintHand::Left),
+    ('两', "l␣", HintHand::Left),
+    ('民', "m␣", HintHand::Left),
+    ('加', "n␣", HintHand::Left),
+    ('西', "o␣", HintHand::Left),
+    ('斯', "p␣", HintHand::Left),
+    ('前', "q␣", HintHand::Left),
+    ('日', "r␣", HintHand::Left),
+    ('生', "s␣", HintHand::Left),
+    ('它', "t␣", HintHand::Left),
+    ('月', "u␣", HintHand::Left),
+    ('回', "v␣", HintHand::Left),
+    ('问', "w␣", HintHand::Left),
+    ('小', "x␣", HintHand::Left),
+    ('意', "y␣", HintHand::Left),
+    ('自', "z␣", HintHand::Left),
+    // Tier 3 空格并击 左手大写+空格 (26)
+    ('教', "A␣", HintHand::Left),
+    ('表', "B␣", HintHand::Left),
+    ('重', "C␣", HintHand::Left),
+    ('当', "D␣", HintHand::Left),
+    ('原', "E␣", HintHand::Left),
+    ('东', "F␣", HintHand::Left),
+    ('果', "G␣", HintHand::Left),
+    ('或', "H␣", HintHand::Left),
+    ('声', "I␣", HintHand::Left),
+    ('将', "J␣", HintHand::Left),
+    ('提', "K␣", HintHand::Left),
+    ('老', "L␣", HintHand::Left),
+    ('美', "M␣", HintHand::Left),
+    ('及', "N␣", HintHand::Left),
+    ('员', "O␣", HintHand::Left),
+    ('解', "P␣", HintHand::Left),
+    ('情', "Q␣", HintHand::Left),
+    ('水', "R␣", HintHand::Left),
+    ('事', "S␣", HintHand::Left),
+    ('体', "T␣", HintHand::Left),
+    ('名', "U␣", HintHand::Left),
+    ('真', "V␣", HintHand::Left),
+    ('文', "W␣", HintHand::Left),
+    ('心', "X␣", HintHand::Left),
+    ('已', "Y␣", HintHand::Left),
+    ('作', "Z␣", HintHand::Left),
+    // Tier 3 空格并击 右手小写+空格 (26)
+    ('由', "a␣", HintHand::Right),
+    ('被', "b␣", HintHand::Right),
+    ('此', "c␣", HintHand::Right),
+    ('都', "d␣", HintHand::Right),
+    ('最', "e␣", HintHand::Right),
+    ('手', "f␣", HintHand::Right),
+    ('高', "g␣", HintHand::Right),
+    ('很', "h␣", HintHand::Right),
+    ('应', "i␣", HintHand::Right),
+    ('机', "j␣", HintHand::Right),
+    ('战', "k␣", HintHand::Right),
+    ('利', "l␣", HintHand::Right),
+    ('明', "m␣", HintHand::Right),
+    ('向', "n␣", HintHand::Right),
+    ('政', "o␣", HintHand::Right),
+    ('相', "p␣", HintHand::Right),
+    ('只', "q␣", HintHand::Right),
+    ('任', "r␣", HintHand::Right),
+    ('所', "s␣", HintHand::Right),
+    ('头', "t␣", HintHand::Right),
+    ('见', "u␣", HintHand::Right),
+    ('什', "v␣", HintHand::Right),
+    ('物', "w␣", HintHand::Right),
+    ('些', "x␣", HintHand::Right),
+    ('与', "y␣", HintHand::Right),
+    ('之', "z␣", HintHand::Right),
+    // Tier 3 空格并击 右手大写+空格 (26)
+    ('代', "A␣", HintHand::Right),
+    ('比', "B␣", HintHand::Right),
+    ('产', "C␣", HintHand::Right),
+    ('动', "D␣", HintHand::Right),
+    ('信', "E␣", HintHand::Right),
+    ('化', "F␣", HintHand::Right),
+    ('合', "G␣", HintHand::Right),
+    ('话', "H␣", HintHand::Right),
+    ('给', "I␣", HintHand::Right),
+    ('间', "J␣", HintHand::Right),
+    ('世', "K␣", HintHand::Right),
+    ('立', "L␣", HintHand::Right),
+    ('门', "M␣", HintHand::Right),
+    ('次', "N␣", HintHand::Right),
+    ('度', "O␣", HintHand::Right),
+    ('常', "P␣", HintHand::Right),
+    ('全', "Q␣", HintHand::Right),
+    ('先', "R␣", HintHand::Right),
+    ('实', "S␣", HintHand::Right),
+    ('特', "T␣", HintHand::Right),
+    ('海', "U␣", HintHand::Right),
+    ('通', "V␣", HintHand::Right),
+    ('位', "W␣", HintHand::Right),
+    ('想', "X␣", HintHand::Right),
+    ('又', "Y␣", HintHand::Right),
+    ('种', "Z␣", HintHand::Right),
+];
+
+/// 查找指定字符在空明码一击字中的物理指法与手区归属。
+pub fn kongming_1hit_hint(c: char) -> Option<(&'static str, HintHand)> {
+    KONGMING_1HIT_CHORDS
+        .iter()
+        .find(|&&(ch, _, _)| ch == c)
+        .map(|&(_, chord, hand)| (chord, hand))
+}
+
 /// 单个字符的可视列宽（CJK 等宽字符记 2，其余记 1）。
 pub fn char_width(c: char) -> usize {
     UnicodeWidthChar::width(c).unwrap_or(1).max(1)
@@ -564,5 +797,44 @@ mod tests {
         assert_eq!(cells[0].hand, HintHand::Left); // 是 → _w 左手
         assert_eq!(cells[1].hand, HintHand::Right); // 有 → +e 右手
         assert_eq!(cells[2].hand, HintHand::TwoHand); // 中 → wCs 双手并击无前缀 → TwoHand 单独配色
+    }
+
+    #[test]
+    fn test_kongming_1hit_chords_shape_and_coverage() {
+        assert_eq!(KONGMING_1HIT_CHORDS.len(), 204);
+        let mut chars = Vec::new();
+        for &(c, chord, hand) in KONGMING_1HIT_CHORDS {
+            assert!(!chord.is_empty(), "指法不可为空: {c}");
+            assert!(
+                matches!(hand, HintHand::Left | HintHand::Right),
+                "一击字指法必须为 Left 或 Right: {c}"
+            );
+            chars.push(c);
+        }
+        let orig_len = chars.len();
+        chars.sort_unstable();
+        chars.dedup();
+        assert_eq!(chars.len(), orig_len, "一击字映射表不应有重复字符");
+
+        // 验证代表性字条：
+        // Tier 0
+        assert_eq!(kongming_1hit_hint('中'), Some(("f", HintHand::Left)));
+        assert_eq!(kongming_1hit_hint('的'), Some(("d", HintHand::Right)));
+        // Tier 1
+        assert_eq!(kongming_1hit_hint('好'), Some(("h", HintHand::Left)));
+        assert_eq!(kongming_1hit_hint('一'), Some(("y", HintHand::Right)));
+        // Tier 2
+        assert_eq!(kongming_1hit_hint('性'), Some(("A", HintHand::Left)));
+        assert_eq!(kongming_1hit_hint('定'), Some(("A", HintHand::Right)));
+        // Tier 3
+        assert_eq!(kongming_1hit_hint('等'), Some(("a␣", HintHand::Left)));
+        assert_eq!(kongming_1hit_hint('由'), Some(("a␣", HintHand::Right)));
+        assert_eq!(kongming_1hit_hint('还'), Some(("h␣", HintHand::Left)));
+        assert_eq!(kongming_1hit_hint('很'), Some(("h␣", HintHand::Right)));
+        assert_eq!(kongming_1hit_hint('教'), Some(("A␣", HintHand::Left)));
+        assert_eq!(kongming_1hit_hint('代'), Some(("A␣", HintHand::Right)));
+
+        // 未收录字符返回 None
+        assert_eq!(kongming_1hit_hint('龙'), None);
     }
 }

@@ -17,10 +17,10 @@ use dazitui_core::{
     SchemeInfo, Session, SessionRecord, Settings, SettingsStore, Stats, StatsDb, Text, TextSource,
     Theme, TokenStore, default_rime_data_dir, discover_schemes, env_credentials,
     format_stats_share_text, format_time, hint_cell_widths, is_auth_failure, key_accuracy_pct,
-    layout_code_hint_line, load_builtin_text, load_builtin_text_shuffled, load_text_from_clipboard,
-    load_text_from_file, load_text_from_string, lttb_downsample, normalize_scheme_to_id,
-    osc52_clipboard, pack_words_by_width, prewarm_segmenter, resolve_scheme_path_via_discovery,
-    save_text_to_file, today_ymd, word_ratio_pct,
+    kongming_1hit_hint, layout_code_hint_line, load_builtin_text, load_builtin_text_shuffled,
+    load_text_from_clipboard, load_text_from_file, load_text_from_string, lttb_downsample,
+    normalize_scheme_to_id, osc52_clipboard, pack_words_by_width, prewarm_segmenter,
+    resolve_scheme_path_via_discovery, save_text_to_file, today_ymd, word_ratio_pct,
 };
 
 /// 方案源文件热监控封装（issue #91 / #93），基于 `notify`。
@@ -836,6 +836,8 @@ struct App {
     scheme_reload_flash_at: Option<Instant>,
     /// 热重载失败提示（如 YAML 写坏）。`Some` 时状态栏报错；成功重载后清空（与成功闪现互斥）。
     scheme_reload_error: Option<String>,
+    /// 切换词提开关后状态栏闪现「✓ 词提：开/关」的截止时刻及开关状态 `(on, deadline)`。
+    code_hint_flash_at: Option<(bool, Instant)>,
     /// 后台数据库异步写入 Worker。
     db_worker: Option<DbWorker>,
     /// 赞赏与支持视图图片协议缓存。
@@ -1112,6 +1114,7 @@ impl App {
             scheme_hot_reload_expected: false,
             scheme_reload_flash_at: None,
             scheme_reload_error: None,
+            code_hint_flash_at: None,
             db_worker,
             sponsor_state: RefCell::new(None),
         };
@@ -1478,6 +1481,23 @@ impl App {
         None
     }
 
+    /// 词提切换提示状态栏闪现：在切换后 1.5s 内显示「✓ 词提：开」或「✓ 词提：关」，剩余 500ms 渐变为 muted 色。
+    fn code_hint_status(&self) -> Option<(String, Style)> {
+        if let Some((on, at)) = self.code_hint_flash_at {
+            if Instant::now() < at {
+                let remaining = at.saturating_duration_since(Instant::now());
+                let color = if remaining < Duration::from_millis(500) {
+                    self.palette().muted
+                } else {
+                    self.palette().accent
+                };
+                let text = if on { "✓ 词提：开" } else { "✓ 词提：关" };
+                return Some((text.to_string(), Style::default().fg(color)));
+            }
+        }
+        None
+    }
+
     /// 计算当前总活跃用时（已累计用时 + 当前活跃段）。
     fn current_elapsed(&self) -> Duration {
         if let Some(active) = self.active_start {
@@ -1537,10 +1557,14 @@ impl App {
         let _ = self.settings_store.save(&self.settings);
     }
 
-    /// 切换遍码提示开关并即时持久化。
+    /// 切换遍码提示开关并即时持久化，同时在状态栏短暂闪现提示。
     fn toggle_code_hint(&mut self) {
         self.settings.code_hint = !self.settings.code_hint;
         let _ = self.settings_store.save(&self.settings);
+        self.code_hint_flash_at = Some((
+            self.settings.code_hint,
+            Instant::now() + Duration::from_millis(1500),
+        ));
     }
 
     /// 切换方案热监控总开关并即时持久化；开关即时生效（开→重建监控，关→卸载监控）。
@@ -2410,6 +2434,11 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                 match app.state {
                     AppState::Typing => {
                         if !app.session.is_empty() && !app.paused {
+                            // 跟打进行中：Ctrl-H 快捷切换遍码提示（不与输入法和打字文本冲突）
+                            if is_toggle_code_hint_anytime(key) {
+                                app.toggle_code_hint();
+                                continue;
+                            }
                             // 跟打进行中：Esc 或 Tab 暂停切入 Normal 菜单态
                             if key.code == KeyCode::Esc || key.code == KeyCode::Tab {
                                 app.pause();
@@ -2541,6 +2570,10 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                             app.restart();
                             continue;
                         }
+                        if is_toggle_code_hint_normal(key) || is_toggle_code_hint_anytime(key) {
+                            app.toggle_code_hint();
+                            continue;
+                        }
                         if let Some(competition_type) = online_shortcut(key) {
                             trigger_online_competition(&mut app, competition_type, terminal)?;
                             continue;
@@ -2652,6 +2685,10 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                             app.enter_settings();
                             continue;
                         }
+                        if is_toggle_code_hint_anytime(key) {
+                            app.toggle_code_hint();
+                            continue;
+                        }
                         match key.code {
                             KeyCode::Up | KeyCode::Char('k') => {
                                 app.builtin_selection = app.builtin_selection.saturating_sub(1);
@@ -2677,6 +2714,9 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                             KeyCode::Char('s') | KeyCode::Char('S') => {
                                 app.builtin_shuffle = !app.builtin_shuffle;
                                 app.refresh_builtin_preview();
+                            }
+                            KeyCode::Char('c') | KeyCode::Char('C') => {
+                                app.toggle_code_hint();
                             }
                             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('h') => {
                                 app.state = AppState::Typing
@@ -3232,15 +3272,15 @@ fn hint_text(
     if browsing {
         " jk 选择 | Enter 载入 | g/G 首尾 | Esc/q 取消 | o 设置 | Ctrl-Q 退出"
     } else if browsing_builtin {
-        " jk 选择 | Enter 载入 | s 乱序 | g/G 首尾 | Esc/q 取消 | o 设置 | Ctrl-Q 退出"
+        " jk 选择 | Enter 载入 | s 乱序 | c 词提 | g/G 首尾 | Esc/q 取消 | o 设置 | Ctrl-Q 退出"
     } else if paused {
-        " jk 菜单导航 | l 执行 | i/Esc 恢复跟打 | d 提前结算 | r 重打 | s 统计 | o 设置 | Ctrl-Q 退出"
+        " jk 菜单导航 | l 执行 | i/Esc 恢复跟打 | d 提前结算 | r 重打 | c 词提 | s 统计 | o 设置 | Ctrl-Q 退出"
     } else if is_ready {
-        " jk 菜单导航 | l 执行 | f 载文 | b 内置 | i 自由发文 | p 剪贴板 | 1 极速杯 | 4 排行榜 | s 统计 | o 设置 | Ctrl-Q 退出"
+        " jk 菜单导航 | l 执行 | f 载文 | b 内置 | i 自由发文 | p 剪贴板 | 1 极速杯 | 4 排行榜 | c 词提 | s 统计 | o 设置 | Ctrl-Q 退出"
     } else if is_online {
-        " Esc 暂停/命令 | Tab 侧栏 | s 统计 | o 设置 | u 登录 | Ctrl-Q 退出"
+        " Esc 暂停/命令 | Tab 侧栏 | Ctrl-H 词提 | s 统计 | o 设置 | u 登录 | Ctrl-Q 退出"
     } else {
-        " Esc 暂停/命令 | Tab 侧栏 | r 重打 | s 统计 | o 设置 | Ctrl-Q 退出"
+        " Esc 暂停/命令 | Tab 侧栏 | Ctrl-H 词提 | r 重打 | s 统计 | o 设置 | Ctrl-Q 退出"
     }
 }
 
@@ -3454,6 +3494,17 @@ fn is_open_stats(key: KeyEvent) -> bool {
 /// 打开赞赏&支持视图快捷键：d / D（Donate / 赞赏）。
 fn is_open_sponsor(key: KeyEvent) -> bool {
     key.modifiers.is_empty() && (key.code == KeyCode::Char('d') || key.code == KeyCode::Char('D'))
+}
+
+/// 快捷开关词提（就绪态/暂停态/浏览内置态快捷键）：c / C。
+fn is_toggle_code_hint_normal(key: KeyEvent) -> bool {
+    key.modifiers.is_empty() && (key.code == KeyCode::Char('c') || key.code == KeyCode::Char('C'))
+}
+
+/// 快捷开关词提（随时可用快捷键，避免跟打中单键打字冲突）：Ctrl-H。
+fn is_toggle_code_hint_anytime(key: KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL)
+        && (key.code == KeyCode::Char('h') || key.code == KeyCode::Char('H'))
 }
 
 /// 处理跟打文本上屏（支持单字符与多字词组，如输入法整词上屏 "怎么"）：
@@ -4316,13 +4367,19 @@ fn ui(frame: &mut Frame, app: &App) {
         }
 
         let is_builtin = matches!(app.text.source, TextSource::Builtin { .. });
+        let is_kongming_1hit = matches!(
+            app.text.source,
+            TextSource::Builtin {
+                set: BuiltinSet::KongmingOneHitChars
+            }
+        );
         let dict_ok = code_hint_dict_usable(app.scheme_dict.as_ref());
         // 非内置长文 + 开启提示 + 已配置可用词典：走双行词格（按词边界锁步折行）路径。
         let use_code_hint_grid = app.settings.code_hint && !is_builtin && dict_ok;
-        // 内置词组赛文 + 遍码提示：预计算词格列宽，供对照区正文行与跟打区行共用
-        // （提示码宽于词时由正文补空格让位，保证两区与提示行三者词列一致）。
-        let word_cell_widths = if app.settings.code_hint && dict_ok {
-            builtin_words_cell_widths(&app.session, &app.text, app.scheme_dict.as_ref())
+        // 内置词组赛文 / 空明码一击字 + 遍码提示：预计算词格列宽，供对照区正文行与跟打区行共用
+        // （提示码宽于词/字时由正文补空格让位，保证两区与提示行三者列宽一致）。
+        let word_cell_widths = if app.settings.code_hint && (dict_ok || is_kongming_1hit) {
+            builtin_cell_widths(&app.session, &app.text, app.scheme_dict.as_ref())
         } else {
             None
         };
@@ -4392,10 +4449,10 @@ fn ui(frame: &mut Frame, app: &App) {
                 None,
             )
         };
-        // 遍码提示（编码提示）：开启时，有可用词典走正常提示路径，否则显示占位引导。
+        // 遍码提示（编码提示）：开启时，有可用词典或内置物理指法赛文走正常提示路径，否则显示占位引导。
         if app.settings.code_hint {
-            if dict_ok {
-                // 内置词组赛文：正文行之上插入单行提示（单页，由 Paragraph 按词宽折行）。
+            if dict_ok || is_kongming_1hit {
+                // 内置词组赛文与空明一击字：正文行之上插入单行提示（单页，由 Paragraph 按词宽折行）。
                 if let Some(hint_line) = code_hint_overlay_line(
                     &app.session,
                     &app.text,
@@ -4526,9 +4583,10 @@ fn ui(frame: &mut Frame, app: &App) {
             .fg(palette.accent)
             .add_modifier(Modifier::BOLD),
     )]);
-    // 成功热重载后，状态栏底部右侧短暂闪现「方案已重载」（约 2s 淡出，issue #97）。
+    // 状态栏底部右侧状态提示：词提切换提示优先（1.5s），其次方案热重载提示。
     let mut help_block = themed_block(&palette, false).title(hint_title);
-    if let Some((msg, style)) = app.scheme_reload_status() {
+    let status_notice = app.code_hint_status().or_else(|| app.scheme_reload_status());
+    if let Some((msg, style)) = status_notice {
         help_block = help_block.title_bottom(Line::from(Span::styled(msg, style)).right_aligned());
     }
     frame.render_widget(
@@ -7616,10 +7674,10 @@ fn build_word_spans(
     spans
 }
 
-/// 内置词组赛文开启遍码提示时，根据当前页词条与已载入方案反查，生成「提示行」。
+/// 内置词组赛文与空明码一击字赛文开启遍码提示时，根据当前页内容生成「提示行」。
 ///
-/// 仅对内置词组赛文生效；未开启、非词组赛文或未配置方案时返回 `None`。
-/// 提示行与正文行（同样以单空格分词、按词可视列宽对齐）逐词对齐。
+/// 仅对内置词组赛文及空明码一击字生效；未开启、非支持赛文或未配置方案时返回 `None`。
+/// 提示行与正文行（同样以单空格分格、按可视列宽对齐）逐格对齐。
 fn code_hint_overlay_line(
     session: &Session,
     text: &Text,
@@ -7630,6 +7688,48 @@ fn code_hint_overlay_line(
         TextSource::Builtin { set } => set,
         _ => return None,
     };
+    let page_start = builtin_page_start(session);
+    let group_size = session.group_size();
+    if set == BuiltinSet::KongmingOneHitChars {
+        let statuses = session.original_status();
+        if page_start >= statuses.len() {
+            return None;
+        }
+        let page_end = (page_start + group_size).min(statuses.len());
+        let page_statuses = &statuses[page_start..page_end];
+        let words: Vec<String> = page_statuses.iter().map(|(c, _)| c.to_string()).collect();
+        let typed_mask: Vec<bool> = page_statuses
+            .iter()
+            .map(|(_, s)| *s == Some(CharStatus::Correct))
+            .collect();
+        let hints: Vec<CodeHint> = page_statuses
+            .iter()
+            .map(|&(c, _)| {
+                if let Some((chord, hand)) = kongming_1hit_hint(c) {
+                    let prefix = match hand {
+                        HintHand::Left => "_",
+                        HintHand::Right => "+",
+                        _ => "-",
+                    };
+                    CodeHint {
+                        word: c.to_string(),
+                        code: format!("{prefix}{chord}"),
+                        strokes: 1,
+                        is_oov: false,
+                    }
+                } else {
+                    CodeHint {
+                        word: c.to_string(),
+                        code: String::new(),
+                        strokes: 0,
+                        is_oov: true,
+                    }
+                }
+            })
+            .collect();
+        let cells = layout_code_hint_line(&words, &hints, &typed_mask);
+        return Some(code_hint_line_from_cells(&cells, theme));
+    }
     if !set.is_words() {
         return None;
     }
@@ -7638,8 +7738,7 @@ fn code_hint_overlay_line(
         Some(b) if !b.is_empty() => b.clone(),
         _ => set.word_boundaries(),
     };
-    let page_start = builtin_page_start(session);
-    let page_end = (page_start + session.group_size()).min(boundaries.len());
+    let page_end = (page_start + group_size).min(boundaries.len());
     if page_start >= boundaries.len() {
         return None;
     }
@@ -7716,12 +7815,12 @@ fn merge_phrase_hints(
     (out_w, out_m, out_r)
 }
 
-/// 内置词组赛文开启遍码提示时，当前页词条的词格列宽（`max(词宽, 提示码宽)`）。
+/// 内置词组与空明码一击字赛文开启遍码提示时，当前页词条/单字的词格列宽（`max(词宽, 提示码宽)`）。
 ///
 /// 提示码宽于词（如「腕间」4 列 vs 码 `HjYIw` 5 列）时词格需撑宽，对照区正文行与
 /// 跟打区行共用本列宽补空格，两区词列才不会错位、提示行也才能逐词对齐。
-/// 非词组赛文、无词典或当前页已越界时返回 `None`（退化为纯词宽，与关闭提示时一致）。
-fn builtin_words_cell_widths(
+/// 非支持赛文、无词典或当前页已越界时返回 `None`（退化为纯词宽，与关闭提示时一致）。
+fn builtin_cell_widths(
     session: &Session,
     text: &Text,
     scheme_dict: Option<&SchemeDict>,
@@ -7730,6 +7829,43 @@ fn builtin_words_cell_widths(
         TextSource::Builtin { set } => set,
         _ => return None,
     };
+    let page_start = builtin_page_start(session);
+    let group_size = session.group_size();
+    if set == BuiltinSet::KongmingOneHitChars {
+        let statuses = session.original_status();
+        if page_start >= statuses.len() {
+            return None;
+        }
+        let page_end = (page_start + group_size).min(statuses.len());
+        let page_statuses = &statuses[page_start..page_end];
+        let words: Vec<String> = page_statuses.iter().map(|(c, _)| c.to_string()).collect();
+        let hints: Vec<CodeHint> = page_statuses
+            .iter()
+            .map(|&(c, _)| {
+                if let Some((chord, hand)) = kongming_1hit_hint(c) {
+                    let prefix = match hand {
+                        HintHand::Left => "_",
+                        HintHand::Right => "+",
+                        _ => "-",
+                    };
+                    CodeHint {
+                        word: c.to_string(),
+                        code: format!("{prefix}{chord}"),
+                        strokes: 1,
+                        is_oov: false,
+                    }
+                } else {
+                    CodeHint {
+                        word: c.to_string(),
+                        code: String::new(),
+                        strokes: 0,
+                        is_oov: true,
+                    }
+                }
+            })
+            .collect();
+        return Some(hint_cell_widths(&words, &hints));
+    }
     if !set.is_words() {
         return None;
     }
@@ -7742,8 +7878,8 @@ fn builtin_words_cell_widths(
             &owned_boundaries
         }
     };
-    let page_start_word = builtin_page_start(session);
-    let page_end_word = (page_start_word + session.group_size()).min(boundaries.len());
+    let page_start_word = page_start;
+    let page_end_word = (page_start_word + group_size).min(boundaries.len());
     if page_start_word >= boundaries.len() {
         return None;
     }
@@ -7754,6 +7890,16 @@ fn builtin_words_cell_widths(
         .collect();
     let hints = dict.build_code_hints(&words);
     Some(hint_cell_widths(&words, &hints))
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+fn builtin_words_cell_widths(
+    session: &Session,
+    text: &Text,
+    scheme_dict: Option<&SchemeDict>,
+) -> Option<Vec<usize>> {
+    builtin_cell_widths(session, text, scheme_dict)
 }
 
 /// 将提示单元（已去皮手区前缀、携手区归属）拼为带色 `Line`：
@@ -8045,6 +8191,33 @@ fn original_line(
             return text_lines;
         }
         // 单字赛文：每页 group_size 字
+        if let Some(widths) = cell_widths {
+            let start = builtin_page_start(session);
+            let statuses = session.original_status();
+            if start >= statuses.len() {
+                return TextLines::default();
+            }
+            let page_end = (start + group_size).min(statuses.len());
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            for (idx, &(c, status)) in statuses[start..page_end].iter().enumerate() {
+                if idx > 0 {
+                    spans.push(Span::raw(" "));
+                }
+                let style = match status {
+                    Some(CharStatus::Correct) => Style::default().fg(color(theme.correct)),
+                    Some(CharStatus::Wrong) => Style::default().fg(color(theme.wrong)),
+                    None => Style::default(),
+                };
+                spans.push(Span::styled(c.to_string(), style.add_modifier(bold_modifier(bold))));
+                let cell_w = c.width().unwrap_or(1);
+                if let Some(extra) = widths.get(idx).and_then(|&cw| cw.checked_sub(cell_w)).filter(|&n| n > 0) {
+                    spans.push(Span::raw(" ".repeat(extra)));
+                }
+            }
+            let mut text_lines = TextLines::default();
+            text_lines.push_line(Line::from(spans));
+            return text_lines;
+        }
         let start = builtin_page_start(session);
         let statuses: Vec<_> = session
             .original_status()
@@ -8138,6 +8311,49 @@ fn type_line(
             return text_lines;
         }
         // 单字赛文：每页 group_size 字
+        if let Some(widths) = cell_widths {
+            let display = session.display();
+            if display.is_empty() {
+                return TextLines::from(
+                    Line::from("（跟打区 — 输入法上屏文字将显示在这里）").fg(color(theme.muted)),
+                );
+            }
+            let start = builtin_page_start(session);
+            let statuses = session.original_status();
+            if start >= statuses.len() || display.len() <= start {
+                return TextLines::from(
+                    Line::from("（跟打区 — 输入法上屏文字将显示在这里）").fg(color(theme.muted)),
+                );
+            }
+            let page_end = (start + group_size).min(statuses.len());
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            for (idx, ci) in (start..page_end).enumerate() {
+                if display.len() <= ci {
+                    break;
+                }
+                if idx > 0 {
+                    spans.push(Span::raw(" "));
+                }
+                let (c, status) = display[ci];
+                let style = match status {
+                    CharStatus::Correct => Style::default().fg(color(theme.correct)),
+                    CharStatus::Wrong => Style::default().fg(color(theme.wrong)),
+                };
+                spans.push(Span::styled(c.to_string(), style.add_modifier(bold_modifier(bold))));
+                let cell_w = c.width().unwrap_or(1);
+                if let Some(extra) = widths.get(idx).and_then(|&cw| cw.checked_sub(cell_w)).filter(|&n| n > 0) {
+                    spans.push(Span::raw(" ".repeat(extra)));
+                }
+            }
+            if spans.is_empty() || spans.iter().all(|s| s.content == " ") {
+                return TextLines::from(
+                    Line::from("（跟打区 — 输入法上屏文字将显示在这里）").fg(color(theme.muted)),
+                );
+            }
+            let mut text_lines = TextLines::default();
+            text_lines.push_line(Line::from(spans));
+            return text_lines;
+        }
         let start = builtin_page_start(session);
         let display: Vec<_> = session
             .display()
@@ -8477,6 +8693,58 @@ mod tests {
     }
 
     #[test]
+    fn toggle_code_hint_shortcuts_normal_and_ctrl_h() {
+        // c / C 无修饰符触发普通切换
+        assert!(is_toggle_code_hint_normal(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)));
+        assert!(is_toggle_code_hint_normal(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::NONE)));
+        assert!(!is_toggle_code_hint_normal(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+        assert!(!is_toggle_code_hint_normal(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)));
+
+        // Ctrl-H / Ctrl-h 触发随时切换
+        assert!(is_toggle_code_hint_anytime(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL)));
+        assert!(is_toggle_code_hint_anytime(KeyEvent::new(KeyCode::Char('H'), KeyModifiers::CONTROL)));
+        assert!(!is_toggle_code_hint_anytime(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE)));
+        assert!(!is_toggle_code_hint_anytime(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+    }
+
+    #[test]
+    fn hint_text_includes_code_hint_shortcuts() {
+        // 内置浏览、暂停态、就绪态：展示 c 词提
+        assert!(hint_text(false, true, false, false, false).contains("c 词提"));
+        assert!(hint_text(false, false, false, true, false).contains("c 词提"));
+        assert!(hint_text(false, false, false, false, true).contains("c 词提"));
+
+        // 在线与离线打字态：展示 Ctrl-H 词提
+        assert!(hint_text(false, false, true, false, false).contains("Ctrl-H 词提"));
+        assert!(hint_text(false, false, false, false, false).contains("Ctrl-H 词提"));
+    }
+
+    #[test]
+    fn toggle_code_hint_flashes_and_fades() {
+        let mut app = test_app(file_text("测试"));
+        assert_eq!(app.code_hint_status(), None);
+
+        // 初始 code_hint 为 true，toggle 后变为 false
+        app.settings.code_hint = true;
+        app.toggle_code_hint();
+        assert!(!app.settings.code_hint);
+        let (msg, style) = app.code_hint_status().expect("应有闪现提示");
+        assert_eq!(msg, "✓ 词提：关");
+        assert_eq!(style.fg, Some(app.palette().accent));
+
+        // 再次 toggle，变为 true
+        app.toggle_code_hint();
+        assert!(app.settings.code_hint);
+        let (msg, style) = app.code_hint_status().expect("应有闪现提示");
+        assert_eq!(msg, "✓ 词提：开");
+        assert_eq!(style.fg, Some(app.palette().accent));
+
+        // 过期后变为 None
+        app.code_hint_flash_at = Some((true, Instant::now() - Duration::from_millis(1)));
+        assert_eq!(app.code_hint_status(), None);
+    }
+
+    #[test]
     fn no_arg_startup_loads_default_builtin() {
         // 默认载入首套内置赛文（常用单字前五百）：内容非空、来源为 Builtin、可重打。
         let text = load_builtin_text(BUILTIN_SETS[0]);
@@ -8495,8 +8763,8 @@ mod tests {
         assert_eq!(BUILTIN_SETS[3].name(), "常用词组前五百");
         assert_eq!(BUILTIN_SETS[4].name(), "常用词组中五百");
         assert_eq!(BUILTIN_SETS[5].name(), "常用词组后五百");
-        assert_eq!(BUILTIN_SETS[6].name(), "yoyo 单字");
-        assert_eq!(BUILTIN_SETS[7].name(), "空明码一击词");
+        assert_eq!(BUILTIN_SETS[6].name(), "空明码一击词");
+        assert_eq!(BUILTIN_SETS[7].name(), "空明码一击字");
     }
 
     #[test]
@@ -8513,26 +8781,8 @@ mod tests {
     }
 
     #[test]
-    fn yoyo_chars_set_is_large_and_deduped() {
-        let set = BUILTIN_SETS[6];
-        assert_eq!(set.name(), "yoyo 单字");
-        let text = load_builtin_text(set);
-        let chars: Vec<char> = text.content.chars().collect();
-        assert!(
-            chars.len() > 6000,
-            "yoyo 单字应约 6640 字，实际 {}",
-            chars.len()
-        );
-        // 内容应无重复单字（即社区常说的「6636 单字无重」）。
-        let mut sorted = chars.clone();
-        sorted.sort_unstable();
-        sorted.dedup();
-        assert_eq!(sorted.len(), chars.len(), "yoyo 单字应无重复");
-    }
-
-    #[test]
     fn builtin_progress_persists_and_resume_prompt_appears() {
-        let set = BUILTIN_SETS[6]; // yoyo 单字
+        let set = BUILTIN_SETS[0]; // 常用单字前五百
         let text = load_builtin_text(set);
         let mut app = test_app(text);
 
@@ -8557,7 +8807,7 @@ mod tests {
 
         // 再次打开该内置赛文：应弹出续打选择而非直接开打
         app.resume_prompt = None;
-        app.builtin_selection = 6;
+        app.builtin_selection = 0;
         app.load_selected_builtin();
         assert!(app.resume_prompt.is_some(), "有存档进度时应弹出续打选择");
 
@@ -8574,7 +8824,7 @@ mod tests {
 
     #[test]
     fn resume_prompt_popup_renders_in_separate_modal() {
-        let set = BUILTIN_SETS[6]; // yoyo 单字
+        let set = BUILTIN_SETS[0]; // 常用单字前五百
         let mut app = test_app(load_builtin_text(set));
         // 制造进度：打完前两组
         app.start_builtin_set(set, 0);
@@ -8586,14 +8836,14 @@ mod tests {
         app.session.type_text(&g2);
         app.persist_builtin_progress_if_changed();
         // 触发续打弹窗
-        app.builtin_selection = 6;
+        app.builtin_selection = 0;
         app.load_selected_builtin();
         assert!(app.resume_prompt.is_some(), "有存档时应弹出续打选择");
 
         // 弹窗应为独立模态层：含标题、赛文名、进度、按键提示（侧边栏不再内联展示）
         let buf = render_buffer_text(&app, 100, 30);
         assert!(buf.contains("续打进度"), "应渲染独立的续打弹窗标题");
-        assert!(buf.contains("yoyo单字"), "应显示赛文名");
+        assert!(buf.contains("常用单字前五百"), "应显示赛文名");
         assert!(buf.contains("已完成"), "应显示进度文案");
         assert!(buf.contains("继续"), "应提供继续选项");
         assert!(buf.contains("重置"), "应提供重置进度选项");
@@ -9862,6 +10112,86 @@ mod tests {
         assert!(
             code_hint_overlay_line(&char_session, &char_text, Some(&dict), theme).is_none(),
             "单字赛文不应生成提示行"
+        );
+    }
+
+    #[test]
+    fn code_hint_overlay_shows_physical_chord_for_kongming_one_hit_chars() {
+        let theme = Theme::preset(ThemePreset::CatppuccinMocha);
+        let set = BuiltinSet::KongmingOneHitChars;
+        let text = load_builtin_text(set);
+        let mut session = Session::new_gated_with_words_and_size(&text.content, true, &[], 10);
+
+        // 无词典（None）也能成功生成提示行！
+        let line = code_hint_overlay_line(&session, &text, None, theme)
+            .expect("空明一击字即便无词典也应生成物理指法提示行");
+
+        // 首字是「中」，在 KONGMING_1HIT_CHORDS 中物理键为 "f"，左手（HintHand::Left）
+        // 左手颜色应为 theme.hand_left
+        let left_color = color(theme.hand_left);
+        let first_hint_span = line
+            .spans
+            .iter()
+            .find(|s| s.content.contains('f'))
+            .expect("首格应含 f 提示");
+        assert_eq!(first_hint_span.style.fg, Some(left_color));
+
+        // 正确输入首字后，首格提示应隐藏（留空占位）
+        session.type_text("中");
+        let line_after_type = code_hint_overlay_line(&session, &text, None, theme)
+            .expect("输入后仍应生成提示行");
+        // 首格提示应为空格字符串
+        let first_cell_text = &line_after_type.spans[0].content;
+        assert!(
+            first_cell_text.chars().all(|c| c == ' '),
+            "已打字提示格应留空: {first_cell_text:?}"
+        );
+
+        // 退格回改后，提示重现
+        session.backspace();
+        let line_after_backspace = code_hint_overlay_line(&session, &text, None, theme)
+            .expect("退格后仍应生成提示行");
+        let first_span_revived = line_after_backspace
+            .spans
+            .iter()
+            .find(|s| s.content.contains('f'));
+        assert!(first_span_revived.is_some(), "退格后首格 f 提示应重现");
+    }
+
+    #[test]
+    fn code_hint_kongming_one_hit_chars_cell_widths_and_alignment() {
+        let theme = Theme::preset(ThemePreset::CatppuccinMocha);
+        let set = BuiltinSet::KongmingOneHitChars;
+        let text = load_builtin_text(set);
+        let session = Session::new_gated_with_words_and_size(&text.content, true, &[], 10);
+
+        // builtin_cell_widths 计算出的列宽
+        let widths = builtin_cell_widths(&session, &text, None).expect("空明码一击字应有词格列宽");
+        assert_eq!(widths.len(), 10);
+
+        // 原文行带 widths 与不带 widths
+        let orig_with_widths = original_line(&session, &text, theme, false, Some(&widths));
+        let orig_without_widths = original_line(&session, &text, theme, false, None);
+        assert_ne!(
+            orig_with_widths.lines[0].spans.len(),
+            orig_without_widths.lines[0].spans.len()
+        );
+
+        // 提示行宽度与原文行宽度对齐
+        let hint_line = code_hint_overlay_line(&session, &text, None, theme).unwrap();
+        let hint_width: usize = hint_line
+            .spans
+            .iter()
+            .map(|s| dazitui_core::display_width(&s.content))
+            .sum();
+        let orig_width: usize = orig_with_widths.lines[0]
+            .spans
+            .iter()
+            .map(|s| dazitui_core::display_width(&s.content))
+            .sum();
+        assert_eq!(
+            hint_width, orig_width,
+            "提示行与带格宽对照行总宽度必须绝对一致"
         );
     }
 
