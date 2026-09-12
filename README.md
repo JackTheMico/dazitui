@@ -25,12 +25,12 @@
 
 | 操作系统 | 架构 / 平台 | 预编译包下载 | 说明 |
 | :--- | :--- | :--- | :--- |
-| 🐧 **Linux** | x86_64 (glibc) | [dazitui-v1.0.13-x86_64-unknown-linux-gnu.tar.gz](https://github.com/JackTheMico/dazitui/releases/latest) | 推荐 Ubuntu / Debian / Fedora / Arch |
-| 🐧 **Linux** | x86_64 (musl 静态编译) | [dazitui-v1.0.13-x86_64-unknown-linux-musl.tar.gz](https://github.com/JackTheMico/dazitui/releases/latest) | 零动态库依赖，全发行版及 Alpine 通用 |
-| 🐧 **Linux** | ARM64 / aarch64 | [dazitui-v1.0.13-aarch64-unknown-linux-gnu.tar.gz](https://github.com/JackTheMico/dazitui/releases/latest) | 树莓派 / ARM 架构 Linux 设备 |
-| 🍎 **macOS** | Apple Silicon (M1/M2/M3/M4) | [dazitui-v1.0.13-aarch64-apple-darwin.tar.gz](https://github.com/JackTheMico/dazitui/releases/latest) | 原生 ARM64 极致性能 |
-| 🍎 **macOS** | Intel x86_64 | [dazitui-v1.0.13-x86_64-apple-darwin.tar.gz](https://github.com/JackTheMico/dazitui/releases/latest) | 兼容 Intel 处理器 Mac |
-| 🪟 **Windows** | x86_64 (MSVC) | [dazitui-v1.0.13-x86_64-pc-windows-msvc.zip](https://github.com/JackTheMico/dazitui/releases/latest) | 解压即用 `dazitui.exe`（推荐 Windows Terminal） |
+| 🐧 **Linux** | x86_64 (glibc) | [dazitui-v1.0.14-x86_64-unknown-linux-gnu.tar.gz](https://github.com/JackTheMico/dazitui/releases/latest) | 推荐 Ubuntu / Debian / Fedora / Arch |
+| 🐧 **Linux** | x86_64 (musl 静态编译) | [dazitui-v1.0.14-x86_64-unknown-linux-musl.tar.gz](https://github.com/JackTheMico/dazitui/releases/latest) | 零动态库依赖，全发行版及 Alpine 通用 |
+| 🐧 **Linux** | ARM64 / aarch64 | [dazitui-v1.0.14-aarch64-unknown-linux-gnu.tar.gz](https://github.com/JackTheMico/dazitui/releases/latest) | 树莓派 / ARM 架构 Linux 设备 |
+| 🍎 **macOS** | Apple Silicon (M1/M2/M3/M4) | [dazitui-v1.0.14-aarch64-apple-darwin.tar.gz](https://github.com/JackTheMico/dazitui/releases/latest) | 原生 ARM64 极致性能 |
+| 🍎 **macOS** | Intel x86_64 | [dazitui-v1.0.14-x86_64-apple-darwin.tar.gz](https://github.com/JackTheMico/dazitui/releases/latest) | 兼容 Intel 处理器 Mac |
+| 🪟 **Windows** | x86_64 (MSVC) | [dazitui-v1.0.14-x86_64-pc-windows-msvc.zip](https://github.com/JackTheMico/dazitui/releases/latest) | 解压即用 `dazitui.exe`（推荐 Windows Terminal） |
 
 ### ⚡ Linux & macOS 一键快速下载运行
 
