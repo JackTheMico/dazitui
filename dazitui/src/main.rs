@@ -3636,8 +3636,8 @@ fn handle_text(
     }
     if let Some(dict) = scheme_dict {
         let (strokes, keys) = dict.resolve_strokes_and_keys(text);
-        for c in text.chars() {
-            session.record_key(&c.to_string());
+        for k in &keys {
+            session.record_key(k);
         }
         session.type_text_with_strokes_at(text, strokes, elapsed);
         for k in &keys {
@@ -13957,6 +13957,51 @@ mod tests {
 
         // 击数应为并击 1 击，而非 4 击
         assert_eq!(session.total_strokes(), 1);
+    }
+
+    #[test]
+    fn handle_text_four_auto_commit_records_physical_keys_and_space() {
+        let mut dict = SchemeDict::default();
+        dict.set_four_auto_commit(true);
+        dict.add_entry("做", "jc");
+        dict.add_entry("结果", "igqe");
+
+        let mut session = Session::new("做结果");
+        let mut live_kb = LiveKeyboard::new();
+        let now = Instant::now();
+
+        handle_text(
+            &mut session,
+            &mut live_kb,
+            Some(&dict),
+            "做",
+            Duration::from_millis(100),
+            now,
+        );
+
+        // 做为 2 码简码，应计 3 击，包含 j、c 与 Space
+        assert_eq!(session.total_strokes(), 3);
+        assert_eq!(session.key_counts().get("j"), Some(&1));
+        assert_eq!(session.key_counts().get("c"), Some(&1));
+        assert_eq!(session.key_counts().get("Space"), Some(&1));
+        assert_eq!(session.key_counts().get("做"), None);
+
+        handle_text(
+            &mut session,
+            &mut live_kb,
+            Some(&dict),
+            "结果",
+            Duration::from_millis(200),
+            now,
+        );
+
+        // 结果为 4 码定长词，应再加 4 击，包含 i、g、q、e（无额外 Space）
+        assert_eq!(session.total_strokes(), 3 + 4);
+        assert_eq!(session.key_counts().get("i"), Some(&1));
+        assert_eq!(session.key_counts().get("g"), Some(&1));
+        assert_eq!(session.key_counts().get("q"), Some(&1));
+        assert_eq!(session.key_counts().get("e"), Some(&1));
+        assert_eq!(session.key_counts().get("结果"), None);
     }
 
     #[test]

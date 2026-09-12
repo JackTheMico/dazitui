@@ -32,6 +32,14 @@ pub struct SchemeDict {
     /// 每条命中编码对应 **1 击**，而非按字符逐个数（不像 yoyo-pure-km 那样每个逻辑码元计 1 击）。
     /// 该标记由 `load_from_file` 依据 algebra 规则自动判定，默认 false。
     pure_chord: bool,
+    /// 是否为定长 4 码自动上屏形码方案（如万象虎、官虎等）。
+    ///
+    /// 此类方案下：
+    /// - 4 码词/单字唯一定长自动上屏，记 4 击（无空格）；
+    /// - 1、2、3 码简码独立上屏必须按空格，记 码长 + 1 击（展开追加 Space）；
+    /// - 句中简词引导键 `/` 计入击数与按键序列；
+    /// - 不追加双拼次选 `'` 提交符。
+    four_auto_commit: bool,
 }
 
 /// 规范路径：解析软链到真实文件，失败则回退原路径（与 watcher canonicalize 策略一致）。
@@ -338,6 +346,10 @@ impl SchemeDict {
     /// 且 d 以 c 为严格前缀（如 文化 `vw`⊂`vwah`），则 c 需键入 `'` 提交候选（次选）。
     /// 单手简码（`_`/`+` 前缀）与双手并击全码分属不同输入方式，不补 `'`。
     fn rebuild_prefix_commit_codes(&mut self) {
+        if self.four_auto_commit {
+            self.prefix_commit_codes.clear();
+            return;
+        }
         let mut set = HashSet::new();
         for codes in self.word_to_codes.values() {
             let unprefixed: Vec<&str> = codes
@@ -368,9 +380,64 @@ impl SchemeDict {
         self.pure_chord
     }
 
+    /// 是否为定长 4 码自动上屏形码方案（如万象虎、官虎等）。
+    pub fn is_four_auto_commit(&self) -> bool {
+        self.four_auto_commit
+    }
+
+    /// 设置定长 4 码自动上屏标记。
+    pub fn set_four_auto_commit(&mut self, val: bool) {
+        self.four_auto_commit = val;
+        if val {
+            self.prefix_commit_codes.clear();
+        }
+    }
+
     /// 设置并击代数指法规则引擎。
     pub fn set_chord_algebra(&mut self, algebra: ChordAlgebra) {
         self.chord_algebra = Some(algebra);
+    }
+
+    /// 自动检测是否为 4 码自动上屏形码方案（万象虎、虎码、五笔等）。
+    fn detect_four_auto_commit(
+        schema_doc: Option<&YamlValue>,
+        schema_name: Option<&str>,
+        schema_stem: &str,
+        has_chord_algebra: bool,
+    ) -> bool {
+        if has_chord_algebra {
+            return false;
+        }
+        if let Some(doc) = schema_doc {
+            let has_fac = doc.get("char_word/four_auto_commit").and_then(|v| v.as_str()) == Some("true")
+                || doc.get("translator/four_auto_commit").and_then(|v| v.as_str()) == Some("true")
+                || doc.get("four_auto_commit").and_then(|v| v.as_str()) == Some("true");
+            if has_fac {
+                return true;
+            }
+            let is_max_4 = doc.get("speller/max_code_length").and_then(|v| v.as_str()) == Some("4");
+            if is_max_4 {
+                return true;
+            }
+            let schema_id = doc.get("schema/schema_id").and_then(|v| v.as_str()).unwrap_or("");
+            if schema_id == "tiger" || schema_id == "tigress" || schema_id.contains("wubi") {
+                return true;
+            }
+        }
+        let stem_lower = schema_stem.to_ascii_lowercase();
+        if stem_lower == "tiger"
+            || stem_lower == "tigress"
+            || stem_lower.starts_with("tiger")
+            || stem_lower.contains("wubi")
+        {
+            return true;
+        }
+        if let Some(name) = schema_name {
+            if name.contains('虎') || name.contains("五笔") {
+                return true;
+            }
+        }
+        false
     }
 
     /// 从 .schema.yaml 文档中提取所有声明的词典名称，按优先级（`initial_quality` 降序）返回。
@@ -486,6 +553,15 @@ impl SchemeDict {
             dict.source_paths.push(canonicalize_path(path));
 
             dict.pure_chord = algebra.is_some() && rules_have_long_code_cap(&rules);
+            dict.four_auto_commit = Self::detect_four_auto_commit(
+                schema_doc.as_ref(),
+                schema_name.as_deref(),
+                schema_stem,
+                algebra.is_some(),
+            );
+            if dict.four_auto_commit {
+                dict.prefix_commit_codes.clear();
+            }
             if let Some(alg) = algebra {
                 dict.set_chord_algebra(alg);
             }
@@ -522,7 +598,18 @@ impl SchemeDict {
             }
             dict.pure_chord =
                 dict.chord_algebra.is_some() && rules_have_long_code_cap(&rules);
-            if let Some(name) = Self::extract_schema_name(&schema_candidate) {
+            let companion_doc = resolver.load_doc(&schema_candidate).ok().cloned();
+            let schema_name = Self::extract_schema_name(&schema_candidate);
+            dict.four_auto_commit = Self::detect_four_auto_commit(
+                companion_doc.as_ref(),
+                schema_name.as_deref().or(dict.name.as_deref()),
+                stem,
+                dict.chord_algebra.is_some(),
+            );
+            if dict.four_auto_commit {
+                dict.prefix_commit_codes.clear();
+            }
+            if let Some(name) = schema_name {
                 dict.set_name(name);
             }
         }
@@ -656,13 +743,17 @@ impl SchemeDict {
             .count() as u32
     }
 
-    /// 计算指定编码在当前方案下的实际击数（结合 `pure_chord` 标记）。
+    /// 计算指定编码在当前方案下的实际击数（结合 `pure_chord` 与 `four_auto_commit` 标记）。
     ///
     /// - 纯并击方案（如空明码等声韵并击方案）：
     ///   - 空格并击简词（`%` 开头）计 1 击；
     ///   - 单字并击（如 `a=`、`Ab`、`y'` 等长 1~2 编码）对应 1 次并击，计 1 击；
     ///   - 双字词全码/双击词（如 `YJyY`、`bGCw`、`AB*=` 等长 3~4 编码）对应 2 次并击，计 2 击；
     ///   - 多字长词按声韵并击模型 `clean_len.div_ceil(2)` 折算实际击数（过滤 `_`、`+`、`-` 与空白符）；
+    /// - 定长形码方案（如万象虎、官虎等 4 码自动上屏形码）：
+    ///   - 引导键结尾（如 `fjjr/`）计码长（保留 `/` 击数，无需空格）；
+    ///   - 4 码定长唯一定位上屏，计 4 击（无需空格）；
+    ///   - 1、2、3 码简码/短码独立出字必须敲空格上屏，计 `码长 + 1` 击；
     /// - 其他方案（如 yoyo-pure-km）：沿用「每个独立逻辑码元计 1 击」模型
     ///   （见 [`SchemeDict::calculate_code_strokes`]）。
     pub fn code_strokes(&self, code: &str) -> u32 {
@@ -678,6 +769,25 @@ impl SchemeDict {
                 .filter(|&c| c != '_' && c != '+' && c != '-' && !c.is_whitespace())
                 .count();
             return (clean_len as u32).div_ceil(2).max(1);
+        }
+        if self.four_auto_commit {
+            let clean_len = code
+                .chars()
+                .filter(|&c| c.is_ascii_alphanumeric() || c == '/' || c == ';' || c == '*' || c == '[' || c == ']')
+                .count() as u32;
+            if clean_len == 0 {
+                return 1;
+            }
+            if code.ends_with('/') {
+                return clean_len;
+            }
+            if clean_len == 4 {
+                return 4;
+            }
+            if clean_len < 4 {
+                return clean_len + 1;
+            }
+            return clean_len;
         }
         Self::calculate_code_strokes(code)
     }
@@ -828,8 +938,8 @@ impl SchemeDict {
     /// 用于 yoyo 双拼中短码为长码严格前缀的字词（如 文化 `vw`⊂`vwah`），
     /// 提示用户键入 `'` 提交该候选（次选）。
     fn apply_commit_terminator(&self, code: String) -> String {
-        // 空格并击简词（% 前缀）一击上屏，无需 ' 提交符，也不应被追加。
-        if code.starts_with('%') {
+        // 空格并击简词（% 前缀）一击上屏，定长形码方案（four_auto_commit）无需 ' 提交符，也不应被追加。
+        if self.four_auto_commit || self.pure_chord || code.starts_with('%') {
             return code;
         }
         let stripped = code.strip_prefix(['_', '+', '-']).unwrap_or(&code);
@@ -891,6 +1001,17 @@ impl SchemeDict {
     pub fn decompose_code(&self, code: &str) -> Vec<String> {
         if let Some(ref algebra) = self.chord_algebra {
             algebra.decompose_code(code)
+        } else if self.four_auto_commit {
+            let mut keys = Vec::new();
+            for c in code.chars() {
+                if c.is_ascii_alphanumeric() || c == '/' || c == ';' || c == '*' || c == '[' || c == ']' {
+                    keys.push(c.to_ascii_lowercase().to_string());
+                }
+            }
+            if !keys.is_empty() && !code.ends_with('/') && keys.len() < 4 {
+                keys.push("Space".to_string());
+            }
+            keys
         } else {
             Self::decompose_code_to_keys(code)
         }
@@ -2571,5 +2692,41 @@ algebra:
             default_rime_data_dir_from(env_linux, false, false),
             PathBuf::from("/home/alice/.local/share/fcitx5/rime")
         );
+    }
+
+    #[test]
+    fn test_four_auto_commit_scheme_strokes_and_keys() {
+        let mut dict = SchemeDict::default();
+        dict.set_four_auto_commit(true);
+        dict.add_entry("我", "t");
+        dict.add_entry("做", "jc");
+        dict.add_entry("完", "wmp");
+        dict.add_entry("结果", "igqe");
+        dict.add_entry("一个人", "fjjr/");
+
+        // 1码: t + Space -> 2
+        assert_eq!(dict.code_strokes("t"), 2);
+        assert_eq!(dict.decompose_code("t"), vec!["t", "Space"]);
+
+        // 2码: jc + Space -> 3
+        assert_eq!(dict.code_strokes("jc"), 3);
+        assert_eq!(dict.decompose_code("jc"), vec!["j", "c", "Space"]);
+
+        // 3码: wmp + Space -> 4
+        assert_eq!(dict.code_strokes("wmp"), 4);
+        assert_eq!(dict.decompose_code("wmp"), vec!["w", "m", "p", "Space"]);
+
+        // 4码: igqe -> 4 (无空格)
+        assert_eq!(dict.code_strokes("igqe"), 4);
+        assert_eq!(dict.decompose_code("igqe"), vec!["i", "g", "q", "e"]);
+
+        // 5码引导简词: fjjr/ -> 5 (包含 '/')
+        assert_eq!(dict.code_strokes("fjjr/"), 5);
+        assert_eq!(dict.decompose_code("fjjr/"), vec!["f", "j", "j", "r", "/"]);
+
+        // resolve_strokes_and_keys 复合匹配
+        let (strokes, keys) = dict.resolve_strokes_and_keys("做完结果");
+        assert_eq!(strokes, 3 + 4 + 4);
+        assert_eq!(keys, vec!["j", "c", "Space", "w", "m", "p", "Space", "i", "g", "q", "e"]);
     }
 }

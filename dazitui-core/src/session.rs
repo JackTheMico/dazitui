@@ -529,6 +529,11 @@ impl Session {
         *self.key_counts.entry(key.to_string()).or_insert(0) += 1;
     }
 
+    /// 获取当前按键频率统计映射。
+    pub fn key_counts(&self) -> &HashMap<String, u32> {
+        &self.key_counts
+    }
+
     /// 筛选在滑动窗口 `(t_start, t]` 内的打字事件及有效时间跨度（带前 0.5s 平滑防抖）。
     fn events_in_window(&self, t: f64, window: f64) -> (impl Iterator<Item = &TypingEvent>, f64) {
         let t_start = (t - window).max(0.0);
