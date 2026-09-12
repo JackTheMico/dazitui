@@ -157,6 +157,29 @@ pub struct TargetFailure {
     pub target_kps: f64,
 }
 
+impl TargetFailure {
+    /// 格式化未达标提示文案（仅展示已设定的门槛项）。
+    pub fn format_notice(&self) -> String {
+        let has_kps = self.target_kps > 0.0;
+        let has_wpm = self.target_wpm > 0;
+        match (has_wpm, has_kps) {
+            (true, true) => format!(
+                "未达标 (速度: {:.0}/{} WPM, 击键: {:.1}/{:.1}) — 已重置，按任意键重打",
+                self.actual_wpm, self.target_wpm, self.actual_kps, self.target_kps
+            ),
+            (true, false) => format!(
+                "未达标 (速度: {:.0}/{} WPM) — 已重置，按任意键重打",
+                self.actual_wpm, self.target_wpm
+            ),
+            (false, true) => format!(
+                "未达标 (击键: {:.1}/{:.1}) — 已重置，按任意键重打",
+                self.actual_kps, self.target_kps
+            ),
+            (false, false) => "未达标 — 已重置，按任意键重打".to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct GroupSnapshot {
     events_len: usize,
@@ -417,7 +440,7 @@ impl Session {
                         let group_wpm = if dur_mins > 0.0001 {
                             char_count as f64 / dur_mins
                         } else {
-                            char_count as f64 * 60.0 / 0.001
+                            0.0
                         };
                         let snap_strokes =
                             self.group_snapshot.as_ref().map(|s| s.total_strokes).unwrap_or(0);
@@ -425,13 +448,21 @@ impl Session {
                         let group_kps = if dur_secs > 0.0001 {
                             group_strokes as f64 / dur_secs
                         } else {
-                            group_strokes as f64 / 0.001
+                            0.0
                         };
 
-                        let kps_met = self.target_kps <= 0.0 || group_kps >= self.target_kps;
-                        let wpm_met = self.target_wpm == 0 || group_wpm >= self.target_wpm as f64;
+                        let has_kps = self.target_kps > 0.0;
+                        let has_wpm = self.target_wpm > 0;
+                        let passed = match (has_kps, has_wpm) {
+                            (true, true) => {
+                                group_kps >= self.target_kps || group_wpm >= self.target_wpm as f64
+                            }
+                            (true, false) => group_kps >= self.target_kps,
+                            (false, true) => group_wpm >= self.target_wpm as f64,
+                            (false, false) => true,
+                        };
 
-                        if kps_met || wpm_met {
+                        if passed {
                             self.completed_groups += 1;
                             self.group_start_elapsed = None;
                             self.group_snapshot = None;
@@ -1452,9 +1483,54 @@ mod tests {
         // KPS = 1.0 (< 15.0，未达成)
         // WPM = 60 (>= 30，达成！)
         // OR 逻辑下应该放行！
-        session.type_text_with_strokes_at("一二三四五六七八九十", 10, Duration::from_secs(10));
+        session.type_text_with_strokes_at("一", 1, Duration::ZERO);
+        session.type_text_with_strokes_at("二三四五六七八九十", 9, Duration::from_secs(10));
         assert_eq!(session.completed_groups(), 1);
         assert!(session.is_complete());
         assert!(session.take_target_failure().is_none());
+    }
+
+    #[test]
+    fn repro_single_target_kps_below_target_should_fail() {
+        let text = "一二三四五六七八九十";
+        let mut session = Session::new_gated_with_words_and_size(text, true, &[], 10);
+        // 用户仅配置目标击键 8.0，目标速度为 0（关）
+        session.set_targets(8.0, 0);
+
+        // 用时 10 秒打完 10 个字（第一字 0s，后续 10s），实际击键 1.0 < 8.0，实际速度 60 WPM
+        session.type_text_with_strokes_at("一", 1, Duration::ZERO);
+        session.type_text_with_strokes_at("二三四五六七八九十", 9, Duration::from_secs(10));
+
+        // 预期未达标被阻断（completed_groups 应为 0）
+        assert_eq!(session.completed_groups(), 0, "仅设目标击键且未达标时，绝不能放行");
+        assert!(session.take_target_failure().is_some());
+    }
+
+    #[test]
+    fn repro_single_target_wpm_below_target_should_fail() {
+        let text = "一二三四五六七八九十";
+        let mut session = Session::new_gated_with_words_and_size(text, true, &[], 10);
+        // 用户仅配置目标速度 120 WPM，目标击键为 0.0（关）
+        session.set_targets(0.0, 120);
+
+        // 用时 10 秒打完 10 个字，实际速度 60 WPM < 120 WPM
+        session.type_text_with_strokes_at("一", 1, Duration::ZERO);
+        session.type_text_with_strokes_at("二三四五六七八九十", 9, Duration::from_secs(10));
+
+        // 预期未达标被阻断（completed_groups 应为 0）
+        assert_eq!(session.completed_groups(), 0, "仅设目标速度且未达标时，绝不能放行");
+        assert!(session.take_target_failure().is_some());
+    }
+
+    #[test]
+    fn repro_single_batch_commit_should_not_fabricate_speed() {
+        let text = "一二三四五六七八九十";
+        let mut session = Session::new_gated_with_words_and_size(text, true, &[], 10);
+        session.set_targets(8.0, 100);
+
+        // 一次性打完/提交 10 个字，耗时为 0 时绝不能虚构 600,000 WPM 放行！
+        session.type_text_with_strokes_at("一二三四五六七八九十", 10, Duration::from_secs(5));
+        assert_eq!(session.completed_groups(), 0, "单次瞬间提交不能虚构速度放行");
+        assert!(session.take_target_failure().is_some());
     }
 }

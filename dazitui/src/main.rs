@@ -2504,14 +2504,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                                     Instant::now(),
                                 );
                                 if let Some(failure) = app.session.take_target_failure() {
-                                    let msg = format!(
-                                        "未达标 (WPM: {:.0}/{}, 击键: {:.1}/{:.1}) — 已重置，按任意键重打",
-                                        failure.actual_wpm,
-                                        failure.target_wpm,
-                                        failure.actual_kps,
-                                        failure.target_kps,
-                                    );
-                                    app.target_failure_notice = Some(msg);
+                                    app.target_failure_notice = Some(failure.format_notice());
                                     app.active_start = None;
                                     app.accumulated_elapsed = app.group_start_accumulated_elapsed;
                                 }
@@ -2536,14 +2529,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                                     Instant::now(),
                                 );
                                 if let Some(failure) = app.session.take_target_failure() {
-                                    let msg = format!(
-                                        "未达标 (WPM: {:.0}/{}, 击键: {:.1}/{:.1}) — 已重置，按任意键重打",
-                                        failure.actual_wpm,
-                                        failure.target_wpm,
-                                        failure.actual_kps,
-                                        failure.target_kps,
-                                    );
-                                    app.target_failure_notice = Some(msg);
+                                    app.target_failure_notice = Some(failure.format_notice());
                                     app.active_start = None;
                                     app.accumulated_elapsed = app.group_start_accumulated_elapsed;
                                 }
@@ -2667,20 +2653,14 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                                     Instant::now(),
                                 );
                                 if let Some(failure) = app.session.take_target_failure() {
-                                    let msg = format!(
-                                        "未达标 (WPM: {:.0}/{}, 击键: {:.1}/{:.1}) — 已重置，按任意键重打",
-                                        failure.actual_wpm,
-                                        failure.target_wpm,
-                                        failure.actual_kps,
-                                        failure.target_kps,
-                                    );
-                                    app.target_failure_notice = Some(msg);
+                                    app.target_failure_notice = Some(failure.format_notice());
                                     app.active_start = None;
                                     app.accumulated_elapsed = app.group_start_accumulated_elapsed;
                                 }
                                 if app.session.is_complete() {
                                     finish_and_maybe_upload(&mut app, terminal)?;
                                 }
+                                app.persist_builtin_progress_if_changed();
                             } else if let KeyCode::Char(c) = key.code {
                                 app.target_failure_notice = None;
                                 let (text, next_key) = drain_pending_chars(c)?;
@@ -2696,20 +2676,14 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                                     Instant::now(),
                                 );
                                 if let Some(failure) = app.session.take_target_failure() {
-                                    let msg = format!(
-                                        "未达标 (WPM: {:.0}/{}, 击键: {:.1}/{:.1}) — 已重置，按任意键重打",
-                                        failure.actual_wpm,
-                                        failure.target_wpm,
-                                        failure.actual_kps,
-                                        failure.target_kps,
-                                    );
-                                    app.target_failure_notice = Some(msg);
+                                    app.target_failure_notice = Some(failure.format_notice());
                                     app.active_start = None;
                                     app.accumulated_elapsed = app.group_start_accumulated_elapsed;
                                 }
                                 if app.session.is_complete() {
                                     finish_and_maybe_upload(&mut app, terminal)?;
                                 }
+                                app.persist_builtin_progress_if_changed();
                             }
                         }
                     }
@@ -3293,9 +3267,15 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                         elapsed,
                         now,
                     );
+                    if let Some(failure) = app.session.take_target_failure() {
+                        app.target_failure_notice = Some(failure.format_notice());
+                        app.active_start = None;
+                        app.accumulated_elapsed = app.group_start_accumulated_elapsed;
+                    }
                     if app.session.is_complete() {
                         finish_and_maybe_upload(&mut app, terminal)?;
                     }
+                    app.persist_builtin_progress_if_changed();
                 }
             }
             _ => {}
@@ -15229,14 +15209,7 @@ mod tests {
 
         // 捕获未达标
         let failure = app.session.take_target_failure().expect("必须触发未达标");
-        let msg = format!(
-            "未达标 (WPM: {:.0}/{}, 击键: {:.1}/{:.1}) — 已重置，按任意键重打",
-            failure.actual_wpm,
-            failure.target_wpm,
-            failure.actual_kps,
-            failure.target_kps,
-        );
-        app.target_failure_notice = Some(msg);
+        app.target_failure_notice = Some(failure.format_notice());
         app.active_start = None;
         app.accumulated_elapsed = app.group_start_accumulated_elapsed;
 
@@ -15264,6 +15237,46 @@ mod tests {
         // 下一次打字会清除 notice
         app.target_failure_notice = None;
         assert!(app.target_failure_notice.is_none());
+    }
+
+    #[test]
+    fn app_target_gating_single_target_blocks_properly() {
+        // 测试用户仅设置了单一门槛时的判定（复现 issue：只设一个目标未达标却被放行）
+        let mut app = test_app(load_builtin_text(BUILTIN_SETS[0]));
+        app.settings.target_kps = 8.0;
+        app.settings.target_wpm = 0;
+        app.restart();
+
+        let group_size = app.settings.group_size as usize;
+        let first_char: String = app.text.content.chars().take(1).collect();
+        let rest_group: String = app.text.content.chars().skip(1).take(group_size - 1).collect();
+
+        // 用时 10 秒打完（首字 0s，后续 10s），击键 1.0 < 8.0
+        app.touch_typing();
+        app.session.type_text_with_strokes_at(&first_char, 1, Duration::ZERO);
+        app.session.type_text_with_strokes_at(&rest_group, (group_size - 1) as u32, Duration::from_secs(10));
+
+        let failure = app.session.take_target_failure().expect("仅设 target_kps 且未达标时必须判定失败");
+        assert_eq!(failure.target_kps, 8.0);
+        assert_eq!(failure.target_wpm, 0);
+        assert!(failure.format_notice().contains("击键:"));
+        assert!(!failure.format_notice().contains("速度:")); // 未设 WPM 时不应显示速度 0
+
+        // 测试仅设 WPM
+        let mut app_wpm = test_app(load_builtin_text(BUILTIN_SETS[0]));
+        app_wpm.settings.target_kps = 0.0;
+        app_wpm.settings.target_wpm = 120;
+        app_wpm.restart();
+
+        app_wpm.touch_typing();
+        app_wpm.session.type_text_with_strokes_at(&first_char, 1, Duration::ZERO);
+        app_wpm.session.type_text_with_strokes_at(&rest_group, (group_size - 1) as u32, Duration::from_secs(10));
+
+        let failure_wpm = app_wpm.session.take_target_failure().expect("仅设 target_wpm 且未达标时必须判定失败");
+        assert_eq!(failure_wpm.target_wpm, 120);
+        assert_eq!(failure_wpm.target_kps, 0.0);
+        assert!(failure_wpm.format_notice().contains("速度:"));
+        assert!(!failure_wpm.format_notice().contains("击键:"));
     }
 }
 
