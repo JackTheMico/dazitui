@@ -688,7 +688,7 @@ impl RankColumnConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
     /// 主题预设。
     pub theme: ThemePreset,
@@ -718,6 +718,10 @@ pub struct Settings {
     pub builtin_progress: HashMap<String, BuiltinProgress>,
     /// 在线排行榜各列显隐配置（v2：可定制展示哪些列，默认全显）。
     pub rank_columns: RankColumnConfig,
+    /// 单字练习目标击键（KPS，0.0 表示关闭门槛）。
+    pub target_kps: f64,
+    /// 单字练习目标速度（WPM，0 表示关闭门槛）。
+    pub target_wpm: u16,
 }
 
 impl Settings {
@@ -735,6 +739,12 @@ impl Settings {
     pub const DEFAULT_GROUP_SIZE: u8 = 10;
     /// 常用快捷预设档位列表。
     pub const GROUP_SIZE_PRESETS: &'static [u8] = &[5, 10, 15, 20, 25, 30, 50];
+    /// 单字练习常用目标击键（KPS）预设档位（0.0 表示关闭门槛）。
+    pub const TARGET_KPS_PRESETS: &'static [f64] =
+        &[0.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 12.0, 15.0];
+    /// 单字练习常用目标速度（WPM）预设档位（0 表示关闭门槛）。
+    pub const TARGET_WPM_PRESETS: &'static [u16] =
+        &[0, 40, 50, 60, 70, 80, 90, 100, 120, 140, 160, 180, 200];
 
     /// 校验并修正占比到合法范围。
     pub fn clamp_ratio(ratio: u8) -> u8 {
@@ -761,6 +771,46 @@ impl Settings {
         }
         Self::GROUP_SIZE_PRESETS[0]
     }
+
+    /// 循环获取下一个预设目标击键（KPS）档位。
+    pub fn next_target_kps_preset(current: f64) -> f64 {
+        for &preset in Self::TARGET_KPS_PRESETS {
+            if preset > current + 0.05 {
+                return preset;
+            }
+        }
+        Self::TARGET_KPS_PRESETS[0]
+    }
+
+    /// 循环获取上一个预设目标击键（KPS）档位。
+    pub fn prev_target_kps_preset(current: f64) -> f64 {
+        for &preset in Self::TARGET_KPS_PRESETS.iter().rev() {
+            if preset + 0.05 < current {
+                return preset;
+            }
+        }
+        *Self::TARGET_KPS_PRESETS.last().unwrap_or(&0.0)
+    }
+
+    /// 循环获取下一个预设目标速度（WPM）档位。
+    pub fn next_target_wpm_preset(current: u16) -> u16 {
+        for &preset in Self::TARGET_WPM_PRESETS {
+            if preset > current {
+                return preset;
+            }
+        }
+        Self::TARGET_WPM_PRESETS[0]
+    }
+
+    /// 循环获取上一个预设目标速度（WPM）档位。
+    pub fn prev_target_wpm_preset(current: u16) -> u16 {
+        for &preset in Self::TARGET_WPM_PRESETS.iter().rev() {
+            if preset < current {
+                return preset;
+            }
+        }
+        *Self::TARGET_WPM_PRESETS.last().unwrap_or(&0)
+    }
 }
 
 impl Default for Settings {
@@ -779,6 +829,8 @@ impl Default for Settings {
             monitor_scheme: true,
             builtin_progress: HashMap::new(),
             rank_columns: RankColumnConfig::default(),
+            target_kps: 0.0,
+            target_wpm: 0,
         }
     }
 }
@@ -845,7 +897,7 @@ impl SettingsStore {
             std::fs::create_dir_all(parent)?;
         }
         let mut content = format!(
-            "theme={}\nreference_ratio={}\nbold={}\nkeyboard_mode={}\nscheme={}\ninput_method={}\nheatmap_layout={}\ngroup_size={}\ncode_hint={}\nmonitor_scheme={}\nrank_columns={}\n",
+            "theme={}\nreference_ratio={}\nbold={}\nkeyboard_mode={}\nscheme={}\ninput_method={}\nheatmap_layout={}\ngroup_size={}\ncode_hint={}\nmonitor_scheme={}\nrank_columns={}\ntarget_kps={}\ntarget_wpm={}\n",
             settings.theme.as_str(),
             settings.reference_ratio,
             settings.bold,
@@ -857,6 +909,8 @@ impl SettingsStore {
             settings.code_hint,
             settings.monitor_scheme,
             settings.rank_columns.to_keys(),
+            settings.target_kps,
+            settings.target_wpm,
         );
         for (scheme, path) in &settings.scheme_dict_paths {
             content.push_str(&format!("scheme_dict.{}={}\n", scheme, path));
@@ -940,6 +994,20 @@ impl SettingsStore {
                 "group_size" => {
                     if let Ok(size) = value.parse::<u8>() {
                         settings.group_size = Settings::clamp_group_size(size);
+                    }
+                }
+                "target_kps" => {
+                    if let Ok(v) = value.parse::<f64>() {
+                        if (0.0..=30.0).contains(&v) {
+                            settings.target_kps = v;
+                        }
+                    }
+                }
+                "target_wpm" => {
+                    if let Ok(v) = value.parse::<u16>() {
+                        if v <= 500 {
+                            settings.target_wpm = v;
+                        }
                     }
                 }
                 "rank_columns" => settings.rank_columns.apply_keys(value),
@@ -1159,6 +1227,8 @@ mod tests {
             monitor_scheme: true,
             builtin_progress: HashMap::new(),
             rank_columns: RankColumnConfig::default(),
+            target_kps: 0.0,
+            target_wpm: 0,
         };
         store.save(&s).unwrap();
         assert_eq!(store.load(), s);
@@ -1608,4 +1678,42 @@ mod tests {
         );
         let _ = std::fs::remove_file(store.path());
     }
+
+    #[test]
+    fn target_presets_cycle_properly() {
+        assert_eq!(Settings::next_target_kps_preset(0.0), 3.0);
+        assert_eq!(Settings::next_target_kps_preset(3.0), 4.0);
+        assert_eq!(Settings::next_target_kps_preset(15.0), 0.0);
+        assert_eq!(Settings::prev_target_kps_preset(0.0), 15.0);
+        assert_eq!(Settings::prev_target_kps_preset(3.0), 0.0);
+
+        assert_eq!(Settings::next_target_wpm_preset(0), 40);
+        assert_eq!(Settings::next_target_wpm_preset(40), 50);
+        assert_eq!(Settings::next_target_wpm_preset(200), 0);
+        assert_eq!(Settings::prev_target_wpm_preset(0), 200);
+        assert_eq!(Settings::prev_target_wpm_preset(40), 0);
+    }
+
+    #[test]
+    fn target_kps_and_wpm_roundtrips_through_store() {
+        let store = SettingsStore::new(temp_path("target_roundtrip"));
+        let mut s = Settings::default();
+        s.target_kps = 6.0;
+        s.target_wpm = 60;
+        store.save(&s).unwrap();
+        let loaded = store.load();
+        assert!((loaded.target_kps - 6.0).abs() < 0.001);
+        assert_eq!(loaded.target_wpm, 60);
+
+        // 缺省时默认 0.0 / 0
+        let store_old = SettingsStore::new(temp_path("target_absent"));
+        std::fs::write(store_old.path(), "theme=catppuccin-mocha\n").unwrap();
+        let loaded_old = store_old.load();
+        assert_eq!(loaded_old.target_kps, 0.0);
+        assert_eq!(loaded_old.target_wpm, 0);
+
+        let _ = std::fs::remove_file(store.path());
+        let _ = std::fs::remove_file(store_old.path());
+    }
 }
+

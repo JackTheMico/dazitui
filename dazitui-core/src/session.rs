@@ -144,6 +144,29 @@ fn is_punctuation(c: char) -> bool {
         )
 }
 
+/// 单字练习组末未达标信息。
+#[derive(Debug, Clone, PartialEq)]
+pub struct TargetFailure {
+    /// 实际单组速度（WPM）。
+    pub actual_wpm: f64,
+    /// 目标速度（WPM，0 表示不设限）。
+    pub target_wpm: u16,
+    /// 实际单组击键（KPS）。
+    pub actual_kps: f64,
+    /// 目标击键（KPS，0.0 表示不设限）。
+    pub target_kps: f64,
+}
+
+#[derive(Debug, Clone)]
+struct GroupSnapshot {
+    events_len: usize,
+    total_strokes: u32,
+    edits: u32,
+    phrase_chars: usize,
+    key_counts: HashMap<String, u32>,
+    edit_details_len: usize,
+}
+
 /// 跟打会话状态机。
 ///
 /// 持有原文与当前已上屏的输入，通过 LCS 对齐逐字比对。
@@ -167,6 +190,12 @@ pub struct Session {
     group_bounds: Vec<(usize, usize)>,
     events: Vec<TypingEvent>,
     group_size: usize,
+    target_kps: f64,
+    target_wpm: u16,
+    target_gated: bool,
+    group_start_elapsed: Option<Duration>,
+    group_snapshot: Option<GroupSnapshot>,
+    last_target_failure: Option<TargetFailure>,
 }
 
 impl Session {
@@ -223,12 +252,74 @@ impl Session {
             group_bounds,
             events: Vec::new(),
             group_size,
+            target_kps: 0.0,
+            target_wpm: 0,
+            target_gated: false,
+            group_start_elapsed: None,
+            group_snapshot: None,
+            last_target_failure: None,
         }
     }
 
     /// 获取当前总击数（并击算一击，含回改）。
     pub fn total_strokes(&self) -> u32 {
         self.total_strokes
+    }
+
+    /// 设置单字练习目标门槛（目标击键 KPS 与目标速度 WPM）。
+    pub fn set_targets(&mut self, target_kps: f64, target_wpm: u16) {
+        self.target_kps = target_kps.max(0.0);
+        self.target_wpm = target_wpm;
+        self.target_gated = true;
+    }
+
+    /// 获取当前目标击键设置。
+    pub fn target_kps(&self) -> f64 {
+        self.target_kps
+    }
+
+    /// 获取当前目标速度设置。
+    pub fn target_wpm(&self) -> u16 {
+        self.target_wpm
+    }
+
+    /// 是否开启了目标门槛且至少有一项设定值 > 0。
+    pub fn is_target_gated(&self) -> bool {
+        self.target_gated && (self.target_kps > 0.0 || self.target_wpm > 0)
+    }
+
+    /// 提取并清空最近一次目标未达标信息。
+    pub fn take_target_failure(&mut self) -> Option<TargetFailure> {
+        self.last_target_failure.take()
+    }
+
+    /// 查看最近一次目标未达标信息。
+    pub fn last_target_failure(&self) -> Option<&TargetFailure> {
+        self.last_target_failure.as_ref()
+    }
+
+    fn take_snapshot(&self) -> GroupSnapshot {
+        GroupSnapshot {
+            events_len: self.events.len(),
+            total_strokes: self.total_strokes,
+            edits: self.edits,
+            phrase_chars: self.phrase_chars,
+            key_counts: self.key_counts.clone(),
+            edit_details_len: self.edit_details.len(),
+        }
+    }
+
+    fn rollback_current_group(&mut self, group_start: usize) {
+        self.input.truncate(group_start);
+        if let Some(snap) = self.group_snapshot.take() {
+            self.events.truncate(snap.events_len);
+            self.total_strokes = snap.total_strokes;
+            self.edits = snap.edits;
+            self.phrase_chars = snap.phrase_chars;
+            self.key_counts = snap.key_counts;
+            self.edit_details.truncate(snap.edit_details_len);
+        }
+        self.group_start_elapsed = None;
     }
 
     /// 上屏一段文本：追加到输入末尾，重新与原文比对，返回本次字符的对/错。
@@ -259,6 +350,16 @@ impl Session {
         } else {
             chars.len()
         };
+
+        if accept_len > 0
+            && self.group_gated
+            && self.target_gated
+            && (self.target_kps > 0.0 || self.target_wpm > 0)
+            && self.group_start_elapsed.is_none()
+        {
+            self.group_start_elapsed = Some(elapsed);
+            self.group_snapshot = Some(self.take_snapshot());
+        }
 
         if accept_len > 0 {
             let accepted_slice = &chars[..accept_len];
@@ -308,7 +409,48 @@ impl Session {
                 let all_correct =
                     (group_start..group_end).all(|i| self.input.get(i) == Some(&self.original[i]));
                 if all_correct {
-                    self.completed_groups += 1;
+                    if self.target_gated && (self.target_kps > 0.0 || self.target_wpm > 0) {
+                        let dur = elapsed.saturating_sub(self.group_start_elapsed.unwrap_or(elapsed));
+                        let dur_secs = dur.as_secs_f64();
+                        let dur_mins = dur_secs / 60.0;
+                        let char_count = group_end - group_start;
+                        let group_wpm = if dur_mins > 0.0001 {
+                            char_count as f64 / dur_mins
+                        } else {
+                            char_count as f64 * 60.0 / 0.001
+                        };
+                        let snap_strokes =
+                            self.group_snapshot.as_ref().map(|s| s.total_strokes).unwrap_or(0);
+                        let group_strokes = self.total_strokes.saturating_sub(snap_strokes);
+                        let group_kps = if dur_secs > 0.0001 {
+                            group_strokes as f64 / dur_secs
+                        } else {
+                            group_strokes as f64 / 0.001
+                        };
+
+                        let kps_met = self.target_kps <= 0.0 || group_kps >= self.target_kps;
+                        let wpm_met = self.target_wpm == 0 || group_wpm >= self.target_wpm as f64;
+
+                        if kps_met || wpm_met {
+                            self.completed_groups += 1;
+                            self.group_start_elapsed = None;
+                            self.group_snapshot = None;
+                            self.last_target_failure = None;
+                        } else {
+                            self.last_target_failure = Some(TargetFailure {
+                                actual_wpm: group_wpm,
+                                target_wpm: self.target_wpm,
+                                actual_kps: group_kps,
+                                target_kps: self.target_kps,
+                            });
+                            self.rollback_current_group(group_start);
+                        }
+                    } else {
+                        self.completed_groups += 1;
+                        self.group_start_elapsed = None;
+                        self.group_snapshot = None;
+                        self.last_target_failure = None;
+                    }
                 }
             }
         }
@@ -637,6 +779,9 @@ impl Session {
     pub fn set_completed_groups(&mut self, completed: usize) {
         let completed = completed.min(self.total_groups());
         self.completed_groups = completed;
+        self.group_start_elapsed = None;
+        self.group_snapshot = None;
+        self.last_target_failure = None;
         self.input.clear();
         if completed == 0 {
             return;
@@ -1240,5 +1385,76 @@ mod tests {
         session.type_text("练习跟打输入");
         assert_eq!(session.completed_groups(), 2);
         assert!(session.is_complete());
+    }
+
+    #[test]
+    fn session_target_gating_kps_pass_and_wpm_pass() {
+        let text = "一二三四五六七八九十";
+        // 目标：6.0 KPS 或 60 WPM
+        let mut session = Session::new_gated_with_words_and_size(text, true, &[], 10);
+        session.set_targets(6.0, 60);
+        assert!(session.is_target_gated());
+
+        // 模拟 10 个字用时 5 秒打完，总击数 35 次：
+        // KPS = 35 / 5.0 = 7.0 (>= 6.0，达标！)
+        // WPM = 10 / (5/60) = 120 (>= 60，达标！)
+        session.type_text_with_strokes_at("一二三四五", 15, Duration::from_secs(2));
+        session.type_text_with_strokes_at("六七八九十", 20, Duration::from_secs(5));
+
+        assert_eq!(session.completed_groups(), 1);
+        assert!(session.is_complete());
+        assert!(session.last_target_failure().is_none());
+    }
+
+    #[test]
+    fn session_target_gating_fails_and_rollbacks() {
+        let text = "一二三四五六七八九十";
+        // 目标：8.0 KPS 或 100 WPM
+        let mut session = Session::new_gated_with_words_and_size(text, true, &[], 10);
+        session.set_targets(8.0, 100);
+
+        // 两次输入在 10s 和 20s 发生，组跨度为 20s - 10s = 10s：
+        // KPS = 10 / 10 = 1.0 (< 8.0)
+        // WPM = 10 / (10/60) = 60 (< 100)
+        // 两者皆未达标，应触发自动回滚重打！
+        session.type_text_with_strokes_at("一二三四五", 5, Duration::from_secs(10));
+        session.type_text_with_strokes_at("六七八九十", 5, Duration::from_secs(20));
+
+        assert_eq!(session.completed_groups(), 0, "未达标不应放行进下一组");
+        assert_eq!(session.len(), 0, "输入应被清空回退到组首");
+        assert_eq!(session.total_strokes(), 0, "击数应回滚剥离");
+
+        let failure = session.take_target_failure().expect("应记录未达标信息");
+        assert_eq!(failure.target_wpm, 100);
+        assert_eq!(failure.target_kps, 8.0);
+        assert!((failure.actual_wpm - 60.0).abs() < 1.0);
+        assert!((failure.actual_kps - 1.0).abs() < 0.1);
+        assert!(session.take_target_failure().is_none(), "take 后应清空");
+
+        // 重试尝试：快速打完，用时 1 秒，总击数 10 击
+        // KPS = 10.0 (>= 8.0)，WPM = 600 (>= 100)，达标放行！
+        session.type_text_with_strokes_at("一二三四五", 5, Duration::from_secs(25));
+        session.type_text_with_strokes_at("六七八九十", 5, Duration::from_secs(26));
+
+        assert_eq!(session.completed_groups(), 1, "重试达标后应放行进下一组");
+        assert!(session.is_complete());
+        assert_eq!(session.total_strokes(), 10, "最终统计只包含成功重试的 10 击");
+    }
+
+    #[test]
+    fn session_target_gating_or_logic_one_met() {
+        let text = "一二三四五六七八九十";
+        // 目标：苛刻的 15.0 KPS 或 宽松的 30 WPM
+        let mut session = Session::new_gated_with_words_and_size(text, true, &[], 10);
+        session.set_targets(15.0, 30);
+
+        // 用时 10 秒打完，10 击：
+        // KPS = 1.0 (< 15.0，未达成)
+        // WPM = 60 (>= 30，达成！)
+        // OR 逻辑下应该放行！
+        session.type_text_with_strokes_at("一二三四五六七八九十", 10, Duration::from_secs(10));
+        assert_eq!(session.completed_groups(), 1);
+        assert!(session.is_complete());
+        assert!(session.take_target_failure().is_none());
     }
 }

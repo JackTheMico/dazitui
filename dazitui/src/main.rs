@@ -339,8 +339,10 @@ const FOCUS_INPUT_METHOD: usize = 5;
 const FOCUS_GROUP_SIZE: usize = 6;
 const FOCUS_CODE_HINT: usize = 7;
 const FOCUS_MONITOR_SCHEME: usize = 8;
+const FOCUS_TARGET_KPS: usize = 9;
+const FOCUS_TARGET_WPM: usize = 10;
 /// 设置视图焦点项总数。
-const SETTINGS_FOCUS_COUNT: usize = 9;
+const SETTINGS_FOCUS_COUNT: usize = 11;
 
 /// 成绩视图「错字时间线」一屏最多可见的错字条数（超出部分滚动查看）。
 const ERROR_TIMELINE_VISIBLE: usize = 8;
@@ -842,6 +844,10 @@ struct App {
     db_worker: Option<DbWorker>,
     /// 赞赏与支持视图图片协议缓存。
     sponsor_state: RefCell<Option<SponsorViewState>>,
+    /// 当前单组练习起跑时的累计活跃用时快照（用于未达标时时钟回滚）。
+    group_start_accumulated_elapsed: Duration,
+    /// 目标未达标提示信息（展示在对照区底部，敲击任意键开始重试时清除）。
+    target_failure_notice: Option<String>,
 }
 
 /// 后台异步方案加载的一次性结果回传。
@@ -1044,7 +1050,7 @@ impl App {
                 let _ = settings_store.save(&settings);
             }
         }
-        let session = {
+        let mut session = {
             let wb = text.session_word_boundaries();
             Session::new_gated_with_words_and_size(
                 &text.content,
@@ -1053,6 +1059,9 @@ impl App {
                 settings.group_size as usize,
             )
         };
+        if let TextSource::Builtin { set } = text.source && !set.is_words() {
+            session.set_targets(settings.target_kps, settings.target_wpm);
+        }
         // 自动登录与会话恢复：若未登录且有环境变量则尝试自动登录。
         let login_notice = if !api.is_logged_in()
             && let Some((user, pass)) = env_credentials(|k| std::env::var(k).ok())
@@ -1117,6 +1126,8 @@ impl App {
             code_hint_flash_at: None,
             db_worker,
             sponsor_state: RefCell::new(None),
+            group_start_accumulated_elapsed: Duration::ZERO,
+            target_failure_notice: None,
         };
         app.reload_scheme_dict();
         app
@@ -1715,8 +1726,13 @@ impl App {
             &wb,
             self.settings.group_size as usize,
         );
+        if let TextSource::Builtin { set } = self.text.source && !set.is_words() {
+            self.session.set_targets(self.settings.target_kps, self.settings.target_wpm);
+        }
         self.start = Instant::now();
         self.accumulated_elapsed = Duration::ZERO;
+        self.group_start_accumulated_elapsed = Duration::ZERO;
+        self.target_failure_notice = None;
         self.last_saved_completed = 0;
         self.active_start = None;
         self.paused = false;
@@ -1739,6 +1755,11 @@ impl App {
             &wb,
             self.settings.group_size as usize,
         );
+        if let TextSource::Builtin { set } = self.text.source && !set.is_words() {
+            self.session.set_targets(self.settings.target_kps, self.settings.target_wpm);
+        }
+        self.group_start_accumulated_elapsed = Duration::ZERO;
+        self.target_failure_notice = None;
         self.last_saved_completed = 0;
         self.live_keyboard.clear();
         self.browse_error = None;
@@ -2008,6 +2029,26 @@ impl App {
         }
     }
 
+    /// 循环切换单字目标击键（KPS）档位并即时持久化。
+    fn cycle_target_kps(&mut self) {
+        self.settings.target_kps = Settings::next_target_kps_preset(self.settings.target_kps);
+        let _ = self.settings_store.save(&self.settings);
+        self.refresh_builtin_preview();
+        if let TextSource::Builtin { set } = self.text.source && !set.is_words() {
+            self.session.set_targets(self.settings.target_kps, self.settings.target_wpm);
+        }
+    }
+
+    /// 循环切换单字目标速度（WPM）档位并即时持久化。
+    fn cycle_target_wpm(&mut self) {
+        self.settings.target_wpm = Settings::next_target_wpm_preset(self.settings.target_wpm);
+        let _ = self.settings_store.save(&self.settings);
+        self.refresh_builtin_preview();
+        if let TextSource::Builtin { set } = self.text.source && !set.is_words() {
+            self.session.set_targets(self.settings.target_kps, self.settings.target_wpm);
+        }
+    }
+
     /// 载入当前选中的内置赛文：若已有存档进度则弹出「继续/重开/重置」选择，
     /// 否则直接进入第 0 组跟打。
     fn load_selected_builtin(&mut self) {
@@ -2049,9 +2090,14 @@ impl App {
             &wb,
             self.settings.group_size as usize,
         );
+        if !set.is_words() {
+            self.session.set_targets(self.settings.target_kps, self.settings.target_wpm);
+        }
         self.session.set_completed_groups(completed_groups);
         self.start = Instant::now();
         self.accumulated_elapsed = Duration::ZERO;
+        self.group_start_accumulated_elapsed = Duration::ZERO;
+        self.target_failure_notice = None;
         self.active_start = None;
         self.paused = false;
         self.live_keyboard.clear();
@@ -2105,6 +2151,7 @@ impl App {
         if cg > self.last_saved_completed {
             self.save_builtin_progress(cg);
             self.last_saved_completed = cg;
+            self.group_start_accumulated_elapsed = self.current_elapsed();
         }
     }
 
@@ -2445,6 +2492,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                                 continue;
                             }
                             if key.code == KeyCode::Backspace {
+                                app.target_failure_notice = None;
                                 app.touch_typing();
                                 let elapsed = app.current_elapsed();
                                 handle_key(
@@ -2455,6 +2503,18 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                                     elapsed,
                                     Instant::now(),
                                 );
+                                if let Some(failure) = app.session.take_target_failure() {
+                                    let msg = format!(
+                                        "未达标 (WPM: {:.0}/{}, 击键: {:.1}/{:.1}) — 已重置，按任意键重打",
+                                        failure.actual_wpm,
+                                        failure.target_wpm,
+                                        failure.actual_kps,
+                                        failure.target_kps,
+                                    );
+                                    app.target_failure_notice = Some(msg);
+                                    app.active_start = None;
+                                    app.accumulated_elapsed = app.group_start_accumulated_elapsed;
+                                }
                                 if app.session.is_complete() {
                                     finish_and_maybe_upload(&mut app, terminal)?;
                                 }
@@ -2462,6 +2522,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                                 continue;
                             }
                             if let KeyCode::Char(c) = key.code {
+                                app.target_failure_notice = None;
                                 let (text, next_key) = drain_pending_chars(c)?;
                                 pending_key_event = next_key;
                                 app.touch_typing();
@@ -2474,6 +2535,18 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                                     elapsed,
                                     Instant::now(),
                                 );
+                                if let Some(failure) = app.session.take_target_failure() {
+                                    let msg = format!(
+                                        "未达标 (WPM: {:.0}/{}, 击键: {:.1}/{:.1}) — 已重置，按任意键重打",
+                                        failure.actual_wpm,
+                                        failure.target_wpm,
+                                        failure.actual_kps,
+                                        failure.target_kps,
+                                    );
+                                    app.target_failure_notice = Some(msg);
+                                    app.active_start = None;
+                                    app.accumulated_elapsed = app.group_start_accumulated_elapsed;
+                                }
                                 if app.session.is_complete() {
                                     finish_and_maybe_upload(&mut app, terminal)?;
                                 }
@@ -2582,6 +2655,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                         // 就绪态下输入非命令字符（如中文输入法上屏或英文首字）-> 自动切入跟打态
                         if app.session.is_empty() {
                             if key.code == KeyCode::Backspace {
+                                app.target_failure_notice = None;
                                 app.touch_typing();
                                 let elapsed = app.current_elapsed();
                                 handle_key(
@@ -2592,10 +2666,23 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                                     elapsed,
                                     Instant::now(),
                                 );
+                                if let Some(failure) = app.session.take_target_failure() {
+                                    let msg = format!(
+                                        "未达标 (WPM: {:.0}/{}, 击键: {:.1}/{:.1}) — 已重置，按任意键重打",
+                                        failure.actual_wpm,
+                                        failure.target_wpm,
+                                        failure.actual_kps,
+                                        failure.target_kps,
+                                    );
+                                    app.target_failure_notice = Some(msg);
+                                    app.active_start = None;
+                                    app.accumulated_elapsed = app.group_start_accumulated_elapsed;
+                                }
                                 if app.session.is_complete() {
                                     finish_and_maybe_upload(&mut app, terminal)?;
                                 }
                             } else if let KeyCode::Char(c) = key.code {
+                                app.target_failure_notice = None;
                                 let (text, next_key) = drain_pending_chars(c)?;
                                 pending_key_event = next_key;
                                 app.touch_typing();
@@ -2608,6 +2695,18 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                                     elapsed,
                                     Instant::now(),
                                 );
+                                if let Some(failure) = app.session.take_target_failure() {
+                                    let msg = format!(
+                                        "未达标 (WPM: {:.0}/{}, 击键: {:.1}/{:.1}) — 已重置，按任意键重打",
+                                        failure.actual_wpm,
+                                        failure.target_wpm,
+                                        failure.actual_kps,
+                                        failure.target_kps,
+                                    );
+                                    app.target_failure_notice = Some(msg);
+                                    app.active_start = None;
+                                    app.accumulated_elapsed = app.group_start_accumulated_elapsed;
+                                }
                                 if app.session.is_complete() {
                                     finish_and_maybe_upload(&mut app, terminal)?;
                                 }
@@ -2710,6 +2809,12 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                             KeyCode::Char('g') | KeyCode::Char('G') => {
                                 app.cycle_group_size();
                             }
+                            KeyCode::Char('t') | KeyCode::Char('T') => {
+                                app.cycle_target_kps();
+                            }
+                            KeyCode::Char('w') | KeyCode::Char('W') => {
+                                app.cycle_target_wpm();
+                            }
                             KeyCode::Enter | KeyCode::Char('l') => app.load_selected_builtin(),
                             KeyCode::Char('s') | KeyCode::Char('S') => {
                                 app.builtin_shuffle = !app.builtin_shuffle;
@@ -2793,6 +2898,35 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                                             &wb,
                                             app.settings.group_size as usize,
                                         );
+                                        if let TextSource::Builtin { set } = app.text.source && !set.is_words() {
+                                            app.session.set_targets(app.settings.target_kps, app.settings.target_wpm);
+                                        }
+                                    }
+                                }
+                                FOCUS_TARGET_KPS => {
+                                    let curr = app.settings.target_kps;
+                                    let next = if forward {
+                                        Settings::next_target_kps_preset(curr)
+                                    } else {
+                                        Settings::prev_target_kps_preset(curr)
+                                    };
+                                    app.settings.target_kps = next;
+                                    let _ = app.settings_store.save(&app.settings);
+                                    if let TextSource::Builtin { set } = app.text.source && !set.is_words() {
+                                        app.session.set_targets(app.settings.target_kps, app.settings.target_wpm);
+                                    }
+                                }
+                                FOCUS_TARGET_WPM => {
+                                    let curr = app.settings.target_wpm;
+                                    let next = if forward {
+                                        Settings::next_target_wpm_preset(curr)
+                                    } else {
+                                        Settings::prev_target_wpm_preset(curr)
+                                    };
+                                    app.settings.target_wpm = next;
+                                    let _ = app.settings_store.save(&app.settings);
+                                    if let TextSource::Builtin { set } = app.text.source && !set.is_words() {
+                                        app.session.set_targets(app.settings.target_kps, app.settings.target_wpm);
                                     }
                                 }
                                 _ => {}
@@ -4327,6 +4461,29 @@ fn ui(frame: &mut Frame, app: &App) {
             ),
         ]);
         let mut ref_block = themed_block(&palette, false).title(ref_title);
+        if let Some(notice) = &app.target_failure_notice {
+            ref_block = ref_block.title_bottom(Line::from(vec![
+                Span::styled(
+                    format!(" {notice} "),
+                    Style::default().fg(palette.error).add_modifier(Modifier::BOLD),
+                ),
+            ]));
+        } else if app.session.is_target_gated() {
+            let mut target_parts = Vec::new();
+            if app.session.target_wpm() > 0 {
+                target_parts.push(format!("{} WPM", app.session.target_wpm()));
+            }
+            if app.session.target_kps() > 0.0 {
+                target_parts.push(format!("{:.1} 击/秒", app.session.target_kps()));
+            }
+            ref_block = ref_block.title_bottom(Line::from(vec![
+                Span::styled(" 目标: ", Style::default().fg(palette.muted)),
+                Span::styled(
+                    format!("{} ", target_parts.join(" 或 ")),
+                    Style::default().fg(palette.accent).add_modifier(Modifier::BOLD),
+                ),
+            ]));
+        }
         if !app.session.is_empty() {
             let elapsed = app.current_elapsed();
             let metrics = app.session.realtime_metrics(elapsed);
@@ -5361,11 +5518,23 @@ fn render_builtin_preview(frame: &mut Frame, app: &App, area: ratatui::layout::R
     } else {
         "乱序"
     };
-    lines.push(hint_bar_line(
-        &format!(" Enter 载入 | s {shuffle_label} | g 分组({group_size}{unit_label}) | Esc 取消 "),
-        &palette,
-    ));
-    let builtin_preview_title = Line::from(vec![
+    let hint_str = if is_words {
+        format!(" Enter 载入 | s {shuffle_label} | g 分组({group_size}{unit_label}) | Esc 取消 ")
+    } else {
+        let kps_label = if app.settings.target_kps <= 0.0 {
+            "关".to_string()
+        } else {
+            format!("{:.1}击", app.settings.target_kps)
+        };
+        let wpm_label = if app.settings.target_wpm == 0 {
+            "关".to_string()
+        } else {
+            format!("{}WPM", app.settings.target_wpm)
+        };
+        format!(" Enter 载入 | s {shuffle_label} | g 分组({group_size}字) | t 击键({kps_label}) | w 速度({wpm_label}) | Esc 取消 ")
+    };
+    lines.push(hint_bar_line(&hint_str, &palette));
+    let mut title_spans = vec![
         Span::styled(
             " 内置赛文预览 ",
             Style::default()
@@ -5377,7 +5546,24 @@ fn render_builtin_preview(frame: &mut Frame, app: &App, area: ratatui::layout::R
             format!("[g] 分组: {group_size} {unit_label}/组 "),
             Style::default().bold().fg(palette.accent),
         ),
-    ]);
+    ];
+    if !is_words {
+        let kps_label = if app.settings.target_kps <= 0.0 {
+            "关".to_string()
+        } else {
+            format!("{:.1}击", app.settings.target_kps)
+        };
+        let wpm_label = if app.settings.target_wpm == 0 {
+            "关".to_string()
+        } else {
+            format!("{}WPM", app.settings.target_wpm)
+        };
+        title_spans.push(Span::styled(
+            format!("[t] 击键: {kps_label}  [w] 速度: {wpm_label} "),
+            Style::default().fg(palette.muted),
+        ));
+    }
+    let builtin_preview_title = Line::from(title_spans);
     let block = themed_block(&palette, false)
         .title(builtin_preview_title)
         .style(Style::default().bg(palette.bg).fg(palette.fg));
@@ -6578,6 +6764,28 @@ fn render_settings(frame: &mut Frame, app: &App) {
         focus == FOCUS_MONITOR_SCHEME,
         &palette,
     ));
+    let kps_label = if app.settings.target_kps <= 0.0 {
+        "关".to_string()
+    } else {
+        format!("{:.1} 击/秒", app.settings.target_kps)
+    };
+    lines.push(settings_row(
+        "单字目标击键",
+        &kps_label,
+        focus == FOCUS_TARGET_KPS,
+        &palette,
+    ));
+    let wpm_label = if app.settings.target_wpm == 0 {
+        "关".to_string()
+    } else {
+        format!("{} WPM", app.settings.target_wpm)
+    };
+    lines.push(settings_row(
+        "单字目标速度",
+        &wpm_label,
+        focus == FOCUS_TARGET_WPM,
+        &palette,
+    ));
 
     lines.push(Line::from(""));
     // 主题预览：用当前主题的对/错色渲染示意文字。
@@ -6587,7 +6795,7 @@ fn render_settings(frame: &mut Frame, app: &App) {
     lines.push(Line::from(""));
     lines.push(hint_bar_line(" jk 选择 | hl 调整 | Esc/q 返回 ", &palette));
 
-    let area = centered_rect(frame.area(), 60, 20);
+    let area = centered_rect(frame.area(), 60, 24);
     frame.render_widget(Clear, area);
     let settings_title = Line::from(vec![Span::styled(
         " 设置 ",
@@ -9210,10 +9418,10 @@ mod tests {
 
     #[test]
     fn move_focus_wraps_around() {
-        // SETTINGS_FOCUS_COUNT = 9（主题/占比/粗体/实时键盘/反查方案/上传名称/分组大小/遍码提示/方案热监控）
-        assert_eq!(move_focus(0, -1), 8); // 第 0 项向前 → 末项（8）
-        assert_eq!(move_focus(8, 1), 0); // 末项向后 → 第 0 项
-        assert_eq!(move_focus(7, 1), 8); // 倒数第二项向后 → 末项
+        // SETTINGS_FOCUS_COUNT = 11（主题/占比/粗体/实时键盘/反查方案/上传名称/分组大小/遍码提示/方案热监控/单字目标击键/单字目标速度）
+        assert_eq!(move_focus(0, -1), 10); // 第 0 项向前 → 末项（10）
+        assert_eq!(move_focus(10, 1), 0); // 末项向后 → 第 0 项
+        assert_eq!(move_focus(9, 1), 10); // 倒数第二项向后 → 末项
         assert_eq!(move_focus(0, 1), 1);
         assert_eq!(move_focus(5, 1), 6);
         assert_eq!(move_focus(2, -1), 1);
@@ -14925,6 +15133,138 @@ mod tests {
         let rendered_p2 = original_line(&session, &text, theme, false, None);
         assert_eq!(rendered_p2.lines[0].spans.len(), 5, "翻页后第二页也是 5 字");
     }
+
+    #[test]
+    fn app_cycle_target_kps_and_wpm() {
+        let mut app = test_app(load_builtin_text(BUILTIN_SETS[0]));
+        assert_eq!(app.settings.target_kps, 0.0);
+        assert_eq!(app.settings.target_wpm, 0);
+
+        // 正向循环击键：0.0 -> 3.0
+        app.cycle_target_kps();
+        assert_eq!(app.settings.target_kps, 3.0);
+        assert_eq!(app.settings_store.load().target_kps, 3.0);
+        assert_eq!(app.session.target_kps(), 3.0);
+
+        // 循环直到回绕到 0.0（共 11 个预设档位，已走 1 步，再走 10 步）
+        for _ in 0..10 {
+            app.cycle_target_kps();
+        }
+        assert_eq!(app.settings.target_kps, 0.0);
+        assert_eq!(app.settings_store.load().target_kps, 0.0);
+        assert_eq!(app.session.target_kps(), 0.0);
+
+        // 正向循环速度：0 -> 40
+        app.cycle_target_wpm();
+        assert_eq!(app.settings.target_wpm, 40);
+        assert_eq!(app.settings_store.load().target_wpm, 40);
+        assert_eq!(app.session.target_wpm(), 40);
+
+        // 循环直到回绕到 0（共 13 个预设档位，已走 1 步，再走 12 步）
+        for _ in 0..12 {
+            app.cycle_target_wpm();
+        }
+        assert_eq!(app.settings.target_wpm, 0);
+        assert_eq!(app.settings_store.load().target_wpm, 0);
+        assert_eq!(app.session.target_wpm(), 0);
+    }
+
+    #[test]
+    fn app_settings_adjust_targets_and_ui() {
+        let mut app = test_app(load_builtin_text(BUILTIN_SETS[0]));
+        app.enter_settings();
+
+        // 焦点切到目标击键并递增
+        app.settings_focus = FOCUS_TARGET_KPS;
+        app.cycle_target_kps();
+        assert_eq!(app.settings.target_kps, 3.0);
+
+        // 焦点切到目标速度并递增
+        app.settings_focus = FOCUS_TARGET_WPM;
+        app.cycle_target_wpm();
+        assert_eq!(app.settings.target_wpm, 40);
+
+        // UI 渲染检查
+        let backend = ratatui::backend::TestBackend::new(90, 32);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| ui(f, &app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let content = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let clean = content.replace(' ', "");
+        assert!(clean.contains("单字目标击键:"));
+        assert!(clean.contains("3.0击/秒"));
+        assert!(clean.contains("单字目标速度:"));
+        assert!(clean.contains("40WPM"));
+    }
+
+    #[test]
+    fn app_target_gating_rollback_and_notice() {
+        let mut app = test_app(load_builtin_text(BUILTIN_SETS[0]));
+        // 设置极高门槛：100 WPM, 100.0 KPS
+        app.settings.target_kps = 100.0;
+        app.settings.target_wpm = 100;
+        app.restart();
+        assert!(app.session.is_target_gated());
+        assert_eq!(app.session.target_kps(), 100.0);
+        assert_eq!(app.session.target_wpm(), 100);
+
+        // 获取第 1 组字符
+        let group_size = app.settings.group_size as usize;
+        let first_char: String = app.text.content.chars().take(1).collect();
+        let rest_group: String = app.text.content.chars().skip(1).take(group_size - 1).collect();
+
+        // 模拟打首字（t = 0s）与后续字（t = 10s），耗时 10 秒（实际速度 60 WPM < 100 WPM，击键 1.0 < 100.0 KPS，必然未达标）
+        app.touch_typing();
+        app.session.type_text_with_strokes_at(&first_char, 1, Duration::ZERO);
+        app.session.type_text_with_strokes_at(&rest_group, (group_size - 1) as u32, Duration::from_secs(10));
+
+        // 捕获未达标
+        let failure = app.session.take_target_failure().expect("必须触发未达标");
+        let msg = format!(
+            "未达标 (WPM: {:.0}/{}, 击键: {:.1}/{:.1}) — 已重置，按任意键重打",
+            failure.actual_wpm,
+            failure.target_wpm,
+            failure.actual_kps,
+            failure.target_kps,
+        );
+        app.target_failure_notice = Some(msg);
+        app.active_start = None;
+        app.accumulated_elapsed = app.group_start_accumulated_elapsed;
+
+        // 验证：回滚后 typed 字符数恢复为 0，完成组数仍为 0
+        assert_eq!(app.session.len(), 0);
+        assert_eq!(app.session.completed_groups(), 0);
+        assert!(app.target_failure_notice.is_some());
+
+        // 验证：在 UI 渲染中可看到未达标警告
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| ui(f, &app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let content = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let clean = content.replace(' ', "");
+        assert!(clean.contains("未达标"));
+
+        // 下一次打字会清除 notice
+        app.target_failure_notice = None;
+        assert!(app.target_failure_notice.is_none());
+    }
 }
 
 /// 方案热重载（issue #91/#94）端到端测试：编辑源文件 → 自动驱逐缓存并重载。
@@ -15753,3 +16093,5 @@ mod scheme_hot_reload_regression_tests {
         );
     }
 }
+
+
