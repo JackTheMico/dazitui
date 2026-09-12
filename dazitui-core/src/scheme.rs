@@ -80,11 +80,46 @@ impl SchemeDict {
             .map(|s| s.to_string())
     }
 
+    /// 清理内部编码标记（如万象词典内部使用的非键盘宏字符 '￣'）。
+    fn clean_raw_code(code: &str) -> std::borrow::Cow<'_, str> {
+        if code.contains('\u{FFE3}') {
+            std::borrow::Cow::Owned(code.replace('\u{FFE3}', ""))
+        } else {
+            std::borrow::Cow::Borrowed(code)
+        }
+    }
+
     /// 从字符串内容解析码表（支持纯文本与 Rime .dict.yaml 格式）。
     pub fn parse(content: &str) -> Self {
         let mut dict = Self::default();
-        let mut in_yaml_header = false;
-        let mut yaml_header_count = 0;
+
+        let columns = Self::extract_columns(content);
+        if let Some(ref cols) = columns {
+            if !cols.iter().any(|c| c == "code") {
+                // 方案词典明确声明无编码列（如 columns: [text, weight]），纯词频表，无反查编码
+                return dict;
+            }
+        }
+
+        let (text_col, code_col) = if let Some(ref cols) = columns {
+            let t_idx = cols.iter().position(|c| c == "text").unwrap_or(0);
+            let c_idx = cols.iter().position(|c| c == "code");
+            (Some(t_idx), c_idx)
+        } else {
+            (None, None)
+        };
+
+        let has_initial_dashes = content
+            .lines()
+            .take(10)
+            .any(|l| l.trim() == "---");
+        let has_early_dots = content
+            .lines()
+            .take(100)
+            .any(|l| l.trim() == "...");
+
+        // 若无起始 `---` 但有 `...`，则从首行起即为头部
+        let mut in_yaml_header = !has_initial_dashes && has_early_dots;
 
         for line in content.lines() {
             let trimmed = line.trim();
@@ -94,39 +129,47 @@ impl SchemeDict {
 
             // 处理 Rime .dict.yaml 的 frontmatter: `---` ... `...`
             if trimmed == "---" {
-                in_yaml_header = true;
-                yaml_header_count += 1;
+                in_yaml_header = !in_yaml_header;
                 continue;
             }
             if in_yaml_header {
-                if trimmed == "..." || (trimmed == "---" && yaml_header_count >= 1) {
+                if trimmed == "..." {
                     in_yaml_header = false;
                 }
                 continue;
             }
 
-            // 解析形如 `字\t编码` 或 `字\t编码\t权重` 或 `编码\t字`
-            let parts: Vec<&str> = trimmed.split('\t').collect();
-            if parts.len() >= 2 {
-                let first = parts[0].trim();
-                let second = parts[1].trim();
-
-                let (word, code) = if is_likely_code(second) && !is_likely_code(first) {
-                    (first, second)
-                } else if is_likely_code(first) && !is_likely_code(second) {
-                    (second, first)
+            if let (Some(t_idx), Some(c_idx)) = (text_col, code_col) {
+                let parts: Vec<&str> = trimmed.split('\t').collect();
+                if parts.len() > t_idx && parts.len() > c_idx {
+                    let word = parts[t_idx].trim();
+                    let code = parts[c_idx].trim();
+                    if !word.is_empty() && !code.is_empty() {
+                        dict.add_entry(word, &Self::clean_raw_code(code));
+                    }
                 } else {
-                    (first, second)
-                };
-
-                if !word.is_empty() && !code.is_empty() {
-                    dict.add_entry(word, code);
+                    let space_parts: Vec<&str> = trimmed.split_whitespace().collect();
+                    if space_parts.len() > t_idx && space_parts.len() > c_idx {
+                        let word = space_parts[t_idx];
+                        let code = space_parts[c_idx];
+                        if !word.is_empty() && !code.is_empty() {
+                            dict.add_entry(word, &Self::clean_raw_code(code));
+                        }
+                    }
                 }
             } else {
-                let space_parts: Vec<&str> = trimmed.split_whitespace().collect();
-                if space_parts.len() >= 2 {
-                    let first = space_parts[0];
-                    let second = space_parts[1];
+                let parts: Vec<&str> = trimmed.split('\t').collect();
+                if parts.len() >= 3 {
+                    // Rime 默认列结构：[text, code, weight, stem]
+                    let word = parts[0].trim();
+                    let code = parts[1].trim();
+                    if !word.is_empty() && !code.is_empty() {
+                        dict.add_entry(word, &Self::clean_raw_code(code));
+                    }
+                } else if parts.len() == 2 {
+                    let first = parts[0].trim();
+                    let second = parts[1].trim();
+
                     let (word, code) = if is_likely_code(second) && !is_likely_code(first) {
                         (first, second)
                     } else if is_likely_code(first) && !is_likely_code(second) {
@@ -134,8 +177,31 @@ impl SchemeDict {
                     } else {
                         (first, second)
                     };
+
                     if !word.is_empty() && !code.is_empty() {
-                        dict.add_entry(word, code);
+                        dict.add_entry(word, &Self::clean_raw_code(code));
+                    }
+                } else {
+                    let space_parts: Vec<&str> = trimmed.split_whitespace().collect();
+                    if space_parts.len() >= 3 {
+                        let word = space_parts[0];
+                        let code = space_parts[1];
+                        if !word.is_empty() && !code.is_empty() {
+                            dict.add_entry(word, &Self::clean_raw_code(code));
+                        }
+                    } else if space_parts.len() == 2 {
+                        let first = space_parts[0];
+                        let second = space_parts[1];
+                        let (word, code) = if is_likely_code(second) && !is_likely_code(first) {
+                            (first, second)
+                        } else if is_likely_code(first) && !is_likely_code(second) {
+                            (second, first)
+                        } else {
+                            (first, second)
+                        };
+                        if !word.is_empty() && !code.is_empty() {
+                            dict.add_entry(word, &Self::clean_raw_code(code));
+                        }
                     }
                 }
             }
@@ -145,7 +211,8 @@ impl SchemeDict {
         dict
     }
 
-    /// 提取 Rime 词典 frontmatter（`---` … `---`/`...` 之间）文本，用于解析 `import_tables` 等元信息。
+    /// 提取 Rime 词典 frontmatter（`---` … `---`/`...` 之间，或无起始 `---` 直接以 `...` 结尾的前置元数据）文本，
+    /// 用于解析 `import_tables`、`columns` 等元信息。
     fn extract_dict_frontmatter(content: &str) -> String {
         let mut buf = String::new();
         let mut in_header = false;
@@ -168,7 +235,40 @@ impl SchemeDict {
                 buf.push('\n');
             }
         }
+        if buf.is_empty() {
+            // 兼容无起始 `---`、直接以 `...` 结尾的前置元信息（如 tigress_ci.dict.yaml）
+            let has_dots = content.lines().take(100).any(|l| l.trim() == "...");
+            if has_dots {
+                for line in content.lines() {
+                    let t = line.trim();
+                    if t == "..." {
+                        break;
+                    }
+                    buf.push_str(line);
+                    buf.push('\n');
+                }
+            }
+        }
         buf
+    }
+
+    /// 解析 Rime 词典的 `columns` 列表。
+    fn extract_columns(content: &str) -> Option<Vec<String>> {
+        let fm = Self::extract_dict_frontmatter(content);
+        if fm.trim().is_empty() {
+            return None;
+        }
+        let doc = parse_rime_yaml(&fm);
+        if let Some(YamlValue::List(items)) = doc.get("columns") {
+            let cols: Vec<String> = items
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect();
+            if !cols.is_empty() {
+                return Some(cols);
+            }
+        }
+        None
     }
 
     /// 解析 Rime 词典的 `import_tables` 列表，返回被导入词典的逻辑名（如 `yoyo_kf`）。
@@ -273,6 +373,76 @@ impl SchemeDict {
         self.chord_algebra = Some(algebra);
     }
 
+    /// 从 .schema.yaml 文档中提取所有声明的词典名称，按优先级（`initial_quality` 降序）返回。
+    fn extract_schema_dictionary_candidates(
+        doc: Option<&YamlValue>,
+        schema_stem: &str,
+    ) -> Vec<String> {
+        let mut candidates: Vec<(f64, usize, String)> = Vec::new();
+        let mut order = 0;
+
+        if let Some(YamlValue::Mapping(entries)) = doc {
+            for (sec_name, sec_val) in entries {
+                if sec_name == "reverse_lookup" {
+                    continue;
+                }
+                if let YamlValue::Mapping(sub_entries) = sec_val {
+                    let dict_opt = sub_entries
+                        .iter()
+                        .find(|(k, _)| k == "dictionary")
+                        .and_then(|(_, v)| v.as_str());
+                    if let Some(dict) = dict_opt {
+                        let trimmed = dict.trim();
+                        if !trimmed.is_empty() {
+                            let quality = sub_entries
+                                .iter()
+                                .find(|(k, _)| k == "initial_quality")
+                                .and_then(|(_, v)| v.as_str().and_then(|s| s.parse::<f64>().ok()))
+                                .unwrap_or(0.0);
+                            let q = if sec_name == "translator" && quality == 0.0 {
+                                0.1
+                            } else {
+                                quality
+                            };
+                            candidates.push((q, order, trimmed.to_string()));
+                            order += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(doc) = doc {
+            if let Some(td) = doc
+                .get("translator/dictionary")
+                .or_else(|| doc.get("__patch/translator/dictionary"))
+                .and_then(|v| v.as_str())
+            {
+                let trimmed = td.trim();
+                if !trimmed.is_empty() && !candidates.iter().any(|(_, _, d)| d == trimmed) {
+                    candidates.push((0.1, order, trimmed.to_string()));
+                }
+            }
+        }
+
+        candidates.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1.cmp(&b.1))
+        });
+
+        let mut out = Vec::new();
+        for (_, _, d) in candidates {
+            if !out.contains(&d) {
+                out.push(d);
+            }
+        }
+        if !out.iter().any(|d| d == schema_stem) {
+            out.push(schema_stem.to_string());
+        }
+        out
+    }
+
     /// 从文件加载码表与指法方案。
     ///
     /// 智能识别文件类型与同名伴随文件：
@@ -293,22 +463,16 @@ impl SchemeDict {
             };
             let schema_name = Self::extract_schema_name(path);
 
-            // 2. 查找伴随词典（优先检查 translator/dictionary，其次使用文件名词干）
+            // 2. 查找伴随词典（按 initial_quality 降序优先选取主输入词典，如万象虎中 initial_quality: 9999 的 tigress）
             let schema_doc = resolver.load_doc(path).ok().cloned();
-            let dict_name = schema_doc.as_ref().and_then(|doc| {
-                doc.get("translator/dictionary")
-                    .or_else(|| doc.get("__patch/translator/dictionary"))
-                    .and_then(|v| v.as_str())
-            });
-
             let schema_stem = file_name.strip_suffix(".schema.yaml").unwrap_or(file_name);
+            let dict_names = Self::extract_schema_dictionary_candidates(schema_doc.as_ref(), schema_stem);
+
             let mut candidate_dicts = Vec::new();
-            if let Some(custom_dict) = dict_name {
-                candidate_dicts.push(parent_dir.join(format!("{custom_dict}.dict.yaml")));
-                candidate_dicts.push(parent_dir.join(format!("{custom_dict}.txt")));
+            for dict_name in &dict_names {
+                candidate_dicts.push(parent_dir.join(format!("{dict_name}.dict.yaml")));
+                candidate_dicts.push(parent_dir.join(format!("{dict_name}.txt")));
             }
-            candidate_dicts.push(parent_dir.join(format!("{schema_stem}.dict.yaml")));
-            candidate_dicts.push(parent_dir.join(format!("{schema_stem}.txt")));
 
             let mut dict = if let Some(dict_path) = candidate_dicts.into_iter().find(|p| p.exists())
             {
@@ -1409,6 +1573,7 @@ fn is_likely_code(s: &str) -> bool {
                         | '\''
                         | '='
                         | '%'
+                        | '\u{FFE3}'
                 )
         })
 }
@@ -1570,6 +1735,34 @@ mod tests {
         assert_eq!(dict.get_primary_code("是"), Some("wCs"));
         assert_eq!(dict.get_primary_code("为"), Some("O<O"));
         assert_eq!(dict.get_primary_code("就"), Some("sE:"));
+    }
+
+    #[test]
+    fn test_rime_dict_yaml_columns_text_weight_skipped() {
+        // 当 columns 为 [text, weight] 时，该词典无编码列，不应把权重数字当作编码提取
+        let yaml = "---\nname: jichu\ncolumns:\n  - text\n  - weight\n...\n阿爸\t275\n阿巴\t252\n";
+        let dict = SchemeDict::parse(yaml);
+        assert_eq!(dict.get_primary_code("阿爸"), None);
+        assert_eq!(dict.get_primary_code("阿巴"), None);
+        assert_eq!(dict.entry_count(), 0);
+    }
+
+    #[test]
+    fn test_rime_dict_yaml_columns_text_weight_code() {
+        // tigress_ci 格式：无 --- 起始，直接以 ... 结尾，columns 为 [text, weight, code]
+        let yaml = "# /引导的句中简词\nname: tigress_ci\ncolumns:\n  - text\n  - weight\n  - code\n...\n一个人\t26801\tfjjr/\n不知道\t22278\tcoho/\n";
+        let dict = SchemeDict::parse(yaml);
+        assert_eq!(dict.get_primary_code("一个人"), Some("fjjr/"));
+        assert_eq!(dict.get_primary_code("不知道"), Some("coho/"));
+    }
+
+    #[test]
+    fn test_clean_raw_code_macron_removal() {
+        // 万象 8105 中短码带 '￣'，应被清理去除
+        let yaml = "---\nname: 8105\n...\n都\t￣q'\t651479\n的\t￣u'\t10359470\n";
+        let dict = SchemeDict::parse(yaml);
+        assert_eq!(dict.get_primary_code("都"), Some("q'"));
+        assert_eq!(dict.get_primary_code("的"), Some("u'"));
     }
 
     #[test]
