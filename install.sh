@@ -34,7 +34,7 @@ esac
 echo "🔍 正在获取 dazitui 最新版本..."
 LATEST_TAG=$(curl -s "https://api.github.com/repos/${REPO}/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
 if [ -z "$LATEST_TAG" ]; then
-    LATEST_TAG="v1.0.11"
+    LATEST_TAG="v1.0.12"
 fi
 
 FILENAME="dazitui-${LATEST_TAG}-${TARGET}.tar.gz"
