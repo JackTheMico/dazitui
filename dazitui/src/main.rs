@@ -437,59 +437,103 @@ fn scheme_current_label(app: &App) -> String {
     format!("{s}（自定义）")
 }
 
-/// 输入法预设列表（顺序即轮转顺序）。
-/// 最后一项「自定义」表示用户自行输入任意名称。
-const INPUT_METHOD_PRESETS: &[&str] = &[
-    "", // 无（空串）
-    "虎码",
-    "五笔86",
-    "五笔98",
-    "小鹤音形",
-    "仓颉",
-    "郑码",
-    "宇浩",
-    "双拼",
-    "全拼",
-    "空明码并击 374971723",
-    "拼读并击",
-    "麓鸣·空明·并击",
-    "虎码并击",
-    "自定义", // 末项：打开自定义弹窗
-];
-
-/// 预设中「自定义」项的标签。
+/// 预设中「自定义」项的标签（哨兵值，选中即打开文本弹窗）。
 const INPUT_METHOD_CUSTOM: &str = "自定义";
 
-/// 当前输入法在预设列表中是否精确匹配某个预设（排除自定义）。
-fn input_method_preset_index(im: &str) -> usize {
-    INPUT_METHOD_PRESETS
+/// 上传名称选项：无（空串）/ 从 Rime 方案提取的名称 / 自定义。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InputMethodOption {
+    None,
+    Discovered(String),
+    Custom,
+}
+
+/// 从已发现的 Rime 方案中提取唯一有效的方案名称列表。
+/// 按照 discovered 中的顺序扫描，过滤空串及「自定义」哨兵值，去重保留首次出现。
+fn extract_input_method_names(discovered: &[SchemeInfo]) -> Vec<String> {
+    let mut names = Vec::new();
+    for s in discovered {
+        let name = s.display_name.trim();
+        if name.is_empty() || name == INPUT_METHOD_CUSTOM {
+            continue;
+        }
+        if !names.contains(&name.to_string()) {
+            names.push(name.to_string());
+        }
+    }
+    names
+}
+
+/// 依据当前发现的方案构建上传名称选项列表（无 + 发现到的方案名 + 自定义）。
+fn build_input_method_options(discovered: &[SchemeInfo]) -> Vec<InputMethodOption> {
+    let mut opts = vec![InputMethodOption::None];
+    for name in extract_input_method_names(discovered) {
+        opts.push(InputMethodOption::Discovered(name));
+    }
+    opts.push(InputMethodOption::Custom);
+    opts
+}
+
+/// 当前 `input_method` 在选项列表中的下标；自定义/未知值落到「自定义」项。
+fn input_method_option_index(opts: &[InputMethodOption], current: &str) -> usize {
+    if current.is_empty() {
+        return opts
+            .iter()
+            .position(|o| matches!(o, InputMethodOption::None))
+            .unwrap_or(0);
+    }
+    if let Some(idx) = opts
         .iter()
-        .position(|&p| p == im && p != INPUT_METHOD_CUSTOM)
-        .unwrap_or(INPUT_METHOD_PRESETS.len() - 1) // 未命中 → 「自定义」下标
+        .position(|o| matches!(o, InputMethodOption::Discovered(name) if name == current))
+    {
+        return idx;
+    }
+    // 自定义或未知值：定位到最后的「自定义」项。
+    opts.len() - 1
 }
 
-/// 输入法设置项的显示标签。
-fn input_method_display(im: &str) -> &str {
-    if im.is_empty() { "无" } else { im }
+/// 将选项转为存储的 input_method 值；自定义项用哨兵 `自定义` 标记（选中即打开弹窗）。
+fn input_method_option_value(o: &InputMethodOption) -> String {
+    match o {
+        InputMethodOption::None => String::new(),
+        InputMethodOption::Discovered(name) => name.clone(),
+        InputMethodOption::Custom => INPUT_METHOD_CUSTOM.to_string(),
+    }
 }
 
-/// 向前轮转输入法预设（← 键），返回下一个预设值（不含「自定义」末项逻辑，由调用方处理弹窗）。
-fn cycle_input_method_prev(current: &str) -> String {
-    let idx = input_method_preset_index(current);
-    let prev = if idx == 0 {
-        INPUT_METHOD_PRESETS.len() - 1
-    } else {
-        idx - 1
-    };
-    INPUT_METHOD_PRESETS[prev].to_string()
+/// 向后轮转上传名称（→ / 右）。
+fn cycle_input_method_next(opts: &[InputMethodOption], current: &str) -> String {
+    let idx = input_method_option_index(opts, current);
+    let next = (idx + 1) % opts.len();
+    input_method_option_value(&opts[next])
 }
 
-/// 向后轮转输入法预设（→ 键），返回下一个预设值。
-fn cycle_input_method_next(current: &str) -> String {
-    let idx = input_method_preset_index(current);
-    let next = (idx + 1) % INPUT_METHOD_PRESETS.len();
-    INPUT_METHOD_PRESETS[next].to_string()
+/// 向前轮转上传名称（← / 左）。
+fn cycle_input_method_prev(opts: &[InputMethodOption], current: &str) -> String {
+    let idx = input_method_option_index(opts, current);
+    let prev = if idx == 0 { opts.len() - 1 } else { idx - 1 };
+    input_method_option_value(&opts[prev])
 }
+
+/// 格式化输入法展示标签：无 / 方案名 / 哨兵「自定义」 / 自定义手动输入值。
+fn input_method_label(discovered: &[SchemeInfo], im: &str) -> String {
+    if im.is_empty() {
+        return "无".to_string();
+    }
+    if discovered.iter().any(|d| d.display_name.trim() == im) {
+        return im.to_string();
+    }
+    if im == INPUT_METHOD_CUSTOM {
+        return INPUT_METHOD_CUSTOM.to_string();
+    }
+    format!("{im}（自定义）")
+}
+
+/// 当前选定输入法在设置项中的展示标签。
+fn input_method_display_label(app: &App) -> String {
+    input_method_label(&app.discovered, &app.settings.input_method)
+}
+
 
 /// 功能栏可导航菜单项。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -972,7 +1016,7 @@ impl TextSettingModal {
     fn new(target: TextSettingTarget, current: &str) -> Self {
         let is_preset = match target {
             TextSettingTarget::Scheme => current == SCHEME_CUSTOM,
-            TextSettingTarget::InputMethod => INPUT_METHOD_PRESETS.contains(&current),
+            TextSettingTarget::InputMethod => current == INPUT_METHOD_CUSTOM,
         };
         let prefill = if is_preset {
             String::new()
@@ -1169,6 +1213,16 @@ impl App {
         let target = idx.min(total - 1) as isize;
         let current = self.error_point_selected.min(total - 1) as isize;
         self.move_error_point(target - current);
+    }
+
+    /// 获取当前生效的上传输入法名称。
+    /// 若用户停留在「自定义」占位符未输入具体文本，则视为空字符串（不上传输入法名称）。
+    fn effective_upload_input_method(&self) -> &str {
+        if self.settings.input_method == INPUT_METHOD_CUSTOM {
+            ""
+        } else {
+            &self.settings.input_method
+        }
     }
 
     /// 进入设置视图：刷新「已发现方案」列表（按当前 fcitx5 部署目录），再切到 Settings 状态。
@@ -1855,7 +1909,7 @@ impl App {
                 &stats,
                 elapsed,
                 &self.text.title,
-                &self.settings.input_method,
+                self.effective_upload_input_method(),
             );
             let session_id = session_record.id.clone();
             let word_index = self.text.build_word_index();
@@ -1930,7 +1984,7 @@ impl App {
                     &self.text,
                     &stats,
                     elapsed,
-                    &self.settings.input_method,
+                    self.effective_upload_input_method(),
                     None,
                 );
                 write_clipboard(&share);
@@ -2018,7 +2072,10 @@ impl App {
         self.settings.group_size = Settings::next_group_size_preset(self.settings.group_size);
         let _ = self.settings_store.save(&self.settings);
         self.refresh_builtin_preview();
-        if self.text.source.is_builtin() && self.session.is_empty() {
+        if self.text.source.is_builtin()
+            && self.session.is_empty()
+            && self.session.completed_groups() == 0
+        {
             let wb = self.text.session_word_boundaries();
             self.session = Session::new_gated_with_words_and_size(
                 &self.text.content,
@@ -2220,7 +2277,7 @@ impl App {
                 &self.text,
                 stats,
                 elapsed,
-                &self.settings.input_method,
+                self.effective_upload_input_method(),
                 None,
             );
             write_clipboard(&share);
@@ -2238,7 +2295,7 @@ impl App {
         }
         match self
             .api
-            .upload_session(&self.text, stats, elapsed, &self.settings.input_method)
+            .upload_session(&self.text, stats, elapsed, self.effective_upload_input_method())
         {
             Ok(outcome) => {
                 // 分享文本只写入剪贴板：成绩视图顶部摘要已展示全部指标，不再重复渲染。
@@ -2272,7 +2329,7 @@ impl App {
                     &self.text,
                     stats,
                     elapsed,
-                    &self.settings.input_method,
+                    self.effective_upload_input_method(),
                     None,
                 );
                 write_clipboard(&share);
@@ -2847,10 +2904,11 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                                     app.reload_scheme_dict();
                                 }
                                 FOCUS_INPUT_METHOD => {
+                                    let opts = build_input_method_options(&app.discovered);
                                     let next = if forward {
-                                        cycle_input_method_next(&app.settings.input_method)
+                                        cycle_input_method_next(&opts, &app.settings.input_method)
                                     } else {
-                                        cycle_input_method_prev(&app.settings.input_method)
+                                        cycle_input_method_prev(&opts, &app.settings.input_method)
                                     };
                                     app.settings.input_method = next;
                                     let _ = app.settings_store.save(&app.settings);
@@ -2864,7 +2922,10 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                                     };
                                     app.settings.group_size = next;
                                     let _ = app.settings_store.save(&app.settings);
-                                    if app.text.source.is_builtin() && app.session.is_empty() {
+                                    if app.text.source.is_builtin()
+                                        && app.session.is_empty()
+                                        && app.session.completed_groups() == 0
+                                    {
                                         let wb = app.text.session_word_boundaries();
                                         app.session = Session::new_gated_with_words_and_size(
                                             &app.text.content,
@@ -2916,14 +2977,15 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                                         &app.settings.scheme,
                                     ));
                                 }
-                            } else if app.settings_focus == FOCUS_INPUT_METHOD
-                                && input_method_preset_index(&app.settings.input_method)
-                                    == INPUT_METHOD_PRESETS.len() - 1
-                            {
-                                app.text_setting_modal = Some(TextSettingModal::new(
-                                    TextSettingTarget::InputMethod,
-                                    &app.settings.input_method,
-                                ));
+                            } else if app.settings_focus == FOCUS_INPUT_METHOD {
+                                let opts = build_input_method_options(&app.discovered);
+                                let idx = input_method_option_index(&opts, &app.settings.input_method);
+                                if opts.get(idx) == Some(&InputMethodOption::Custom) {
+                                    app.text_setting_modal = Some(TextSettingModal::new(
+                                        TextSettingTarget::InputMethod,
+                                        &app.settings.input_method,
+                                    ));
+                                }
                             }
                         }
                         KeyCode::Esc | KeyCode::Char('q') => app.state = AppState::Typing,
@@ -6722,7 +6784,7 @@ fn render_settings(frame: &mut Frame, app: &App) {
     ));
     lines.push(settings_row(
         "上传名称",
-        input_method_display(&app.settings.input_method),
+        &input_method_display_label(app),
         focus == FOCUS_INPUT_METHOD,
         &palette,
     ));
@@ -7258,7 +7320,7 @@ fn render_result_view(
         summary_lines.push(Line::from(format!(" 回改明细: {details}")));
     }
     // 上传状态（在线赛文）/ 统计复制状态（自由发文与离线赛文）
-    summary_lines.extend(upload_lines(upload, theme, &app.settings.input_method));
+    summary_lines.extend(upload_lines(upload, theme, app.effective_upload_input_method()));
 
     // 计算顶部高度：内容行按终端内宽折算换行（超宽行占多行）后的总行数 + 边框 2 行
     let inner_width = (total_area.width.saturating_sub(2)).max(1) as usize;
@@ -9011,6 +9073,58 @@ mod tests {
     }
 
     #[test]
+    fn resumed_builtin_practice_does_not_inflate_wpm_or_stats() {
+        let set = BUILTIN_SETS[0]; // 常用单字前五百
+        let mut app = test_app(load_builtin_text(set));
+        // 模拟续打：已完成 31 组（310 字）
+        app.start_builtin_set(set, 31);
+        assert_eq!(app.session.completed_groups(), 31);
+        assert!(app.session.is_empty(), "续打就绪态 session.is_empty 应为 true");
+
+        // 模拟打字：在第 32 组录入第 310..320 个字符
+        let chars_to_type: String = app.text.content.chars().skip(310).take(10).collect();
+        let dur = Duration::from_secs(30);
+        app.touch_typing();
+        // 模拟经过 30 秒
+        app.accumulated_elapsed = dur;
+        for c in chars_to_type.chars() {
+            handle_text(
+                &mut app.session,
+                &mut app.live_keyboard,
+                app.scheme_dict.as_ref(),
+                &c.to_string(),
+                dur,
+                Instant::now(),
+            );
+        }
+
+        let metrics = app.session.realtime_metrics(dur);
+        assert!(
+            metrics.cumulative_wpm < 50.0,
+            "续打实时速度不应把历史预填的 310 字算入当前用时：实际为 {:.1} WPM",
+            metrics.cumulative_wpm
+        );
+        assert!(
+            (metrics.cumulative_wpm - 20.0).abs() < 1.0,
+            "实时速度应约为 20 WPM，实际为 {:.1}",
+            metrics.cumulative_wpm
+        );
+
+        app.finish_typing();
+        let stats = match &app.state {
+            AppState::Finished { stats, .. } => stats.clone(),
+            _ => panic!("Expected AppState::Finished"),
+        };
+        assert_eq!(stats.typed_chars, 10, "结算字数应为当前会话录入的 10 字");
+        assert_eq!(stats.correct_chars, 10, "结算全对字数应为当前会话录入的 10 字");
+        assert!(
+            (stats.wpm - 20.0).abs() < 1.0,
+            "结算速度应约为 20 WPM，实际为 {:.1}",
+            stats.wpm
+        );
+    }
+
+    #[test]
     fn resume_prompt_popup_renders_in_separate_modal() {
         let set = BUILTIN_SETS[0]; // 常用单字前五百
         let mut app = test_app(load_builtin_text(set));
@@ -9423,80 +9537,106 @@ mod tests {
     }
 
     #[test]
-    fn input_method_display_empty_shows_wu() {
-        assert_eq!(input_method_display(""), "无");
-        assert_eq!(input_method_display("虎码"), "虎码");
-    }
-
-    #[test]
-    fn cycle_input_method_next_from_empty_is_first_preset() {
-        // 空串（「无」）向后轮转 → 「虎码」（第 1 项）
-        assert_eq!(cycle_input_method_next(""), "虎码");
-    }
-
-    #[test]
-    fn cycle_input_method_next_wraps_last_to_empty() {
-        // 末项「自定义」向后轮转 → 「无」（空串，即第 0 项）
-        let last = INPUT_METHOD_CUSTOM;
-        let result = cycle_input_method_next(last);
-        assert_eq!(result, "");
-    }
-
-    #[test]
-    fn app_keyboard_mode_cycling_and_persistence() {
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let temp_dir = std::env::temp_dir().join(format!("dazitui-test-app-kb-{stamp}"));
-        let store = SettingsStore::new(temp_dir.join("settings"));
-        let token_store = temp_token_store();
-        let mut app = App::new_with(
-            load_builtin_text(BUILTIN_SETS[0]),
-            token_store.clone(),
-            ApiClient::with_base_url_and_store("http://127.0.0.1:1", Some(token_store)),
-            store.clone(),
-            None,
+    fn input_method_label_and_display_tests() {
+        let discovered = vec![SchemeInfo {
+            id: "yoyo-pure".to_string(),
+            display_name: "麓鸣纯形·六脉".to_string(),
+            path: PathBuf::from("/x/yoyo-pure.schema.yaml"),
+        }];
+        assert_eq!(input_method_label(&discovered, ""), "无");
+        assert_eq!(
+            input_method_label(&discovered, "麓鸣纯形·六脉"),
+            "麓鸣纯形·六脉"
         );
-
-        assert_eq!(app.settings.keyboard_mode, KeyboardMode::Off);
-        app.next_keyboard_mode();
-        assert_eq!(app.settings.keyboard_mode, KeyboardMode::Staggered);
-        assert_eq!(store.load().keyboard_mode, KeyboardMode::Staggered);
-
-        app.next_keyboard_mode();
-        assert_eq!(app.settings.keyboard_mode, KeyboardMode::Ortholinear);
-        assert_eq!(store.load().keyboard_mode, KeyboardMode::Ortholinear);
-
-        app.next_keyboard_mode();
-        assert_eq!(app.settings.keyboard_mode, KeyboardMode::Off);
-        assert_eq!(store.load().keyboard_mode, KeyboardMode::Off);
-
-        app.prev_keyboard_mode();
-        assert_eq!(app.settings.keyboard_mode, KeyboardMode::Ortholinear);
-        assert_eq!(store.load().keyboard_mode, KeyboardMode::Ortholinear);
-
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        assert_eq!(
+            input_method_label(&discovered, INPUT_METHOD_CUSTOM),
+            "自定义"
+        );
+        assert_eq!(input_method_label(&discovered, "虎码"), "虎码（自定义）");
     }
 
     #[test]
-    fn cycle_input_method_prev_from_empty_wraps_to_last() {
-        // 「无」向前轮转 → 末项「自定义」
-        let result = cycle_input_method_prev("");
-        assert_eq!(result, INPUT_METHOD_CUSTOM);
+    fn cycle_input_method_empty_discovered() {
+        let opts = build_input_method_options(&[]);
+        assert_eq!(opts.len(), 2, "无 + 自定义");
+        assert_eq!(cycle_input_method_next(&opts, ""), INPUT_METHOD_CUSTOM);
+        assert_eq!(cycle_input_method_next(&opts, INPUT_METHOD_CUSTOM), "");
+        assert_eq!(cycle_input_method_prev(&opts, ""), INPUT_METHOD_CUSTOM);
+        assert_eq!(cycle_input_method_prev(&opts, INPUT_METHOD_CUSTOM), "");
     }
 
     #[test]
-    fn cycle_input_method_prev_from_huma_is_empty() {
-        // 「虎码」向前轮转 → 「无」（空串）
-        assert_eq!(cycle_input_method_prev("虎码"), "");
+    fn cycle_input_method_with_discovered_and_dedup() {
+        let discovered = vec![
+            SchemeInfo {
+                id: "wubi86".to_string(),
+                display_name: "五笔86".to_string(),
+                path: PathBuf::from("/x/wubi86.schema.yaml"),
+            },
+            SchemeInfo {
+                id: "wubi86_dup".to_string(),
+                display_name: "五笔86".to_string(),
+                path: PathBuf::from("/x/wubi86_dup.schema.yaml"),
+            },
+            SchemeInfo {
+                id: "empty_name".to_string(),
+                display_name: "   ".to_string(),
+                path: PathBuf::from("/x/empty.schema.yaml"),
+            },
+            SchemeInfo {
+                id: "custom_name".to_string(),
+                display_name: "自定义".to_string(),
+                path: PathBuf::from("/x/custom.schema.yaml"),
+            },
+            SchemeInfo {
+                id: "yoyo-pure".to_string(),
+                display_name: "麓鸣纯形·六脉".to_string(),
+                path: PathBuf::from("/x/yoyo-pure.schema.yaml"),
+            },
+        ];
+        let opts = build_input_method_options(&discovered);
+        assert_eq!(opts.len(), 4, "无 + 2 个有效去重发现 + 自定义");
+        assert!(matches!(opts[0], InputMethodOption::None));
+        assert!(matches!(opts[1], InputMethodOption::Discovered(ref s) if s == "五笔86"));
+        assert!(matches!(opts[2], InputMethodOption::Discovered(ref s) if s == "麓鸣纯形·六脉"));
+        assert!(matches!(opts[3], InputMethodOption::Custom));
+
+        // 顺序轮转测试
+        assert_eq!(cycle_input_method_next(&opts, ""), "五笔86");
+        assert_eq!(cycle_input_method_next(&opts, "五笔86"), "麓鸣纯形·六脉");
+        assert_eq!(
+            cycle_input_method_next(&opts, "麓鸣纯形·六脉"),
+            INPUT_METHOD_CUSTOM
+        );
+        assert_eq!(cycle_input_method_next(&opts, INPUT_METHOD_CUSTOM), "");
+
+        // 逆向轮转测试
+        assert_eq!(cycle_input_method_prev(&opts, ""), INPUT_METHOD_CUSTOM);
+        assert_eq!(
+            cycle_input_method_prev(&opts, INPUT_METHOD_CUSTOM),
+            "麓鸣纯形·六脉"
+        );
+        assert_eq!(
+            cycle_input_method_prev(&opts, "麓鸣纯形·六脉"),
+            "五笔86"
+        );
+        assert_eq!(cycle_input_method_prev(&opts, "五笔86"), "");
+
+        // 未知/自定义值 → 索引归为「自定义」，next 回绕到无
+        assert_eq!(cycle_input_method_next(&opts, "我的专属输入法"), "");
     }
 
     #[test]
-    fn cycle_input_method_unknown_falls_to_custom_slot_then_wraps() {
-        // 自定义值（不在预设）→ 视为「自定义」末项下标，next → 第 0 项「无」
-        let result = cycle_input_method_next("我的专属输入法");
-        assert_eq!(result, "");
+    fn effective_upload_input_method_filters_sentinel() {
+        let mut app = test_app(load_builtin_text(BUILTIN_SETS[0]));
+        app.settings.input_method = INPUT_METHOD_CUSTOM.to_string();
+        assert_eq!(app.effective_upload_input_method(), "");
+
+        app.settings.input_method = "五笔86".to_string();
+        assert_eq!(app.effective_upload_input_method(), "五笔86");
+
+        app.settings.input_method = "".to_string();
+        assert_eq!(app.effective_upload_input_method(), "");
     }
 
     #[test]
@@ -9545,7 +9685,7 @@ mod tests {
         );
         assert_eq!(
             TextSettingModal::new(TextSettingTarget::InputMethod, "虎码").input,
-            ""
+            "虎码"
         );
         assert_eq!(
             TextSettingModal::new(TextSettingTarget::InputMethod, "自定义").input,

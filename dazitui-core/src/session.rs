@@ -219,6 +219,7 @@ pub struct Session {
     group_start_elapsed: Option<Duration>,
     group_snapshot: Option<GroupSnapshot>,
     last_target_failure: Option<TargetFailure>,
+    resumed_chars: usize,
 }
 
 impl Session {
@@ -281,6 +282,7 @@ impl Session {
             group_start_elapsed: None,
             group_snapshot: None,
             last_target_failure: None,
+            resumed_chars: 0,
         }
     }
 
@@ -642,10 +644,11 @@ impl Session {
     pub fn realtime_metrics(&self, elapsed: Duration) -> RealtimeMetrics {
         let secs = elapsed.as_secs_f64();
         let effective_secs = secs.max(0.5);
+        let session_typed = self.input.len().saturating_sub(self.resumed_chars);
         let cumulative_wpm = if secs <= 0.0 {
             0.0
         } else {
-            (self.input.len() as f64 / effective_secs) * 60.0
+            (session_typed as f64 / effective_secs) * 60.0
         };
         let cumulative_kps = if secs <= 0.0 {
             0.0
@@ -654,10 +657,10 @@ impl Session {
         };
         let rolling_wpm = self.calc_rolling_wpm(secs);
         let rolling_kps = self.calc_rolling_kps(secs);
-        let key_length = if self.input.is_empty() {
+        let key_length = if session_typed == 0 {
             0.0
         } else {
-            self.total_strokes as f64 / self.input.len() as f64
+            self.total_strokes as f64 / session_typed as f64
         };
         RealtimeMetrics {
             cumulative_wpm,
@@ -672,14 +675,19 @@ impl Session {
     /// 计算跟打统计（完成或提前结束时调用，不消耗会话）。
     pub fn finish(&self, elapsed: Duration) -> Stats {
         let statuses = self.align();
-        let correct = statuses
+        let session_statuses = if self.resumed_chars < statuses.len() {
+            &statuses[self.resumed_chars..]
+        } else {
+            &[]
+        };
+        let correct = session_statuses
             .iter()
             .filter(|s| **s == CharStatus::Correct)
             .count();
-        let wrong = statuses.len() - correct;
+        let wrong = session_statuses.len() - correct;
         let total_secs = elapsed.as_secs_f64();
-        // 毛速度（52dazi 口径）：以"总录入字数"为分子，错字不扣速度。
-        let typed = self.input.len();
+        // 毛速度（52dazi 口径）：以当前会话"实际录入字数"为分子，错字不扣速度。
+        let typed = self.input.len().saturating_sub(self.resumed_chars);
         let wpm = if total_secs <= 0.0 {
             0.0
         } else if total_secs < 0.5 {
@@ -695,10 +703,10 @@ impl Session {
         } else {
             self.total_strokes as f64 / total_secs
         };
-        let key_length = if self.input.is_empty() {
+        let key_length = if typed == 0 {
             0.0
         } else {
-            self.total_strokes as f64 / self.input.len() as f64
+            self.total_strokes as f64 / typed as f64
         };
         let mut key_frequency: Vec<(String, u32)> = self
             .key_counts
@@ -718,7 +726,7 @@ impl Session {
             wrong_chars: wrong,
             edits: self.edits,
             wrong_total: (wrong as u32) + self.edits,
-            typed_chars: self.input.len(),
+            typed_chars: typed,
             phrase_chars: self.phrase_chars,
             key_frequency,
             edit_details: self.edit_details.clone(),
@@ -768,9 +776,14 @@ impl Session {
         self.original.len()
     }
 
-    /// 是否还没有任何上屏字符。
+    /// 是否还没有任何上屏字符（续打模式下，历史预填字符不算入当前会话上屏字符）。
     pub fn is_empty(&self) -> bool {
-        self.input.is_empty()
+        self.input.len() <= self.resumed_chars
+    }
+
+    /// 续打时预填的历史字符数（不计入当前会话的打字用时、字数及毛速度）。
+    pub fn resumed_chars(&self) -> usize {
+        self.resumed_chars
     }
 
     /// 是否已上屏完整篇原文。
@@ -820,6 +833,7 @@ impl Session {
         self.last_target_failure = None;
         self.input.clear();
         if completed == 0 {
+            self.resumed_chars = 0;
             return;
         }
         // 词组赛文：已完成范围 = 第 0 组到已完成组最后一个词的结束边界。
@@ -831,6 +845,7 @@ impl Session {
             let end = (completed * self.group_size).min(self.original.len());
             self.input.extend_from_slice(&self.original[..end]);
         }
+        self.resumed_chars = self.input.len();
     }
 
     /// 总组数。
@@ -1538,4 +1553,43 @@ mod tests {
         assert_eq!(session.completed_groups(), 0, "单次瞬间提交不能虚构速度放行");
         assert!(session.take_target_failure().is_some());
     }
+
+    #[test]
+    fn repro_resume_does_not_inflate_wpm_or_stats() {
+        // 模拟用户续打场景：500 字，每组 10 字，已完成 31 组（310 字）。
+        let original: String = "一".repeat(500);
+        let mut session = Session::new_gated_with_words_and_size(&original, true, &[], 10);
+        session.set_completed_groups(31);
+
+        // 续打开始前，当前跟打会话应处于就绪/空态（is_empty 为 true）
+        assert!(session.is_empty(), "续打尚未输入字符时应处于就绪/空态");
+
+        // 用户在第 32 组打入 10 个字，用时 30 秒（实际打字速度应为 20 WPM，绝非 500+ WPM）
+        for _ in 0..10 {
+            session.type_text_at("一", Duration::from_secs(30));
+        }
+
+        let metrics = session.realtime_metrics(Duration::from_secs(30));
+        // 30 秒打 10 字： (10 / 30) * 60 = 20 WPM
+        assert!(
+            metrics.cumulative_wpm < 50.0,
+            "续打实时速度不应把历史预填的 310 字算入当前用时：实际为 {:.1} WPM",
+            metrics.cumulative_wpm
+        );
+        assert!(
+            (metrics.cumulative_wpm - 20.0).abs() < 1.0,
+            "实时速度应约为 20 WPM，实际为 {:.1}",
+            metrics.cumulative_wpm
+        );
+
+        let stats = session.finish(Duration::from_secs(30));
+        assert_eq!(stats.typed_chars, 10, "本轮跟打统计的 typed_chars 应仅为续打打入的 10 字");
+        assert_eq!(stats.correct_chars, 10, "本轮跟打统计的 correct_chars 应仅为续打打入的 10 字");
+        assert!(
+            (stats.wpm - 20.0).abs() < 1.0,
+            "结算速度应约为 20 WPM，实际为 {:.1}",
+            stats.wpm
+        );
+    }
 }
+
