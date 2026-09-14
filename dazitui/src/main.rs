@@ -7980,6 +7980,25 @@ fn code_hint_overlay_line(
         let cells = layout_code_hint_line(&words, &hints, &typed_mask);
         return Some(code_hint_line_from_cells(&cells, theme));
     }
+    // 内置单字赛文（常用单字前/中/后五百）：逐字以方案词典反查编码提示。
+    // 与空明一击字不同，此处走「已载入方案词典」路径（虎码/万象虎等形码单字练习需求）。
+    if set.is_single_char() {
+        let dict = scheme_dict?;
+        let statuses = session.original_status();
+        if page_start >= statuses.len() {
+            return None;
+        }
+        let page_end = (page_start + group_size).min(statuses.len());
+        let page_statuses = &statuses[page_start..page_end];
+        let words: Vec<String> = page_statuses.iter().map(|(c, _)| c.to_string()).collect();
+        let typed_mask: Vec<bool> = page_statuses
+            .iter()
+            .map(|(_, s)| *s == Some(CharStatus::Correct))
+            .collect();
+        let hints: Vec<CodeHint> = dict.build_code_hints(&words);
+        let cells = layout_code_hint_line(&words, &hints, &typed_mask);
+        return Some(code_hint_line_from_cells(&cells, theme));
+    }
     if !set.is_words() {
         return None;
     }
@@ -8114,6 +8133,20 @@ fn builtin_cell_widths(
                 }
             })
             .collect();
+        return Some(hint_cell_widths(&words, &hints));
+    }
+    // 内置单字赛文（常用单字前/中/后五百）：逐字以方案词典反查编码的宽度，
+    // 与 `code_hint_overlay_line` 的提示行宽度保持一致，保证对照区/跟打区/提示行三者列对齐。
+    if set.is_single_char() {
+        let dict = scheme_dict?;
+        let statuses = session.original_status();
+        if page_start >= statuses.len() {
+            return None;
+        }
+        let page_end = (page_start + group_size).min(statuses.len());
+        let page_statuses = &statuses[page_start..page_end];
+        let words: Vec<String> = page_statuses.iter().map(|(c, _)| c.to_string()).collect();
+        let hints: Vec<CodeHint> = dict.build_code_hints(&words);
         return Some(hint_cell_widths(&words, &hints));
     }
     if !set.is_words() {
@@ -10434,12 +10467,20 @@ mod tests {
             code_hint_overlay_line(&session, &text, None, theme).is_none(),
             "未配置方案时不应生成提示行"
         );
-        // 非词组（单字）赛文不生成提示行
+        // 非词组（单字）赛文 + 已配置方案：应生成提示行（虎码等形码单字练习也需词提）。
         let char_text = load_builtin_text(BUILTIN_SETS[0]);
         let char_session = Session::new_gated(char_text.content.as_str(), true);
+        let char_line = code_hint_overlay_line(&char_session, &char_text, Some(&dict), theme)
+            .expect("内置单字赛文在已配置方案时应生成提示行");
+        let char_rendered: String = char_line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(
-            code_hint_overlay_line(&char_session, &char_text, Some(&dict), theme).is_none(),
-            "单字赛文不应生成提示行"
+            !char_rendered.trim().is_empty(),
+            "单字赛文提示行不应为空，得到: {char_rendered:?}"
+        );
+        // 未配置方案（None）时不生成提示行（无词典可查）。
+        assert!(
+            code_hint_overlay_line(&char_session, &char_text, None, theme).is_none(),
+            "单字赛文未配置方案时不应生成提示行"
         );
     }
 

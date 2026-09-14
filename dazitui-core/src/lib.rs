@@ -178,6 +178,15 @@ impl BuiltinSet {
         )
     }
 
+    /// 是否为单字赛文（以单字为单位分页显示，如常用单字前/中/后五百）。
+    /// 与 `is_words()` 互补：`KongmingOneHitChars` 另有专用物理指法提示路径，不在此列。
+    pub fn is_single_char(&self) -> bool {
+        matches!(
+            self,
+            Self::CommonCharsQian | Self::CommonCharsZhong | Self::CommonCharsHou
+        )
+    }
+
     /// 赛文内容（已去换行，为纯字符串）。
     pub fn content(&self) -> &'static str {
         match self {
