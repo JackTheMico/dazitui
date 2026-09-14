@@ -1580,6 +1580,19 @@ impl App {
         self.paused = true;
     }
 
+    /// 主流程态下 Tab 统一收起/展开功能栏。
+    /// 返回 `true` 表示本次按键被消费（已切换 `sidebar_visible`），调用方应 `continue`；
+    /// 返回 `false` 表示不是 Tab，交由后续分支处理。
+    /// 注意：此函数只切换侧栏显隐，绝不触及暂停状态——打字态下暂停语义已交给 Esc。
+    fn toggle_sidebar_via_tab(&mut self, key: KeyEvent) -> bool {
+        if is_toggle_sidebar(key) {
+            self.sidebar_visible = !self.sidebar_visible;
+            true
+        } else {
+            false
+        }
+    }
+
     /// 确保跟打计时处于启动活跃态。
     fn touch_typing(&mut self) {
         if self.paused || self.active_start.is_none() {
@@ -2543,9 +2556,13 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                                 app.toggle_code_hint();
                                 continue;
                             }
-                            // 跟打进行中：Esc 或 Tab 暂停切入 Normal 菜单态
-                            if key.code == KeyCode::Esc || key.code == KeyCode::Tab {
+                            // 跟打进行中：Esc 暂停切入 Normal 菜单态
+                            if key.code == KeyCode::Esc {
                                 app.pause();
+                                continue;
+                            }
+                            // 跟打进行中：Tab 收起/展开功能栏（全局统一语义，不暂停）
+                            if app.toggle_sidebar_via_tab(key) {
                                 continue;
                             }
                             if key.code == KeyCode::Backspace {
@@ -2600,12 +2617,8 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                         }
 
                         // 就绪态 (app.session.is_empty()) 或 暂停态 (app.paused) —— Normal 命令态
-                        if key.code == KeyCode::Tab {
-                            if app.paused {
-                                app.enter_resume_countdown();
-                            } else {
-                                app.sidebar_visible = !app.sidebar_visible;
-                            }
+                        // Tab 统一收起/展开功能栏（暂停态恢复改走 Esc/i，不再占用 Tab）
+                        if app.toggle_sidebar_via_tab(key) {
                             continue;
                         }
 
@@ -2776,6 +2789,9 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('h') => {
                                 app.state = AppState::Typing
                             }
+                            KeyCode::Tab => {
+                                app.toggle_sidebar_via_tab(key);
+                            }
                             _ => {}
                         }
                     }
@@ -2856,6 +2872,9 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                             }
                             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('h') => {
                                 app.state = AppState::Typing
+                            }
+                            KeyCode::Tab => {
+                                app.toggle_sidebar_via_tab(key);
                             }
                             _ => {}
                         }
@@ -2989,6 +3008,9 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                             }
                         }
                         KeyCode::Esc | KeyCode::Char('q') => app.state = AppState::Typing,
+                        KeyCode::Tab => {
+                            app.sidebar_visible = !app.sidebar_visible;
+                        }
                         _ => {}
                     },
                     AppState::Stats(ref mut stats_state) => {
@@ -3416,8 +3438,7 @@ fn finish_and_maybe_upload<B: ratatui::backend::Backend>(
     Ok(())
 }
 
-/// 收起/展开功能栏：Tab。
-#[allow(dead_code)]
+/// 收起/展开功能栏：Tab（就绪/打字/暂停/浏览/设置等主流程态统一语义）。
 fn is_toggle_sidebar(key: KeyEvent) -> bool {
     key.code == KeyCode::Tab
 }
@@ -3446,13 +3467,13 @@ fn hint_text(
     is_ready: bool,
 ) -> &'static str {
     if browsing {
-        " jk 选择 | Enter 载入 | g/G 首尾 | Esc/q 取消 | o 设置 | Ctrl-Q 退出"
+        " Tab 侧栏 | jk 选择 | Enter 载入 | g/G 首尾 | Esc/q 取消 | o 设置 | Ctrl-Q 退出"
     } else if browsing_builtin {
-        " jk 选择 | Enter 载入 | s 乱序 | c 词提 | g/G 首尾 | Esc/q 取消 | o 设置 | Ctrl-Q 退出"
+        " Tab 侧栏 | jk 选择 | Enter 载入 | s 乱序 | c 词提 | g/G 首尾 | Esc/q 取消 | o 设置 | Ctrl-Q 退出"
     } else if paused {
-        " jk 菜单导航 | l 执行 | i/Esc 恢复跟打 | d 提前结算 | r 重打 | c 词提 | s 统计 | o 设置 | Ctrl-Q 退出"
+        " Tab 侧栏 | jk 菜单导航 | l 执行 | i/Esc 恢复跟打 | d 提前结算 | r 重打 | c 词提 | s 统计 | o 设置 | Ctrl-Q 退出"
     } else if is_ready {
-        " jk 菜单导航 | l 执行 | f 载文 | b 内置 | i 自由发文 | p 剪贴板 | 1 极速杯 | 4 排行榜 | c 词提 | s 统计 | o 设置 | Ctrl-Q 退出"
+        " Tab 侧栏 | jk 菜单导航 | l 执行 | f 载文 | b 内置 | i 自由发文 | p 剪贴板 | 1 极速杯 | 4 排行榜 | c 词提 | s 统计 | o 设置 | Ctrl-Q 退出"
     } else if is_online {
         " Esc 暂停/命令 | Tab 侧栏 | Ctrl-H 词提 | s 统计 | o 设置 | u 登录 | Ctrl-Q 退出"
     } else {
@@ -9372,6 +9393,52 @@ mod tests {
             KeyCode::Char('t'),
             KeyModifiers::NONE
         )));
+    }
+
+    #[test]
+    fn tab_during_typing_toggles_sidebar_without_pausing() {
+        let mut app = test_app(file_text("测试赛文"));
+        // 进入跟打态并打出一个字，确保处于「跟打进行中」
+        app.state = AppState::Typing;
+        app.session.type_text("测");
+        assert!(!app.paused, "前置：跟打态不应已暂停");
+
+        let before = app.sidebar_visible;
+        // 打字中按 Tab：应翻转侧栏显隐，且不得触发暂停
+        let consumed = app.toggle_sidebar_via_tab(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(consumed, "Tab 在打字态应被侧栏切换逻辑消费");
+        assert_eq!(
+            app.sidebar_visible,
+            !before,
+            "Tab 在打字态应翻转 sidebar_visible"
+        );
+        assert!(!app.paused, "Tab 在打字态绝不应触发暂停（暂停改由 Esc 负责）");
+
+        // 反向：非 Tab 键不应被消费，也不应改动侧栏/暂停
+        let before2 = app.sidebar_visible;
+        let consumed2 =
+            app.toggle_sidebar_via_tab(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        assert!(!consumed2, "普通字符键不应被侧栏切换逻辑消费");
+        assert_eq!(app.sidebar_visible, before2, "非 Tab 键不应改动侧栏显隐");
+        assert!(!app.paused);
+    }
+
+    #[test]
+    fn tab_in_paused_state_toggles_sidebar_and_does_not_resume() {
+        let mut app = test_app(file_text("测试赛文"));
+        app.state = AppState::Typing;
+        app.session.type_text("测");
+        app.paused = true; // 模拟暂停态
+
+        let before = app.sidebar_visible;
+        let consumed = app.toggle_sidebar_via_tab(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(consumed);
+        assert_eq!(app.sidebar_visible, !before, "暂停态 Tab 也应翻转侧栏");
+        assert!(app.paused, "暂停态 Tab 不应恢复跟打（恢复改走 Esc/i）");
+        assert!(
+            matches!(app.state, AppState::Typing),
+            "暂停态 Tab 不应切换 AppState"
+        );
     }
 
     #[test]
