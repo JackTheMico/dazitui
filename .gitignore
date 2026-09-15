@@ -1,6 +1,5 @@
 /target
 /.reasonix
 /.codebase-memory/
-/.workbuddy/memory
-/.workbuddy/tmp
+/.workbuddy/
 /docs/research

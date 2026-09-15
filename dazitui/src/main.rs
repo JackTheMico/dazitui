@@ -26,6 +26,10 @@ use dazitui_core::{
 /// 方案源文件热监控封装（issue #91 / #93），基于 `notify`。
 mod scheme_watcher;
 
+/// Linux 物理键盘按键监听封装（用于串击方案输入法组字按键实时点亮）。
+mod evdev_listener;
+
+
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::prelude::Stylize;
@@ -688,6 +692,8 @@ pub struct LiveKeyboard {
     pub active_keys: std::collections::HashMap<String, Instant>,
     /// 上一次输入（上屏或退格）的时刻，用于推算串击方案的回放节奏。
     last_input_at: Option<Instant>,
+    /// 是否由 Linux evdev 后台捕获并实时点亮（串击方案且具有权限时置为 true）。
+    pub evdev_active: bool,
 }
 
 /// 串击回放的逐键间隔下限：低于此值，多键连打在视觉上仍近似同时点亮。
@@ -701,6 +707,7 @@ impl LiveKeyboard {
         Self {
             active_keys: std::collections::HashMap::new(),
             last_input_at: None,
+            evdev_active: false,
         }
     }
 
@@ -813,10 +820,11 @@ impl LiveKeyboard {
                     .fg(palette.bg)
                     .bg(palette.accent)
                     .add_modifier(Modifier::BOLD)
-            } else if elapsed_ms <= 250 {
-                // 余温衰减 (100-250ms): 强调色前景色 + 加粗
+            } else if elapsed_ms <= 300 {
+                // 余温衰减 (100-300ms): 选区背景实体发光键帽 + 强调色前景 + 加粗
                 Style::default()
                     .fg(palette.accent)
+                    .bg(palette.selection)
                     .add_modifier(Modifier::BOLD)
             } else {
                 // 常态
@@ -899,6 +907,8 @@ struct App {
     free_input_modal: Option<FreeInputModal>,
     /// 实时虚拟键盘状态。
     live_keyboard: LiveKeyboard,
+    /// Linux 物理键盘按键监听器（用于串击方案输入法组字按键实时点亮）。
+    evdev_receiver: Option<evdev_listener::EvdevKeyReceiver>,
     /// 当前输入法方案码表（用于汉字方案反查击键与键盘涟漪点亮）。
     scheme_dict: Option<SchemeDict>,
     /// 自动发现的输入方案列表（启动扫描一次 fcitx5 部署目录）。
@@ -1166,6 +1176,11 @@ impl App {
         };
         let logged_in = api.is_logged_in();
         let token = api.current_token();
+        let evdev = evdev_listener::EvdevKeyReceiver::start();
+        let evdev_active = evdev.is_active;
+        let sidebar_notice = evdev.status_message.clone();
+        let mut live_keyboard = LiveKeyboard::new();
+        live_keyboard.evdev_active = evdev_active;
         let mut app = Self {
             text,
             session,
@@ -1176,7 +1191,7 @@ impl App {
             state: AppState::Typing,
             sidebar_visible: true,
             sidebar_selected: 0,
-            sidebar_notice: None,
+            sidebar_notice,
             browse_files: Vec::new(),
             browse_selection: 0,
             builtin_selection: 0,
@@ -1200,7 +1215,8 @@ impl App {
             last_saved_completed: 0,
             text_setting_modal: None,
             free_input_modal: None,
-            live_keyboard: LiveKeyboard::new(),
+            live_keyboard,
+            evdev_receiver: Some(evdev),
             scheme_dict: None,
             discovered,
             scheme_cache: HashMap::new(),
@@ -1360,6 +1376,30 @@ impl App {
             }
             if self.scheme_loading.as_deref() == Some(result.id.as_str()) {
                 self.scheme_loading = None;
+            }
+        }
+    }
+
+    /// 消费后台物理键盘击键事件并驱动实时虚拟键盘高亮。
+    /// 仅在跟打进行中（AppState::Typing 且非暂停）且当前方案为串击方案（无 chord_algebra）时生效。
+    fn poll_evdev_keys(&mut self) {
+        if let Some(ref receiver) = self.evdev_receiver {
+            if !receiver.is_active {
+                return;
+            }
+            let keys = receiver.try_recv_keys();
+            if keys.is_empty() {
+                return;
+            }
+            let is_chord = self
+                .scheme_dict
+                .as_ref()
+                .map_or(false, |d| d.chord_algebra().is_some());
+            let kb_enabled = self.settings.keyboard_mode.is_enabled();
+            if matches!(self.state, AppState::Typing) && !self.paused && !is_chord && kb_enabled {
+                for (k, now) in keys {
+                    self.live_keyboard.press_key(&k, now);
+                }
             }
         }
     }
@@ -2506,12 +2546,22 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
         app.poll_rank_loader();
         // 检测方案源文件改动并（防抖后）热重载（issue #91/#94）。
         app.poll_scheme_hot_reload();
+        // 消费后台物理键盘击键（串击方案组字实时点亮）。
+        app.poll_evdev_keys();
         app.advance_countdown_if_due();
         terminal.draw(|frame| ui(frame, &app))?;
         let event_to_process = if let Some(pk) = pending_key_event.take() {
             Event::Key(pk)
         } else {
-            if !event::poll(Duration::from_millis(100))? {
+            let poll_timeout = if matches!(app.state, AppState::Typing)
+                && !app.paused
+                && app.settings.keyboard_mode.is_enabled()
+            {
+                Duration::from_millis(16)
+            } else {
+                Duration::from_millis(100)
+            };
+            if !event::poll(poll_timeout)? {
                 continue;
             }
             event::read()?
@@ -3770,20 +3820,28 @@ fn handle_text(
             session.record_key(k);
         }
         session.type_text_with_strokes_at(text, strokes, elapsed);
-        // 串击方案（无并击指法规则）按回放节奏依次点亮；并击方案保持同时点亮。
-        let stagger = dict.chord_algebra().is_none();
-        live_kb.press_keys(keys.iter().map(String::as_str), now, stagger);
+        let is_chord = dict.chord_algebra().is_some();
+        if is_chord {
+            // 并击方案：保持双手并击同时点亮
+            live_kb.press_keys(keys.iter().map(String::as_str), now, false);
+        } else if !live_kb.evdev_active {
+            // 串击方案：若 evdev 未激活（无权限或设备不可用），降级按 ADR 0011 回放节奏依次点亮；
+            // 若 evdev 已激活，用户在输入法组字击键时已被实时点亮，上屏无需重复回放。
+            live_kb.press_keys(keys.iter().map(String::as_str), now, true);
+        }
     } else {
         for c in text.chars() {
             session.record_key(&c.to_string());
         }
         let strokes = text.chars().count() as u32;
         session.type_text_with_strokes_at(text, strokes, elapsed);
-        for c in text.chars() {
-            if c == ' ' {
-                live_kb.press_key("Space", now);
-            } else if c.is_ascii() {
-                live_kb.press_char(c, now);
+        if !live_kb.evdev_active {
+            for c in text.chars() {
+                if c == ' ' {
+                    live_kb.press_key("Space", now);
+                } else if c.is_ascii() {
+                    live_kb.press_char(c, now);
+                }
             }
         }
     }
@@ -7063,10 +7121,11 @@ pub fn generate_live_keyboard_lines(
                                 format!("[{k_display}]")
                             };
                             spans.push(Span::styled(badge, active_style));
-                        } else if elapsed_ms <= 250 {
-                            // 余温衰减 (100-250ms): 强调色渐隐
+                        } else if elapsed_ms <= 300 {
+                            // 余温衰减 (100-300ms): 选区底色实体发光键帽拖尾
                             let decay_style = Style::default()
                                 .fg(palette.accent)
+                                .bg(palette.selection)
                                 .add_modifier(Modifier::BOLD);
                             let badge = if *k_lookup == "Space" {
                                 format!("[ {:^20} ]", k_display)
@@ -7196,9 +7255,10 @@ pub fn generate_live_keyboard_lines(
                                 format!("[{k_display}]")
                             };
                             spans.push(Span::styled(badge, active_style));
-                        } else if elapsed_ms <= 250 {
+                        } else if elapsed_ms <= 300 {
                             let decay_style = Style::default()
                                 .fg(palette.accent)
+                                .bg(palette.selection)
                                 .add_modifier(Modifier::BOLD);
                             let badge = if *k_lookup == "Space" {
                                 format!("[ {:^20} ]", k_display)
@@ -7247,7 +7307,7 @@ fn append_idle_key_spans(
     palette: &ThemePalette,
     space_width: usize,
 ) {
-    let delim_style = Style::default().fg(palette.accent);
+    let delim_style = Style::default().fg(palette.muted);
     if k_lookup == "Space" {
         spans.push(Span::styled("[", delim_style));
         spans.push(Span::styled(
@@ -7256,7 +7316,7 @@ fn append_idle_key_spans(
         ));
         spans.push(Span::styled("]", delim_style));
     } else if is_homing {
-        // 定位键 (F / J): 鲜明主题强调色 + 粗体，形成视觉瞄点
+        // 定位键 (F / J): 鲜明主题强调色 + 粗体，中括号保持 muted 暗色，形成清晰视觉瞄点
         spans.push(Span::styled("[", delim_style));
         spans.push(Span::styled(
             k_display.to_string(),
@@ -7272,7 +7332,7 @@ fn append_idle_key_spans(
             Style::default().fg(palette.muted),
         ));
     } else {
-        // 核心字母/符号键: 高对比度主题前景色，清晰易读
+        // 核心字母/符号键: 高对比度主题前景色，中括号为 muted 暗边框
         spans.push(Span::styled("[", delim_style));
         spans.push(Span::styled(
             k_display.to_string(),
@@ -13793,14 +13853,14 @@ mod tests {
         assert_eq!(active_style.fg, Some(palette.bg));
         assert!(active_style.add_modifier.contains(Modifier::BOLD));
 
-        // 150ms 衰减 -> 次高亮 (fg: accent)
+        // 150ms 衰减 -> 选区实体发光键帽 (fg: accent, bg: selection)
         let t_decay = t0 + Duration::from_millis(150);
         let decay_style = kb.get_key_style("a", &palette, t_decay);
         assert_eq!(decay_style.fg, Some(palette.accent));
-        assert_eq!(decay_style.bg, None);
+        assert_eq!(decay_style.bg, Some(palette.selection));
 
-        // 300ms 后 -> 恢复常态 muted
-        let t_end = t0 + Duration::from_millis(300);
+        // 350ms 后 -> 恢复常态 muted
+        let t_end = t0 + Duration::from_millis(350);
         let end_style = kb.get_key_style("a", &palette, t_end);
         assert_eq!(end_style.fg, Some(palette.muted));
     }
@@ -13933,44 +13993,44 @@ mod tests {
             if span.content == "F" {
                 assert_eq!(span.style.fg, Some(palette.accent));
                 assert!(span.style.add_modifier.contains(Modifier::BOLD));
-                // F 键的左右括号应为主题强调色
+                // F 键字母为 accent 强调色，左右中括号保持 muted 暗色以沉淀视觉基底
                 assert_eq!(row2.spans[i - 1].content, "[");
-                assert_eq!(row2.spans[i - 1].style.fg, Some(palette.accent));
+                assert_eq!(row2.spans[i - 1].style.fg, Some(palette.muted));
                 assert_eq!(row2.spans[i + 1].content, "]");
-                assert_eq!(row2.spans[i + 1].style.fg, Some(palette.accent));
+                assert_eq!(row2.spans[i + 1].style.fg, Some(palette.muted));
                 found_f = true;
             } else if span.content == "J" {
                 assert_eq!(span.style.fg, Some(palette.accent));
                 assert!(span.style.add_modifier.contains(Modifier::BOLD));
                 found_j = true;
             } else if span.content == "A" {
-                // 普通字母键为主要前景色 fg，但左右边框为主题强调色 accent
+                // 普通字母键为主要前景色 fg，左右边框为次要暗色 muted
                 assert_eq!(span.style.fg, Some(palette.fg));
                 assert_eq!(row2.spans[i - 1].content, "[");
-                assert_eq!(row2.spans[i - 1].style.fg, Some(palette.accent));
+                assert_eq!(row2.spans[i - 1].style.fg, Some(palette.muted));
                 assert_eq!(row2.spans[i + 1].content, "]");
-                assert_eq!(row2.spans[i + 1].style.fg, Some(palette.accent));
+                assert_eq!(row2.spans[i + 1].style.fg, Some(palette.muted));
                 found_a = true;
             }
         }
         assert!(found_f && found_j && found_a);
 
-        // Row 4 空格键验证：左右括号为 accent，内部文字为 muted，且标签为纯英文 Space
+        // Row 4 空格键验证：左右括号为 muted，内部文字为 muted，且标签为纯英文 Space
         let row4 = &lines[4];
         let mut found_space_brackets = false;
         for (i, span) in row4.spans.iter().enumerate() {
             if span.content.contains("Space") && !span.content.contains("[") {
                 assert_eq!(span.style.fg, Some(palette.muted));
                 assert_eq!(row4.spans[i - 1].content, "[");
-                assert_eq!(row4.spans[i - 1].style.fg, Some(palette.accent));
+                assert_eq!(row4.spans[i - 1].style.fg, Some(palette.muted));
                 assert_eq!(row4.spans[i + 1].content, "]");
-                assert_eq!(row4.spans[i + 1].style.fg, Some(palette.accent));
+                assert_eq!(row4.spans[i + 1].style.fg, Some(palette.muted));
                 found_space_brackets = true;
             }
         }
         assert!(
             found_space_brackets,
-            "空格键外侧括号应为主题强调色且文本为纯英文 Space"
+            "空格键外侧括号应为次要暗色且文本为纯英文 Space"
         );
 
         // 多主题预设联动验证：切换至 Dracula 主题，边框色彩随之变更
@@ -13982,13 +14042,13 @@ mod tests {
             if span.content == "A" {
                 assert_eq!(
                     dracula_row2.spans[i - 1].style.fg,
-                    Some(dracula_palette.accent)
+                    Some(dracula_palette.muted)
                 );
-                assert_ne!(dracula_row2.spans[i - 1].style.fg, Some(palette.accent));
+                assert_ne!(dracula_row2.spans[i - 1].style.fg, Some(palette.muted));
             }
         }
 
-        // 2. 按键按下时：测试强高亮 (0-100ms) 反色填充 (bg: accent, fg: bg)
+        // 2. 按键按下时：测试强高亮 (0-160ms) 反色填充 (bg: accent, fg: bg)
         kb.press_char('a', now);
         let active_lines =
             generate_live_keyboard_lines(&kb, KeyboardMode::Staggered, &palette, now, 80);
@@ -14003,6 +14063,31 @@ mod tests {
             }
         }
         assert!(found_active_a, "按下瞬间 'A' 键应渲染为反色实体高亮 [A]");
+
+        // 3. 余温衰减阶段（100-300ms）：测试选区发光键帽拖尾 (bg: selection, fg: accent)
+        let decay_time = now + Duration::from_millis(200);
+        let decay_lines =
+            generate_live_keyboard_lines(&kb, KeyboardMode::Staggered, &palette, decay_time, 80);
+        let decay_row2 = &decay_lines[2];
+        let mut found_decay_a = false;
+        for span in &decay_row2.spans {
+            if span.content == "[A]" {
+                assert_eq!(span.style.bg, Some(palette.selection));
+                assert_eq!(span.style.fg, Some(palette.accent));
+                assert!(span.style.add_modifier.contains(Modifier::BOLD));
+                found_decay_a = true;
+            }
+        }
+        assert!(found_decay_a, "衰减阶段 'A' 键应渲染为选区发光实体键帽 [A]");
+
+        // 4. 超时恢复常态 (>300ms)
+        let idle_time = now + Duration::from_millis(350);
+        let restored_lines =
+            generate_live_keyboard_lines(&kb, KeyboardMode::Staggered, &palette, idle_time, 80);
+        let restored_row2 = &restored_lines[2];
+        for span in &restored_row2.spans {
+            assert_ne!(span.content, "[A]", "超时后不应再是单个 [A] span，应拆分为常态括号与字母");
+        }
     }
 
     #[test]
@@ -14114,17 +14199,17 @@ mod tests {
             assert!(style.add_modifier.contains(Modifier::BOLD));
         }
 
-        // 100-250ms 衰减次高亮
+        // 100-300ms 衰减实体发光键帽
         for k in &["v", "b", "g"] {
             let style = kb.get_key_style(k, &palette, t0 + Duration::from_millis(180));
             assert_eq!(style.fg, Some(palette.accent));
-            assert_eq!(style.bg, None);
+            assert_eq!(style.bg, Some(palette.selection));
             assert!(style.add_modifier.contains(Modifier::BOLD));
         }
 
-        // >250ms 恢复常态
+        // >300ms 恢复常态
         for k in &["v", "b", "g"] {
-            let style = kb.get_key_style(k, &palette, t0 + Duration::from_millis(300));
+            let style = kb.get_key_style(k, &palette, t0 + Duration::from_millis(350));
             assert_eq!(style.fg, Some(palette.muted));
             assert_eq!(style.bg, None);
         }
@@ -14171,11 +14256,11 @@ mod tests {
         let last = kb.get_key_style("r", &palette, t0);
         assert_eq!(last.bg, Some(palette.accent));
 
-        // 中间两个键处于余温衰减
+        // 中间两个键处于余温衰减 (100-300ms, 选区实体发光键帽)
         for k in ["w", "e"] {
             let s = kb.get_key_style(k, &palette, t0);
             assert_eq!(s.fg, Some(palette.accent), "键 {k} 应处于余温衰减");
-            assert_eq!(s.bg, None);
+            assert_eq!(s.bg, Some(palette.selection));
         }
 
         // 最早按下的键已衰减回常态（与从未按下的键同色）
@@ -14201,7 +14286,7 @@ mod tests {
             assert_eq!(s.bg, Some(palette.accent), "并击键 {k} 应同时强高亮");
         }
         for k in ["q", "w", "e", "r"] {
-            let s = kb.get_key_style(k, &palette, t0 + Duration::from_millis(300));
+            let s = kb.get_key_style(k, &palette, t0 + Duration::from_millis(350));
             assert_eq!(s.bg, None, "并击键 {k} 应同时衰减回常态");
         }
     }
@@ -14375,6 +14460,82 @@ mod tests {
         assert_eq!(session.key_counts().get("q"), Some(&1));
         assert_eq!(session.key_counts().get("e"), Some(&1));
         assert_eq!(session.key_counts().get("结果"), None);
+    }
+
+    #[test]
+    fn handle_text_sequential_with_evdev_active_skips_replay() {
+        let mut dict = SchemeDict::default();
+        dict.add_entry("虎", "h");
+        let mut session = Session::new("虎");
+        let mut live_kb = LiveKeyboard::new();
+        live_kb.evdev_active = true;
+        let now = Instant::now();
+
+        // 串击方案且 evdev 处于激活工作状态：上屏正常推进 session，但不重复往 live_kb 灌反查键
+        handle_text(
+            &mut session,
+            &mut live_kb,
+            Some(&dict),
+            "虎",
+            Duration::from_millis(100),
+            now,
+        );
+
+        assert_eq!(session.len(), 1);
+        assert_eq!(session.total_strokes(), 1);
+        // live_kb 由后台 evdev 在打字时实时点亮，handle_text 不做二次回放
+        assert!(live_kb.active_keys.is_empty());
+    }
+
+    #[test]
+    fn handle_text_sequential_without_evdev_active_falls_back_to_stagger() {
+        let mut dict = SchemeDict::default();
+        dict.add_entry("虎", "h");
+        let mut session = Session::new("虎");
+        let mut live_kb = LiveKeyboard::new();
+        live_kb.evdev_active = false;
+        let now = Instant::now();
+
+        // 串击方案且 evdev 未激活（降级模式）：自动回退到 ADR 0011 回放点亮
+        handle_text(
+            &mut session,
+            &mut live_kb,
+            Some(&dict),
+            "虎",
+            Duration::from_millis(100),
+            now,
+        );
+
+        assert_eq!(session.len(), 1);
+        assert_eq!(session.total_strokes(), 1);
+        assert!(live_kb.active_keys.contains_key("h"));
+    }
+
+    #[test]
+    fn handle_text_chord_always_activates_chord_keys_regardless_of_evdev() {
+        let mut dict = SchemeDict::default();
+        dict.add_entry("到", "_.");
+        let rules = vec!["xform|xv|\\.|".to_string()];
+        dict.set_chord_algebra(dazitui_core::ChordAlgebra::from_rules(&rules));
+
+        let mut session = Session::new("到");
+        let mut live_kb = LiveKeyboard::new();
+        live_kb.evdev_active = true; // 即使开启了 evdev
+        let now = Instant::now();
+
+        // 并击方案始终由反查规则同时激活双手并击物理键
+        handle_text(
+            &mut session,
+            &mut live_kb,
+            Some(&dict),
+            "到",
+            Duration::from_millis(100),
+            now,
+        );
+
+        assert_eq!(session.len(), 1);
+        assert!(live_kb.active_keys.contains_key("x"));
+        assert!(live_kb.active_keys.contains_key("v"));
     }
 
     #[test]
