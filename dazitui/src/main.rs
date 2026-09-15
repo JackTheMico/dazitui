@@ -686,19 +686,48 @@ enum FreeInputAction {
 pub struct LiveKeyboard {
     /// 键名（规范化后的小写字符或特殊键名）-> 最近触发激活的时间戳。
     pub active_keys: std::collections::HashMap<String, Instant>,
+    /// 上一次输入（上屏或退格）的时刻，用于推算串击方案的回放节奏。
+    last_input_at: Option<Instant>,
 }
+
+/// 串击回放的逐键间隔下限：低于此值，多键连打在视觉上仍近似同时点亮。
+const STAGGER_MIN: Duration = Duration::from_millis(20);
+/// 串击回放的逐键间隔上限：高于此值，停顿后的首个字会被慢放成卡带。
+const STAGGER_MAX: Duration = Duration::from_millis(120);
 
 impl LiveKeyboard {
     /// 创建新实例。
     pub fn new() -> Self {
         Self {
             active_keys: std::collections::HashMap::new(),
+            last_input_at: None,
         }
     }
 
     /// 重置所有激活按键。
     pub fn clear(&mut self) {
         self.active_keys.clear();
+        self.last_input_at = None;
+    }
+
+    /// 计算串击方案一次上屏中 `n` 个按键的回放时刻。
+    ///
+    /// 第 i 键的时刻为 `now - (n-1-i) * interval`，最后一个键落在 `now`，
+    /// 于是先按下的键已经衰减、后按下的键正亮着，在同一张键盘图上形成拖尾。
+    ///
+    /// `interval` 取「距上次输入的时间差 / n」并钳制到 [`STAGGER_MIN`, `STAGGER_MAX`]：
+    /// 快速连打不被压缩，停顿后打出的字也不会被慢放。
+    pub fn staggered_press_times(n: usize, delta: Duration, now: Instant) -> Vec<Instant> {
+        if n <= 1 {
+            return vec![now];
+        }
+        let interval = (delta / n as u32).clamp(STAGGER_MIN, STAGGER_MAX);
+        (0..n)
+            .map(|i| {
+                let back = interval * (n - 1 - i) as u32;
+                now.checked_sub(back).unwrap_or(now)
+            })
+            .collect()
     }
 
     /// 规范化按键标识。
@@ -734,6 +763,7 @@ impl LiveKeyboard {
     pub fn press_key(&mut self, key: &str, now: Instant) {
         let norm = Self::normalize_key(key);
         self.active_keys.insert(norm, now);
+        self.last_input_at = Some(now);
     }
 
     /// 触发单字符按键激活。
@@ -746,13 +776,30 @@ impl LiveKeyboard {
     }
 
     /// 批量触发按键激活（用于汉字方案反查）。
-    pub fn press_keys<'a, I>(&mut self, keys: I, now: Instant)
+    ///
+    /// `stagger` 为 true 时按回放节奏**依次**点亮（串击方案：先按的先衰减）；
+    /// 为 false 时全部落在 `now`（并击方案：一次并击的键同时按下，同时点亮）。
+    pub fn press_keys<'a, I>(&mut self, keys: I, now: Instant, stagger: bool)
     where
         I: IntoIterator<Item = &'a str>,
     {
-        for k in keys {
-            self.press_key(k, now);
+        let keys: Vec<&str> = keys.into_iter().collect();
+        if keys.is_empty() {
+            return;
         }
+        let delta = self
+            .last_input_at
+            .map_or(Duration::ZERO, |prev| now.saturating_duration_since(prev));
+        let times = if stagger {
+            Self::staggered_press_times(keys.len(), delta, now)
+        } else {
+            vec![now; keys.len()]
+        };
+        for (k, t) in keys.iter().zip(times) {
+            let norm = Self::normalize_key(k);
+            self.active_keys.insert(norm, t);
+        }
+        self.last_input_at = Some(now);
     }
 
     /// 计算给定键位在时间点 `now` 的样式（高亮/衰减/常态）。
@@ -3723,9 +3770,9 @@ fn handle_text(
             session.record_key(k);
         }
         session.type_text_with_strokes_at(text, strokes, elapsed);
-        for k in &keys {
-            live_kb.press_key(k, now);
-        }
+        // 串击方案（无并击指法规则）按回放节奏依次点亮；并击方案保持同时点亮。
+        let stagger = dict.chord_algebra().is_none();
+        live_kb.press_keys(keys.iter().map(String::as_str), now, stagger);
     } else {
         for c in text.chars() {
             session.record_key(&c.to_string());
@@ -13722,9 +13769,11 @@ mod tests {
         kb.clear();
         assert!(kb.active_keys.is_empty());
 
-        kb.press_keys(["n", "i"], now);
+        // 并击：多键同帧按下，时间戳一致
+        kb.press_keys(["n", "i"], now, false);
         assert!(kb.active_keys.contains_key("n"));
         assert!(kb.active_keys.contains_key("i"));
+        assert_eq!(kb.active_keys.get("n"), kb.active_keys.get("i"));
     }
 
     #[test]
@@ -14054,8 +14103,8 @@ mod tests {
         let mut kb = LiveKeyboard::new();
         let t0 = Instant::now();
 
-        // 模拟汉字上屏瞬间同时激活多个字根键 (如 'v', 'b', 'g')
-        kb.press_keys(["v", "b", "g"], t0);
+        // 模拟并击：汉字上屏瞬间同时激活多个字根键 (如 'v', 'b', 'g')
+        kb.press_keys(["v", "b", "g"], t0, false);
 
         // 0-100ms 强高亮
         for k in &["v", "b", "g"] {
@@ -14078,6 +14127,82 @@ mod tests {
             let style = kb.get_key_style(k, &palette, t0 + Duration::from_millis(300));
             assert_eq!(style.fg, Some(palette.muted));
             assert_eq!(style.bg, None);
+        }
+    }
+
+    #[test]
+    fn staggered_press_times_clamps_interval() {
+        let now = Instant::now();
+
+        // 单键无所谓间隔
+        assert_eq!(
+            LiveKeyboard::staggered_press_times(1, Duration::from_millis(500), now),
+            vec![now]
+        );
+
+        // 基准间隔 100ms，落在 [20,120] 内，原样采用
+        let times = LiveKeyboard::staggered_press_times(4, Duration::from_millis(400), now);
+        assert_eq!(times.len(), 4);
+        assert_eq!(times[3], now, "最后一个键应落在 now");
+        assert_eq!(now.duration_since(times[2]), Duration::from_millis(100));
+        assert_eq!(now.duration_since(times[0]), Duration::from_millis(300));
+
+        // 极快连打：基准 10ms 抬到下限 20ms
+        let times = LiveKeyboard::staggered_press_times(4, Duration::from_millis(40), now);
+        assert_eq!(now.duration_since(times[0]), Duration::from_millis(60));
+
+        // 长停顿：基准 1000ms 压到上限 120ms
+        let times = LiveKeyboard::staggered_press_times(4, Duration::from_millis(4000), now);
+        assert_eq!(now.duration_since(times[0]), Duration::from_millis(360));
+    }
+
+    #[test]
+    fn press_keys_stagger_lights_up_in_typing_order() {
+        let palette = theme_palette(ThemePreset::CatppuccinMocha);
+        let mut kb = LiveKeyboard::new();
+        let t_prev = Instant::now();
+        let t0 = t_prev + Duration::from_millis(1000);
+
+        // 上次输入在 1s 前 -> 基准间隔 250ms，钳到上限 120ms
+        kb.press_keys(["z"], t_prev, false);
+        kb.press_keys(["q", "w", "e", "r"], t0, true);
+
+        // 最后按下的键：强高亮反白
+        let last = kb.get_key_style("r", &palette, t0);
+        assert_eq!(last.bg, Some(palette.accent));
+
+        // 中间两个键处于余温衰减
+        for k in ["w", "e"] {
+            let s = kb.get_key_style(k, &palette, t0);
+            assert_eq!(s.fg, Some(palette.accent), "键 {k} 应处于余温衰减");
+            assert_eq!(s.bg, None);
+        }
+
+        // 最早按下的键已衰减回常态（与从未按下的键同色）
+        assert_eq!(
+            kb.get_key_style("q", &palette, t0).fg,
+            kb.get_key_style("p", &palette, t0).fg
+        );
+    }
+
+    #[test]
+    fn press_keys_chord_lights_up_simultaneously() {
+        let palette = theme_palette(ThemePreset::CatppuccinMocha);
+        let mut kb = LiveKeyboard::new();
+        let t_prev = Instant::now();
+        let t0 = t_prev + Duration::from_millis(1000);
+
+        // 并击方案：即便间隔 1s，四个键仍同时点亮、同时衰减
+        kb.press_keys(["z"], t_prev, false);
+        kb.press_keys(["q", "w", "e", "r"], t0, false);
+
+        for k in ["q", "w", "e", "r"] {
+            let s = kb.get_key_style(k, &palette, t0);
+            assert_eq!(s.bg, Some(palette.accent), "并击键 {k} 应同时强高亮");
+        }
+        for k in ["q", "w", "e", "r"] {
+            let s = kb.get_key_style(k, &palette, t0 + Duration::from_millis(300));
+            assert_eq!(s.bg, None, "并击键 {k} 应同时衰减回常态");
         }
     }
 
