@@ -21,7 +21,10 @@ use dazitui_core::{
     load_text_from_clipboard, load_text_from_file, load_text_from_string, lttb_downsample,
     normalize_scheme_to_id, osc52_clipboard, pack_words_by_width, prewarm_segmenter,
     resolve_scheme_path_via_discovery, save_text_to_file, today_ymd, word_ratio_pct,
+    TigerCupClient, TigerDraft, TigerDraftStore, TigerLeaderboardEntry,
+    build_tiger_payload, format_tiger_share_text,
 };
+
 
 /// 方案源文件热监控封装（issue #91 / #93），基于 `notify`。
 mod scheme_watcher;
@@ -238,18 +241,66 @@ struct RankBoard {
     viewport_rows: Cell<usize>,
 }
 
-/// 在线排行榜视图状态：三个比赛 Tab 各自缓存一份榜单。
+/// 在线排行榜支持的比赛 Tab（极速杯 / 锦标赛 / 键神杯 / 虎码杯）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum RankTab {
+    Jisu,
+    Jinbiao,
+    Jianshen,
+    TigerCup,
+}
+
+impl RankTab {
+    const ALL: [RankTab; 4] = [
+        RankTab::Jisu,
+        RankTab::Jinbiao,
+        RankTab::Jianshen,
+        RankTab::TigerCup,
+    ];
+
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Jisu => "极速杯",
+            Self::Jinbiao => "锦标赛",
+            Self::Jianshen => "键神杯",
+            Self::TigerCup => "虎码杯",
+        }
+    }
+
+    fn next(&self) -> Self {
+        let i = Self::ALL.iter().position(|t| t == self).unwrap_or(0);
+        Self::ALL[(i + 1) % Self::ALL.len()]
+    }
+
+    fn prev(&self) -> Self {
+        let i = Self::ALL.iter().position(|t| t == self).unwrap_or(0);
+        Self::ALL[(i + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+}
+
+impl From<CompetitionType> for RankTab {
+    fn from(c: CompetitionType) -> Self {
+        match c {
+            CompetitionType::Jisu => RankTab::Jisu,
+            CompetitionType::Jinbiao => RankTab::Jinbiao,
+            CompetitionType::Jianshen => RankTab::Jianshen,
+        }
+    }
+}
+
+/// 在线排行榜视图状态：四个比赛 Tab 各自缓存一份榜单。
 #[derive(Debug)]
 struct OnlineRankState {
     /// 当前选中的比赛 Tab。
-    active_tab: CompetitionType,
+    active_tab: RankTab,
     /// 当前拉取的期次日期（今天 `YYYY-MM-DD`），跨天自动刷新。
     date: String,
-    /// 三个比赛各自榜单缓存（按比赛类型索引）。
-    boards: HashMap<CompetitionType, RankBoard>,
+    /// 四个比赛各自榜单缓存（按比赛 Tab 索引）。
+    boards: HashMap<RankTab, RankBoard>,
     /// 全局错误提示（网络失败等），优先于各 board 局部错误展示。
     error: Option<String>,
 }
+
 
 /// 在线排行榜「自定义列」弹窗：列出四列并支持勾选显隐。
 #[derive(Debug, Default)]
@@ -345,8 +396,9 @@ const FOCUS_CODE_HINT: usize = 7;
 const FOCUS_MONITOR_SCHEME: usize = 8;
 const FOCUS_TARGET_KPS: usize = 9;
 const FOCUS_TARGET_WPM: usize = 10;
+const FOCUS_RETRY_SHUFFLE: usize = 11;
 /// 设置视图焦点项总数。
-const SETTINGS_FOCUS_COUNT: usize = 11;
+const SETTINGS_FOCUS_COUNT: usize = 12;
 
 /// 成绩视图「错字时间线」一屏最多可见的错字条数（超出部分滚动查看）。
 const ERROR_TIMELINE_VISIBLE: usize = 8;
@@ -549,11 +601,13 @@ enum SidebarMenuItem {
     OnlineJisu,
     OnlineJinbiao,
     OnlineJianshen,
+    OnlineTigerCup,
     OnlineRank,
     Stats,
     Settings,
     Sponsor,
     Login,
+    LoginTiger,
 }
 
 const SIDEBAR_MENU_ITEMS: &[SidebarMenuItem] = &[
@@ -564,12 +618,15 @@ const SIDEBAR_MENU_ITEMS: &[SidebarMenuItem] = &[
     SidebarMenuItem::OnlineJisu,
     SidebarMenuItem::OnlineJinbiao,
     SidebarMenuItem::OnlineJianshen,
+    SidebarMenuItem::OnlineTigerCup,
     SidebarMenuItem::OnlineRank,
     SidebarMenuItem::Stats,
     SidebarMenuItem::Settings,
     SidebarMenuItem::Sponsor,
     SidebarMenuItem::Login,
+    SidebarMenuItem::LoginTiger,
 ];
+
 
 /// 成绩视图里的成绩上传状态（在线赛文完成跟打后自动上传）。
 #[derive(Debug, Clone, PartialEq)]
@@ -881,6 +938,14 @@ struct App {
     online_loading: Option<CompetitionType>,
     /// 在线载文错误提示（展示在功能栏）。
     online_error: Option<String>,
+    /// 虎码杯客户端。
+    tiger_api: TigerCupClient,
+    /// 虎码杯当日草稿存储。
+    tiger_draft_store: TigerDraftStore,
+    /// 虎码杯赛文加载中。
+    tiger_loading: bool,
+    /// 虎码杯载文错误提示。
+    tiger_error: Option<String>,
     /// 外观设置。
     settings: Settings,
     /// 设置持久化存储。
@@ -988,6 +1053,63 @@ impl SchemeLoader {
 
 /// 异步排行榜加载器：派生后台线程调用 `ApiClient::get_competition_rank`，
 /// 经通道回传结果，主循环每帧 `poll_rank_loader` 消费，期间 TUI 不冻结（与 `SchemeLoader` 同构）。
+/// 将虎码杯排行榜条目映射为通用的 CompetitionRank 结构（支持 my_rank 高亮与统一渲染）。
+fn tiger_entries_to_rank(
+    entries: Vec<TigerLeaderboardEntry>,
+    my_username: Option<&str>,
+    date: &str,
+) -> CompetitionRank {
+    let mut my_rank_result = Vec::new();
+    let rows: Vec<CompetitionRankRow> = entries
+        .into_iter()
+        .map(|e| {
+            if let Some(uname) = my_username {
+                if e.username == uname {
+                    my_rank_result.push(CompetitionRankRow {
+                        rank: e.rank,
+                        username: e.username.clone(),
+                        speed: e.speed,
+                        input_method: e.input_method.clone(),
+                        keystrokes: e.hit_rate,
+                        ma_chang: e.kpw,
+                        jian_zhun: format!("{:.2}%", e.accuracy),
+                        jian_shu: e.total_keys,
+                        hui_gai: e.correction_count,
+                        da_ci: format!("{:.2}%", e.word_ratio * 100.0),
+                        typing_time: crate::format_time(std::time::Duration::from_secs_f64(e.time)),
+                        from: "虎魄/dazitui".to_string(),
+                        sect_name: e.tier.clone(),
+                    });
+                }
+            }
+            CompetitionRankRow {
+                rank: e.rank,
+                username: e.username,
+                speed: e.speed,
+                input_method: e.input_method,
+                keystrokes: e.hit_rate,
+                ma_chang: e.kpw,
+                jian_zhun: format!("{:.2}%", e.accuracy),
+                jian_shu: e.total_keys,
+                hui_gai: e.correction_count,
+                da_ci: format!("{:.2}%", e.word_ratio * 100.0),
+                typing_time: crate::format_time(std::time::Duration::from_secs_f64(e.time)),
+                from: "虎魄/dazitui".to_string(),
+                sect_name: e.tier,
+            }
+        })
+        .collect();
+    let total = rows.len() as u32;
+    CompetitionRank {
+        rank_result: rows,
+        my_rank_result,
+        total,
+        text_title: format!("{date} 每日赛文"),
+        text_length: 0,
+    }
+}
+
+/// 异步排行榜加载器：派生后台线程调用客户端并回传结果，主循环每帧 `poll_rank_loader` 消费。
 struct RankLoader {
     sender: mpsc::Sender<RankLoadResult>,
     receiver: mpsc::Receiver<RankLoadResult>,
@@ -995,8 +1117,8 @@ struct RankLoader {
 
 /// 后台排行榜拉取的一次性结果回传。
 struct RankLoadResult {
-    /// 拉取的比赛类型。
-    competition_type: CompetitionType,
+    /// 拉取的比赛 Tab。
+    tab: RankTab,
     /// 拉取的期次日期（与请求时一致，用于校验是否仍匹配当前视图）。
     date: String,
     /// 拉取结果：成功为榜单，失败为错误。
@@ -1009,14 +1131,29 @@ impl RankLoader {
         Self { sender, receiver }
     }
 
-    /// 派发一次后台排行榜拉取：在独立线程调用 `client.get_competition_rank` 并回传结果。
-    /// `client` 需在调用前 clone（线程所有权移交），其内部会话与 `app.api` 共享。
-    fn request(&self, client: ApiClient, competition_type: CompetitionType, date: String) {
+    /// 派发一次后台排行榜拉取：在独立线程调用客户端并回传结果。
+    fn request(
+        &self,
+        client: ApiClient,
+        tiger_client: TigerCupClient,
+        tab: RankTab,
+        date: String,
+        my_username: Option<String>,
+    ) {
         let sender = self.sender.clone();
         std::thread::spawn(move || {
-            let result = client.get_competition_rank(competition_type, &date);
+            let result = match tab {
+                RankTab::Jisu => client.get_competition_rank(CompetitionType::Jisu, &date),
+                RankTab::Jinbiao => client.get_competition_rank(CompetitionType::Jinbiao, &date),
+                RankTab::Jianshen => client.get_competition_rank(CompetitionType::Jianshen, &date),
+                RankTab::TigerCup => {
+                    tiger_client.get_leaderboard(&date, 50).map(|entries| {
+                        tiger_entries_to_rank(entries, my_username.as_deref(), &date)
+                    })
+                }
+            };
             let _ = sender.send(RankLoadResult {
-                competition_type,
+                tab,
                 date,
                 result,
             });
@@ -1024,9 +1161,18 @@ impl RankLoader {
     }
 }
 
+/// 登录支持的平台。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum LoginPlatform {
+    #[default]
+    Dazi52,
+    TigerCup,
+}
+
 /// 登录模态框输入状态。
 #[derive(Debug, Default)]
 struct LoginForm {
+    platform: LoginPlatform,
     username: String,
     password: String,
     /// 焦点字段：0 = 用户名，1 = 密码。
@@ -1036,6 +1182,7 @@ struct LoginForm {
     /// 错误提示。
     error: Option<String>,
 }
+
 
 /// 登录模态框按键动作。
 #[derive(Debug, PartialEq, Eq)]
@@ -1162,6 +1309,7 @@ impl App {
         };
         if let TextSource::Builtin { set } = text.source && !set.is_words() {
             session.set_targets(settings.target_kps, settings.target_wpm);
+            session.set_retry_shuffle(settings.retry_shuffle);
         }
         // 自动登录与会话恢复：若未登录且有环境变量则尝试自动登录。
         let login_notice = if !api.is_logged_in()
@@ -1206,6 +1354,10 @@ impl App {
             login_notice,
             online_loading: None,
             online_error: None,
+            tiger_api: TigerCupClient::new(),
+            tiger_draft_store: TigerDraftStore::with_default_path(),
+            tiger_loading: false,
+            tiger_error: None,
             settings,
             settings_store,
             settings_focus: FOCUS_THEME,
@@ -1415,11 +1567,11 @@ impl App {
                 }
                 // 无论当前激活 Tab 是否为本回包所属比赛，都写入对应缓存，
                 // 保证按 Tab 切换不重复拉取（#104）。仅当该榜为当前激活 Tab 时自动滚到我的行。
-                let board = state.boards.entry(result.competition_type).or_default();
+                let board = state.boards.entry(result.tab).or_default();
                 board.loading = false;
                 match result.result {
                     Ok(rank) => {
-                        let is_active = state.active_tab == result.competition_type;
+                        let is_active = state.active_tab == result.tab;
                         if is_active {
                             // 登录态下自动滚动到当前用户所在行，使高亮行立即可见。
                             if let Some(mine) = rank.my_rank_result.first() {
@@ -1441,16 +1593,16 @@ impl App {
         }
     }
 
-    /// 进入在线排行榜视图：初始化三 Tab 状态并立即拉取默认（极速杯）榜单。
+    /// 进入在线排行榜视图：初始化四个 Tab 状态并立即拉取默认（极速杯）榜单。
     fn open_online_rank(&mut self) -> io::Result<()> {
         let date = today_ymd();
         self.state = AppState::OnlineRank(OnlineRankState {
-            active_tab: CompetitionType::Jisu,
+            active_tab: RankTab::Jisu,
             date: date.clone(),
             boards: HashMap::new(),
             error: None,
         });
-        self.fetch_rank(CompetitionType::Jisu, &date);
+        self.fetch_rank(RankTab::Jisu, &date);
         Ok(())
     }
 
@@ -1466,20 +1618,21 @@ impl App {
     }
 
     /// 触发指定比赛榜单的后台拉取：先标记该 Tab 加载中，再派发后台线程。
-    /// 已登录时 `app.api` 携带 token，服务端会在 `my_rank_result` 回填当前用户整行。
-    fn fetch_rank(&mut self, competition_type: CompetitionType, date: &str) {
+    fn fetch_rank(&mut self, tab: RankTab, date: &str) {
         if let AppState::OnlineRank(state) = &mut self.state {
-            state.boards.entry(competition_type).or_default().loading = true;
+            state.boards.entry(tab).or_default().loading = true;
             state.error = None;
         }
         let client = self.api.clone();
+        let tiger_client = self.tiger_api.clone();
+        let my_username = self.tiger_api.current_credentials().map(|c| c.username);
         let date = date.to_string();
-        self.rank_loader.request(client, competition_type, date);
+        self.rank_loader.request(client, tiger_client, tab, date, my_username);
     }
 
     /// 切换排行榜当前 Tab 并拉取对应榜单（封装对 `app.state` 的可变借用，避免与 `fetch_rank` 冲突）。
     /// 切换时同步刷新期次日期，确保跨自然日后 `snum` 仍为当天（#107）。
-    fn switch_rank_tab(&mut self, tab: CompetitionType) {
+    fn switch_rank_tab(&mut self, tab: RankTab) {
         let date = if let AppState::OnlineRank(state) = &mut self.state {
             let today = today_ymd();
             if today != state.date {
@@ -1754,9 +1907,36 @@ impl App {
 
     /// 打开登录模态框。
     fn open_login(&mut self) {
-        self.login_form = Some(LoginForm::default());
+        self.login_form = Some(LoginForm {
+            platform: LoginPlatform::Dazi52,
+            username: String::new(),
+            password: String::new(),
+            focus: 0,
+            busy: false,
+            error: None,
+        });
         self.login_notice = None;
     }
+
+    /// 打开虎码杯登录模态框。
+    fn open_tiger_login(&mut self) {
+        let (default_user, default_pass) = self
+            .tiger_api
+            .current_credentials()
+            .map(|c| (c.username, c.password))
+            .unwrap_or_default();
+        let focus = if default_user.is_empty() { 0 } else { 1 };
+        self.login_form = Some(LoginForm {
+            platform: LoginPlatform::TigerCup,
+            username: default_user,
+            password: default_pass,
+            focus,
+            busy: false,
+            error: None,
+        });
+        self.sidebar_notice = None;
+    }
+
 
     /// 关闭登录模态框（不改变登录状态）。
     fn close_login(&mut self) {
@@ -1834,7 +2014,7 @@ impl App {
         self.state = AppState::Sponsor;
     }
 
-    /// 提交登录：调用网关，成功后持久化 token。
+    /// 提交登录：调用网关，成功后持久化 token/凭据。
     fn submit_login(&mut self) {
         let Some(form) = self.login_form.as_mut() else {
             return;
@@ -1845,25 +2025,50 @@ impl App {
         }
         form.busy = true;
         form.error = None;
-        match self.api.login(&form.username, &form.password) {
-            Ok(r) => {
-                let _ = self.token_store.save(&r.token);
-                self.token = Some(r.token);
-                self.logged_in = true;
-                self.login_form = None;
-                self.login_notice = Some("登录成功".to_string());
-                if let AppState::Finished { stats, elapsed, .. } = &self.state {
-                    let stats = stats.clone();
-                    let elapsed = *elapsed;
-                    self.do_upload(&stats, elapsed);
+        let platform = form.platform;
+        let username = form.username.clone();
+        let password = form.password.clone();
+        match platform {
+            LoginPlatform::Dazi52 => match self.api.login(&username, &password) {
+                Ok(r) => {
+                    let _ = self.token_store.save(&r.token);
+                    self.token = Some(r.token);
+                    self.logged_in = true;
+                    self.login_form = None;
+                    self.login_notice = Some("登录成功".to_string());
+                    if let AppState::Finished { stats, elapsed, .. } = &self.state {
+                        let stats = stats.clone();
+                        let elapsed = *elapsed;
+                        self.do_upload(&stats, elapsed);
+                    }
                 }
-            }
-            Err(e) => {
-                form.busy = false;
-                form.error = Some(api_error_text(&e));
-            }
+                Err(e) => {
+                    if let Some(form) = self.login_form.as_mut() {
+                        form.busy = false;
+                        form.error = Some(api_error_text(&e));
+                    }
+                }
+            },
+            LoginPlatform::TigerCup => match self.tiger_api.login(&username, &password) {
+                Ok(_) => {
+                    self.login_form = None;
+                    self.sidebar_notice = Some("虎码杯登录成功".to_string());
+                    if let AppState::Finished { stats, elapsed, .. } = &self.state {
+                        let stats = stats.clone();
+                        let elapsed = *elapsed;
+                        self.do_upload(&stats, elapsed);
+                    }
+                }
+                Err(e) => {
+                    if let Some(form) = self.login_form.as_mut() {
+                        form.busy = false;
+                        form.error = Some(api_error_text(&e));
+                    }
+                }
+            },
         }
     }
+
 
     /// 重打当前赛文：重置会话与计时。
     /// 若当前赛文为乱序版，重新打乱以获得新的随机排列。
@@ -1882,6 +2087,7 @@ impl App {
         );
         if let TextSource::Builtin { set } = self.text.source && !set.is_words() {
             self.session.set_targets(self.settings.target_kps, self.settings.target_wpm);
+            self.session.set_retry_shuffle(self.settings.retry_shuffle);
         }
         self.start = Instant::now();
         self.accumulated_elapsed = Duration::ZERO;
@@ -1911,6 +2117,7 @@ impl App {
         );
         if let TextSource::Builtin { set } = self.text.source && !set.is_words() {
             self.session.set_targets(self.settings.target_kps, self.settings.target_wpm);
+            self.session.set_retry_shuffle(self.settings.retry_shuffle);
         }
         self.group_start_accumulated_elapsed = Duration::ZERO;
         self.target_failure_notice = None;
@@ -2206,6 +2413,16 @@ impl App {
         }
     }
 
+    /// 切换单字练习未达标乱序重打开关并即时持久化。
+    fn toggle_retry_shuffle(&mut self) {
+        self.settings.retry_shuffle = !self.settings.retry_shuffle;
+        let _ = self.settings_store.save(&self.settings);
+        self.refresh_builtin_preview();
+        if let TextSource::Builtin { set } = self.text.source && !set.is_words() {
+            self.session.set_retry_shuffle(self.settings.retry_shuffle);
+        }
+    }
+
     /// 载入当前选中的内置赛文：若已有存档进度则弹出「继续/重开/重置」选择，
     /// 否则直接进入第 0 组跟打。
     fn load_selected_builtin(&mut self) {
@@ -2249,6 +2466,7 @@ impl App {
         );
         if !set.is_words() {
             self.session.set_targets(self.settings.target_kps, self.settings.target_wpm);
+            self.session.set_retry_shuffle(self.settings.retry_shuffle);
         }
         self.session.set_completed_groups(completed_groups);
         self.start = Instant::now();
@@ -2359,15 +2577,104 @@ impl App {
         }
     }
 
+    /// 虎码杯下载当日赛文并进入跟打。
+    fn download_tigercup(&mut self) {
+        self.tiger_loading = true;
+        match self.tiger_api.fetch_daily_article() {
+            Ok(comp) => {
+                let content = normalize_online_content(&comp.content);
+                if content.is_empty() {
+                    self.tiger_loading = false;
+                    self.tiger_error = Some("虎码杯赛文内容为空".to_string());
+                    return;
+                }
+                let today = today_ymd();
+                let draft = TigerDraft {
+                    date: today,
+                    title: comp.title.clone(),
+                    content: content.clone(),
+                    fetched_at_unix: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
+                };
+                let _ = self.tiger_draft_store.save(&draft);
+                self.text = Text {
+                    title: comp.title,
+                    content,
+                    source: TextSource::TigerCup,
+                    word_boundaries: None,
+                    shuffled: false,
+                };
+                self.tiger_loading = false;
+                self.tiger_error = None;
+                self.enter_countdown(CountdownSource::Online);
+            }
+            Err(e) => {
+                self.tiger_loading = false;
+                self.tiger_error = Some(api_error_text(&e));
+                self.sidebar_notice = Some(api_error_text(&e));
+            }
+        }
+    }
+
+    /// 虎码杯执行上传：调用 TigerCupClient 上传成绩并复制分享文本。
+    fn perform_tiger_upload(&self, stats: &Stats, elapsed: Duration) -> UploadState {
+        let payload = build_tiger_payload(
+            &self.text,
+            stats,
+            elapsed,
+            self.effective_upload_input_method(),
+        );
+        let share = format_tiger_share_text(&payload, elapsed, None, None, None);
+        if !self.tiger_api.is_logged_in() {
+            write_clipboard(&share);
+            return UploadState::Failed {
+                message: "未登录虎码杯账号，无法上传成绩".to_string(),
+                need_relogin: true,
+                detail: None,
+                copied_stats: Some(share),
+            };
+        }
+        match self.tiger_api.upload_score(&payload) {
+            Ok(_) => {
+                let _ = self.tiger_draft_store.clear();
+                write_clipboard(&share);
+                UploadState::Success {
+                    ranking: Some("已上报".to_string()),
+                }
+            }
+            Err(e) => {
+                write_clipboard(&share);
+                UploadState::Failed {
+                    message: api_error_text(&e),
+                    need_relogin: false,
+                    detail: match &e {
+                        ApiError::Transport(raw) | ApiError::Parse(raw) => Some(raw.clone()),
+                        ApiError::Server(_) => None,
+                    },
+                    copied_stats: Some(share),
+                }
+            }
+        }
+    }
+
     /// 上传成绩并更新成绩视图状态（在线赛文完成跟打后调用）。
     fn do_upload(&mut self, stats: &Stats, elapsed: Duration) {
-        let upload = self.perform_upload(stats, elapsed);
+        let upload = match self.text.source {
+            TextSource::TigerCup => self.perform_tiger_upload(stats, elapsed),
+            TextSource::Online { .. } => self.perform_upload(stats, elapsed),
+            _ => UploadState::NotApplicable {
+                copied_stats: None,
+            },
+        };
         self.state = AppState::Finished {
             stats: stats.clone(),
             upload,
             elapsed,
         };
     }
+
 
     /// 执行上传：调用 API 客户端一站式上传成绩（包含指标计算、payload 构建、网关通信、自动重登与分享文本生成）。
     fn perform_upload(&self, stats: &Stats, elapsed: Duration) -> UploadState {
@@ -2641,6 +2948,10 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                     app.open_login();
                     continue;
                 }
+                if is_open_tiger_login(key) {
+                    app.open_tiger_login();
+                    continue;
+                }
                 let mut key = key;
                 if !matches!(app.state, AppState::Typing) || app.session.is_empty() || app.paused {
                     normalize_key(&mut key);
@@ -2804,6 +3115,10 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                             trigger_online_competition(&mut app, competition_type, terminal)?;
                             continue;
                         }
+                        if is_open_tigercup(key) {
+                            trigger_tigercup_competition(&mut app, terminal)?;
+                            continue;
+                        }
 
                         // 就绪态下输入非命令字符（如中文输入法上屏或英文首字）-> 自动切入跟打态
                         if app.session.is_empty() {
@@ -2959,6 +3274,15 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                             KeyCode::Char('w') | KeyCode::Char('W') => {
                                 app.cycle_target_wpm();
                             }
+                            KeyCode::Char('r') | KeyCode::Char('R') => {
+                                let is_words = BUILTIN_SETS
+                                    .get(app.builtin_selection)
+                                    .map(|s| s.is_words())
+                                    .unwrap_or(false);
+                                if !is_words {
+                                    app.toggle_retry_shuffle();
+                                }
+                            }
                             KeyCode::Enter | KeyCode::Char('l') => app.load_selected_builtin(),
                             KeyCode::Char('s') | KeyCode::Char('S') => {
                                 app.builtin_shuffle = !app.builtin_shuffle;
@@ -3080,11 +3404,16 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                                         app.session.set_targets(app.settings.target_kps, app.settings.target_wpm);
                                     }
                                 }
+                                FOCUS_RETRY_SHUFFLE => {
+                                    app.toggle_retry_shuffle();
+                                }
                                 _ => {}
                             }
                         }
                         KeyCode::Enter => {
-                            if app.settings_focus == FOCUS_SCHEME {
+                            if app.settings_focus == FOCUS_RETRY_SHUFFLE {
+                                app.toggle_retry_shuffle();
+                            } else if app.settings_focus == FOCUS_SCHEME {
                                 let opts = build_scheme_options(&app.discovered);
                                 let idx = scheme_option_index(&opts, &app.settings.scheme);
                                 if opts.get(idx) == Some(&SchemeOption::Custom) {
@@ -3366,14 +3695,15 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                         KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
                             app.state = AppState::Typing;
                         }
-                        KeyCode::Char('1') => app.switch_rank_tab(CompetitionType::Jisu),
-                        KeyCode::Char('2') => app.switch_rank_tab(CompetitionType::Jinbiao),
-                        KeyCode::Char('3') => app.switch_rank_tab(CompetitionType::Jianshen),
+                        KeyCode::Char('1') => app.switch_rank_tab(RankTab::Jisu),
+                        KeyCode::Char('2') => app.switch_rank_tab(RankTab::Jinbiao),
+                        KeyCode::Char('3') => app.switch_rank_tab(RankTab::Jianshen),
+                        KeyCode::Char('4') => app.switch_rank_tab(RankTab::TigerCup),
                         KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
                             let next = if let AppState::OnlineRank(s) = &app.state {
                                 s.active_tab.next()
                             } else {
-                                CompetitionType::Jisu
+                                RankTab::Jisu
                             };
                             app.switch_rank_tab(next);
                         }
@@ -3381,7 +3711,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                             let prev = if let AppState::OnlineRank(s) = &app.state {
                                 s.active_tab.prev()
                             } else {
-                                CompetitionType::Jisu
+                                RankTab::Jisu
                             };
                             app.switch_rank_tab(prev);
                         }
@@ -3437,6 +3767,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                     continue;
                 }
                 if matches!(app.state, AppState::Typing) {
+                    app.target_failure_notice = None;
                     app.touch_typing();
                     let elapsed = app.current_elapsed();
                     let now = Instant::now();
@@ -3483,6 +3814,38 @@ fn trigger_online_competition<B: ratatui::backend::Backend>(
     Ok(())
 }
 
+/// 触发虎码杯比赛赛文载入（未登录时引导登录，有今日未完赛草稿则优先恢复）。
+fn trigger_tigercup_competition<B: ratatui::backend::Backend>(
+    app: &mut App,
+    terminal: &mut ratatui::Terminal<B>,
+) -> io::Result<()> {
+    if !app.tiger_api.is_logged_in() {
+        app.sidebar_notice = Some("请先登录虎码杯账号".to_string());
+        app.open_tiger_login();
+        return Ok(());
+    }
+    let today = today_ymd();
+    if let Some(draft) = app.tiger_draft_store.load_today(&today) {
+        app.text = Text {
+            title: draft.title,
+            content: draft.content,
+            source: TextSource::TigerCup,
+            word_boundaries: None,
+            shuffled: false,
+        };
+        app.sidebar_notice = Some("已恢复今日未完赛虎码杯草稿".to_string());
+        app.enter_countdown(CountdownSource::Online);
+        return Ok(());
+    }
+
+    app.tiger_loading = true;
+    terminal
+        .draw(|frame| ui(frame, app))
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    app.download_tigercup();
+    Ok(())
+}
+
 /// 激活功能栏选中的菜单项。
 fn activate_sidebar_menu_item<B: ratatui::backend::Backend>(
     app: &mut App,
@@ -3506,6 +3869,9 @@ fn activate_sidebar_menu_item<B: ratatui::backend::Backend>(
         SidebarMenuItem::OnlineJianshen => {
             trigger_online_competition(app, CompetitionType::Jianshen, terminal)?;
         }
+        SidebarMenuItem::OnlineTigerCup => {
+            trigger_tigercup_competition(app, terminal)?;
+        }
         SidebarMenuItem::OnlineRank => {
             app.open_online_rank()?;
         }
@@ -3515,9 +3881,11 @@ fn activate_sidebar_menu_item<B: ratatui::backend::Backend>(
         SidebarMenuItem::Settings => app.enter_settings(),
         SidebarMenuItem::Sponsor => app.open_sponsor(),
         SidebarMenuItem::Login => app.open_login(),
+        SidebarMenuItem::LoginTiger => app.open_tiger_login(),
     }
     Ok(())
 }
+
 
 /// 完成跟打：进入成绩视图；在线赛文先渲染「上传中」再同步上传成绩。
 fn finish_and_maybe_upload<B: ratatui::backend::Backend>(
@@ -3910,6 +4278,10 @@ fn handle_finished_key(app: &mut App, key: KeyEvent) -> bool {
         app.open_login();
         return true;
     }
+    if is_open_tiger_login(key) {
+        app.open_tiger_login();
+        return true;
+    }
     if is_open_rank(key) {
         let _ = app.open_online_rank();
         return true;
@@ -3996,12 +4368,24 @@ fn is_open_settings(key: KeyEvent) -> bool {
     key.modifiers.is_empty() && (key.code == KeyCode::Char('o') || key.code == KeyCode::Char('O'))
 }
 
-/// 打开在线排行榜快捷键：4（与 1/2/3 比赛入口并列）。
+/// 打开在线排行榜快捷键：4 或 Ctrl-R。
 fn is_open_rank(key: KeyEvent) -> bool {
-    key.modifiers.is_empty() && key.code == KeyCode::Char('4')
+    (key.modifiers.is_empty() && key.code == KeyCode::Char('4'))
+        || (key.modifiers == crossterm::event::KeyModifiers::CONTROL
+            && (key.code == KeyCode::Char('r') || key.code == KeyCode::Char('R')))
 }
 
-/// 三个比赛入口快捷键：1=极速杯、2=锦标赛、3=键神杯。
+/// 打开虎码杯比赛快捷键：t / T（Tiger）。
+fn is_open_tigercup(key: KeyEvent) -> bool {
+    key.modifiers.is_empty() && (key.code == KeyCode::Char('t') || key.code == KeyCode::Char('T'))
+}
+
+/// 打开虎码杯登录快捷键：g / G（tiGer login）。
+fn is_open_tiger_login(key: KeyEvent) -> bool {
+    key.modifiers.is_empty() && (key.code == KeyCode::Char('g') || key.code == KeyCode::Char('G'))
+}
+
+/// 三个 52dazi 比赛入口快捷键：1=极速杯、2=锦标赛、3=键神杯。
 fn online_shortcut(key: KeyEvent) -> Option<CompetitionType> {
     if !key.modifiers.is_empty() {
         return None;
@@ -4013,6 +4397,7 @@ fn online_shortcut(key: KeyEvent) -> Option<CompetitionType> {
         _ => None,
     }
 }
+
 
 /// 把 API 错误转为友好文案。
 fn api_error_text(err: &ApiError) -> String {
@@ -4264,9 +4649,9 @@ fn render_online_rank_view(frame: &mut Frame, app: &App, rank_state: &OnlineRank
     let [content_area, hint_area] =
         Layout::vertical([Constraint::Min(0), Constraint::Length(3)]).areas(inner);
 
-    // 三 Tab 行：极速杯 / 锦标赛 / 键神杯，当前 Tab 高亮（顺序由 `CompetitionType::ALL` 统一）。
+    // 四 Tab 行：极速杯 / 锦标赛 / 键神杯 / 虎码杯，当前 Tab 高亮（顺序由 `RankTab::ALL` 统一）。
     let mut tab_spans: Vec<Span> = Vec::new();
-    for (i, ct) in CompetitionType::ALL.iter().enumerate() {
+    for (i, ct) in RankTab::ALL.iter().enumerate() {
         let active = *ct == rank_state.active_tab;
         if i > 0 {
             tab_spans.push(Span::styled(" │ ", Style::default().fg(palette.selection)));
@@ -4305,13 +4690,17 @@ fn render_online_rank_view(frame: &mut Frame, app: &App, rank_state: &OnlineRank
                 }
                 Some(data) => {
                     // 名次条：登录态下展示「我第 N 名 / 共 M 人」；未登录降级为公开榜提示。
+                    let is_logged_in_current_tab = match rank_state.active_tab {
+                        RankTab::TigerCup => app.tiger_api.is_logged_in(),
+                        _ => app.logged_in,
+                    };
                     let my_rank = data.my_rank_result.first().map(|r| r.rank);
                     let rankbar = match my_rank {
                         Some(r) => Line::from(Span::styled(
                             format!("我第 {} 名 / 共 {} 人", r, data.total),
                             Style::default().fg(palette.accent).bold(),
                         )),
-                        None if !app.logged_in => Line::from(Span::styled(
+                        None if !is_logged_in_current_tab => Line::from(Span::styled(
                             "未登录：登录后可见个人名次（当前为公开榜）",
                             Style::default().fg(palette.warning),
                         )),
@@ -4342,7 +4731,8 @@ fn render_online_rank_view(frame: &mut Frame, app: &App, rank_state: &OnlineRank
     }
 
     // 底部快捷键提示栏（圆角边框 + 结构化标题），与统计视图一致。
-    let hint = " 1/2/3 比赛 | Tab/←→ 切换 | jk 滚动 | c 列定制 | R 刷新 | Esc/q 返回 ";
+    let hint = " 1/2/3/4 比赛 | Tab/←→ 切换 | jk 滚动 | c 列定制 | R 刷新 | Esc/q 返回 ";
+
     let hint_title = Line::from(vec![Span::styled(
         " 快捷键 ",
         Style::default().bold().fg(palette.accent),
@@ -4652,7 +5042,7 @@ fn ui(frame: &mut Frame, app: &App) {
                 ),
             ]));
         }
-        if !app.session.is_empty() {
+        if !app.session.is_empty() && app.target_failure_notice.is_none() {
             let elapsed = app.current_elapsed();
             let metrics = app.session.realtime_metrics(elapsed);
             let (rolling_wpm_str, rolling_kps_str) = if app.paused {
@@ -4963,8 +5353,12 @@ fn ui(frame: &mut Frame, app: &App) {
 fn render_login_modal(frame: &mut Frame, form: &LoginForm, palette: &ThemePalette, _theme: Theme) {
     let area = centered_rect(frame.area(), 62, 9);
     frame.render_widget(Clear, area);
+    let platform_title = match form.platform {
+        LoginPlatform::Dazi52 => " 登录 52dazi ",
+        LoginPlatform::TigerCup => " 登录 虎码杯 ",
+    };
     let mut lines = vec![
-        Line::from(" 登录 52dazi ").bold().fg(palette.fg),
+        Line::from(platform_title).bold().fg(palette.fg),
         Line::from(""),
     ];
     let user_label = if form.focus == 0 {
@@ -4989,7 +5383,8 @@ fn render_login_modal(frame: &mut Frame, form: &LoginForm, palette: &ThemePalett
         lines.push(hint_bar_line(" Enter 登录 | Tab 切换 | Esc 取消 ", palette));
     }
     let block = themed_block(palette, true)
-        .title(" 登录 ")
+        .title(platform_title)
+
         .style(Style::default().bg(palette.bg).fg(palette.fg));
     frame.render_widget(
         Paragraph::new(lines)
@@ -5455,6 +5850,7 @@ fn render_sidebar(
                 SidebarMenuItem::OnlineJisu => ("1", "极速杯", false, false),
                 SidebarMenuItem::OnlineJinbiao => ("2", "锦标赛", false, false),
                 SidebarMenuItem::OnlineJianshen => ("3", "键神杯", false, false),
+                SidebarMenuItem::OnlineTigerCup => ("t", "虎码杯", false, false),
                 SidebarMenuItem::OnlineRank => ("4", "排行榜", false, false),
                 SidebarMenuItem::Stats => ("s", "数据统计", false, false),
                 SidebarMenuItem::Settings => ("o", "设置", false, false),
@@ -5464,6 +5860,13 @@ fn render_sidebar(
                         ("u", "已登录 52dazi", true, false)
                     } else {
                         ("u", "登录 52dazi", false, true)
+                    }
+                }
+                SidebarMenuItem::LoginTiger => {
+                    if app.tiger_api.is_logged_in() {
+                        ("g", "已登录 虎码杯", true, false)
+                    } else {
+                        ("g", "登录 虎码杯", false, true)
                     }
                 }
             };
@@ -5532,9 +5935,16 @@ fn render_sidebar(
     if let Some(ct) = app.online_loading {
         lines.push(Line::from(format!(" 正在载入{}...", ct.name())).fg(palette.accent));
     }
+    if app.tiger_loading {
+        lines.push(Line::from(" 正在载入虎码杯...").fg(palette.accent));
+    }
     if let Some(err) = &app.online_error {
         lines.push(Line::from(format!(" {err}")).fg(palette.error));
     }
+    if let Some(err) = &app.tiger_error {
+        lines.push(Line::from(format!(" {err}")).fg(palette.error));
+    }
+
 
     let is_active = browsing || browsing_builtin || app.paused || app.session.is_empty();
     let mut title_spans = vec![Span::styled(
@@ -5699,7 +6109,12 @@ fn render_builtin_preview(frame: &mut Frame, app: &App, area: ratatui::layout::R
         } else {
             format!("{}WPM", app.settings.target_wpm)
         };
-        format!(" Enter 载入 | s {shuffle_label} | g 分组({group_size}字) | t 击键({kps_label}) | w 速度({wpm_label}) | Esc 取消 ")
+        let retry_label = if app.settings.retry_shuffle {
+            "开"
+        } else {
+            "关"
+        };
+        format!(" Enter 载入 | s {shuffle_label} | r 乱序重打({retry_label}) | g 分组({group_size}字) | t 击键({kps_label}) | w 速度({wpm_label}) | Esc 取消 ")
     };
     lines.push(hint_bar_line(&hint_str, &palette));
     let mut title_spans = vec![
@@ -5726,8 +6141,13 @@ fn render_builtin_preview(frame: &mut Frame, app: &App, area: ratatui::layout::R
         } else {
             format!("{}WPM", app.settings.target_wpm)
         };
+        let retry_label = if app.settings.retry_shuffle {
+            "开"
+        } else {
+            "关"
+        };
         title_spans.push(Span::styled(
-            format!("[t] 击键: {kps_label}  [w] 速度: {wpm_label} "),
+            format!("[r] 乱序重打: {retry_label}  [t] 击键: {kps_label}  [w] 速度: {wpm_label} "),
             Style::default().fg(palette.muted),
         ));
     }
@@ -6952,6 +7372,12 @@ fn render_settings(frame: &mut Frame, app: &App) {
         "单字目标速度",
         &wpm_label,
         focus == FOCUS_TARGET_WPM,
+        &palette,
+    ));
+    lines.push(settings_row(
+        "未达标乱序重打",
+        on_off(app.settings.retry_shuffle),
+        focus == FOCUS_RETRY_SHUFFLE,
         &palette,
     ));
 
@@ -9384,6 +9810,79 @@ mod tests {
     }
 
     #[test]
+    fn r_key_toggles_retry_shuffle_in_builtin_preview() {
+        let mut app = test_app(file_text("旧赛文"));
+        app.open_builtin_browser();
+        app.builtin_selection = 0; // 常用单字前五百（单字）
+        app.refresh_builtin_preview();
+        assert!(!app.settings.retry_shuffle);
+
+        // 验证单字预览初始渲染包含 r 乱序重打(关)
+        let backend = ratatui::backend::TestBackend::new(160, 100);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| ui(f, &app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let content = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let clean = content.replace(' ', "");
+        assert!(clean.contains("乱序重打(关)"));
+        assert!(clean.contains("[r]乱序重打:关"));
+
+        // 模拟按 r 键切换开关
+        app.toggle_retry_shuffle();
+        assert!(app.settings.retry_shuffle);
+        assert!(app.settings_store.load().retry_shuffle);
+
+        // 验证单字预览渲染更新为 乱序重打(开)
+        terminal.draw(|f| ui(f, &app)).unwrap();
+        let buffer2 = terminal.backend().buffer();
+        let content2 = (0..buffer2.area.height)
+            .map(|y| {
+                (0..buffer2.area.width)
+                    .map(|x| buffer2[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let clean2 = content2.replace(' ', "");
+        assert!(clean2.contains("乱序重打(开)"));
+        assert!(clean2.contains("[r]乱序重打:开"));
+
+        // 载入赛文后验证会话正确同步启用 retry_shuffle
+        app.load_selected_builtin();
+        assert!(app.session.is_retry_shuffle());
+    }
+
+    #[test]
+    fn r_key_hidden_for_word_sets_in_builtin_preview() {
+        let mut app = test_app(file_text("旧赛文"));
+        app.open_builtin_browser();
+        app.builtin_selection = 3; // 常用词组前五百（词组）
+        app.refresh_builtin_preview();
+
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| ui(f, &app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let content = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let clean = content.replace(' ', "");
+        assert!(!clean.contains("乱序重打"), "词组预览弹窗不应展示「乱序重打」提示");
+    }
+
+    #[test]
     fn load_selected_builtin_with_shuffle_loads_shuffled_text() {
         let mut app = test_app(file_text("旧赛文"));
         app.open_builtin_browser();
@@ -9719,10 +10218,10 @@ mod tests {
 
     #[test]
     fn move_focus_wraps_around() {
-        // SETTINGS_FOCUS_COUNT = 11（主题/占比/粗体/实时键盘/反查方案/上传名称/分组大小/遍码提示/方案热监控/单字目标击键/单字目标速度）
-        assert_eq!(move_focus(0, -1), 10); // 第 0 项向前 → 末项（10）
-        assert_eq!(move_focus(10, 1), 0); // 末项向后 → 第 0 项
-        assert_eq!(move_focus(9, 1), 10); // 倒数第二项向后 → 末项
+        // SETTINGS_FOCUS_COUNT = 12（主题/占比/粗体/实时键盘/反查方案/上传名称/分组大小/遍码提示/方案热监控/单字目标击键/单字目标速度/未达标乱序重打）
+        assert_eq!(move_focus(0, -1), 11); // 第 0 项向前 → 末项（11）
+        assert_eq!(move_focus(11, 1), 0); // 末项向后 → 第 0 项
+        assert_eq!(move_focus(10, 1), 11); // 倒数第二项向后 → 末项
         assert_eq!(move_focus(0, 1), 1);
         assert_eq!(move_focus(5, 1), 6);
         assert_eq!(move_focus(2, -1), 1);
@@ -11269,12 +11768,18 @@ mod tests {
 
         let client = ApiClient::with_base_url(&format!("http://{addr}"));
         let loader = RankLoader::new();
-        loader.request(client, CompetitionType::Jisu, "2026-08-30".to_string());
+        loader.request(
+            client,
+            TigerCupClient::new(),
+            RankTab::Jisu,
+            "2026-08-30".to_string(),
+            None,
+        );
         let result = loader
             .receiver
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("worker 应在超时前回传结果");
-        assert_eq!(result.competition_type, CompetitionType::Jisu);
+        assert_eq!(result.tab, RankTab::Jisu);
         assert_eq!(result.date, "2026-08-30");
         let rank = result.result.expect("应解析成功");
         assert_eq!(rank.total, 1);
@@ -12590,21 +13095,30 @@ mod tests {
         assert!(matches!(app.state, AppState::BrowsingBuiltin));
         app.state = AppState::Typing;
 
-        // 激活 在线排行榜 (index 7)：后台线程会拉取，测试中指向死地址避免真实网络。
+        // 激活 在线排行榜：后台线程会拉取，测试中指向死地址避免真实网络。
         app.api = ApiClient::with_base_url("http://127.0.0.1:1");
-        app.sidebar_selected = 7;
+        app.sidebar_selected = SIDEBAR_MENU_ITEMS
+            .iter()
+            .position(|&m| m == SidebarMenuItem::OnlineRank)
+            .unwrap();
         activate_sidebar_menu_item(&mut app, &mut terminal).unwrap();
         assert!(matches!(app.state, AppState::OnlineRank(_)));
         app.state = AppState::Typing;
 
-        // 激活 数据统计 (index 8)
-        app.sidebar_selected = 8;
+        // 激活 数据统计
+        app.sidebar_selected = SIDEBAR_MENU_ITEMS
+            .iter()
+            .position(|&m| m == SidebarMenuItem::Stats)
+            .unwrap();
         activate_sidebar_menu_item(&mut app, &mut terminal).unwrap();
         assert!(matches!(app.state, AppState::Stats(_)));
         app.state = AppState::Typing;
 
-        // 激活 设置 (index 9)
-        app.sidebar_selected = 9;
+        // 激活 设置
+        app.sidebar_selected = SIDEBAR_MENU_ITEMS
+            .iter()
+            .position(|&m| m == SidebarMenuItem::Settings)
+            .unwrap();
         activate_sidebar_menu_item(&mut app, &mut terminal).unwrap();
         assert!(matches!(app.state, AppState::Settings));
         app.state = AppState::Typing;
@@ -12634,10 +13148,10 @@ mod tests {
             text_length: 100,
         };
         let state = OnlineRankState {
-            active_tab: CompetitionType::Jisu,
+            active_tab: RankTab::Jisu,
             date: "2026-08-30".into(),
             boards: HashMap::from([(
-                CompetitionType::Jisu,
+                RankTab::Jisu,
                 RankBoard {
                     data: Some(data),
                     loading: false,
@@ -12689,10 +13203,10 @@ mod tests {
             text_length: 100,
         };
         let state = OnlineRankState {
-            active_tab: CompetitionType::Jisu,
+            active_tab: RankTab::Jisu,
             date: "2026-08-30".into(),
             boards: HashMap::from([(
-                CompetitionType::Jisu,
+                RankTab::Jisu,
                 RankBoard {
                     data: Some(data),
                     loading: false,
@@ -12743,10 +13257,10 @@ mod tests {
             text_length: 100,
         };
         let state = OnlineRankState {
-            active_tab: CompetitionType::Jisu,
+            active_tab: RankTab::Jisu,
             date: "2026-08-30".into(),
             boards: HashMap::from([(
-                CompetitionType::Jisu,
+                RankTab::Jisu,
                 RankBoard {
                     data: Some(data),
                     loading: false,
@@ -12879,10 +13393,10 @@ mod tests {
             text_length: 100,
         };
         let state = OnlineRankState {
-            active_tab: CompetitionType::Jisu,
+            active_tab: RankTab::Jisu,
             date: "2026-08-30".into(),
             boards: HashMap::from([(
-                CompetitionType::Jisu,
+                RankTab::Jisu,
                 RankBoard {
                     data: Some(data),
                     loading: false,
@@ -12952,10 +13466,10 @@ mod tests {
             text_length: 100,
         };
         let state = OnlineRankState {
-            active_tab: CompetitionType::Jisu,
+            active_tab: RankTab::Jisu,
             date: "2026-08-30".into(),
             boards: HashMap::from([(
-                CompetitionType::Jisu,
+                RankTab::Jisu,
                 RankBoard {
                     data: Some(data),
                     loading: false,
@@ -13010,10 +13524,10 @@ mod tests {
     #[test]
     fn render_online_rank_view_shows_error_and_retry() {
         let state = OnlineRankState {
-            active_tab: CompetitionType::Jisu,
+            active_tab: RankTab::Jisu,
             date: "2026-08-30".into(),
             boards: HashMap::from([(
-                CompetitionType::Jisu,
+                RankTab::Jisu,
                 RankBoard {
                     data: None,
                     loading: false,
@@ -13062,10 +13576,10 @@ mod tests {
             text_length: 100,
         };
         let state = OnlineRankState {
-            active_tab: CompetitionType::Jisu,
+            active_tab: RankTab::Jisu,
             date: "2026-08-30".into(),
             boards: HashMap::from([(
-                CompetitionType::Jisu,
+                RankTab::Jisu,
                 RankBoard {
                     data: Some(data),
                     loading: false,
@@ -13106,7 +13620,7 @@ mod tests {
         // 指向死亡地址，避免后台线程真实联网（连接被快速拒绝）。
         app.api = ApiClient::with_base_url("http://127.0.0.1:1");
         app.state = AppState::OnlineRank(OnlineRankState {
-            active_tab: CompetitionType::Jisu,
+            active_tab: RankTab::Jisu,
             date: "2000-01-01".into(), // 旧期次
             boards: HashMap::new(),
             error: None,
@@ -13124,10 +13638,10 @@ mod tests {
         let mut app = test_app(file_text("x"));
         app.api = ApiClient::with_base_url("http://127.0.0.1:1");
         app.state = AppState::OnlineRank(OnlineRankState {
-            active_tab: CompetitionType::Jisu,
+            active_tab: RankTab::Jisu,
             date: "2026-08-30".into(),
             boards: HashMap::from([(
-                CompetitionType::Jisu,
+                RankTab::Jisu,
                 RankBoard {
                     data: None,
                     loading: false,
@@ -13141,7 +13655,7 @@ mod tests {
         app.rank_scroll(-10); // 远小于当前 scroll
         match &app.state {
             AppState::OnlineRank(s) => {
-                let scroll = s.boards.get(&CompetitionType::Jisu).unwrap().scroll;
+                let scroll = s.boards.get(&RankTab::Jisu).unwrap().scroll;
                 assert_eq!(scroll, 0, "上滚不应越过 0");
             }
             _ => panic!("状态应保持为 OnlineRank"),
@@ -13149,7 +13663,7 @@ mod tests {
         app.rank_scroll(2);
         match &app.state {
             AppState::OnlineRank(s) => {
-                let scroll = s.boards.get(&CompetitionType::Jisu).unwrap().scroll;
+                let scroll = s.boards.get(&RankTab::Jisu).unwrap().scroll;
                 assert_eq!(scroll, 2, "正向下滚应在下界之上累加");
             }
             _ => panic!("状态应保持为 OnlineRank"),
@@ -13179,10 +13693,10 @@ mod tests {
         };
         let mut app = test_app(file_text("x"));
         app.state = AppState::OnlineRank(OnlineRankState {
-            active_tab: CompetitionType::Jisu,
+            active_tab: RankTab::Jisu,
             date: "2026-08-30".into(),
             boards: HashMap::from([(
-                CompetitionType::Jisu,
+                RankTab::Jisu,
                 RankBoard {
                     data: Some(data),
                     loading: false,
@@ -15766,6 +16280,38 @@ mod tests {
     }
 
     #[test]
+    fn app_settings_toggle_retry_shuffle_and_ui() {
+        let mut app = test_app(load_builtin_text(BUILTIN_SETS[0]));
+        assert!(!app.settings.retry_shuffle);
+        assert!(!app.session.is_retry_shuffle());
+
+        app.enter_settings();
+        app.settings_focus = FOCUS_RETRY_SHUFFLE;
+        app.toggle_retry_shuffle();
+        assert!(app.settings.retry_shuffle);
+        assert!(app.settings_store.load().retry_shuffle);
+        assert!(app.session.is_retry_shuffle());
+
+        let backend = ratatui::backend::TestBackend::new(90, 32);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| ui(f, &app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let content = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let clean = content.replace(' ', "");
+        assert!(clean.contains("未达标乱序重打:"));
+        assert!(clean.contains("开"));
+    }
+
+    #[test]
     fn app_target_gating_rollback_and_notice() {
         let mut app = test_app(load_builtin_text(BUILTIN_SETS[0]));
         // 设置极高门槛：100 WPM, 100.0 KPS
@@ -15812,10 +16358,126 @@ mod tests {
             .join("\n");
         let clean = content.replace(' ', "");
         assert!(clean.contains("未达标"));
+        assert!(clean.contains("请直接打字重打本组"));
+        assert!(!clean.contains("按任意键重打"));
 
         // 下一次打字会清除 notice
         app.target_failure_notice = None;
         assert!(app.target_failure_notice.is_none());
+    }
+
+    #[test]
+    fn app_target_gating_retry_shuffle_shuffles_and_resets() {
+        let mut app = test_app(load_builtin_text(BUILTIN_SETS[0]));
+        app.settings.target_wpm = 100;
+        app.settings.retry_shuffle = true;
+        app.restart();
+        assert!(app.session.is_retry_shuffle());
+
+        let initial_group = app.session.current_group_target_chars();
+        let group_str: String = initial_group.iter().collect();
+
+        // 慢速打完本组（用时 30 秒，WPM = 20 < 100 必然未达标）
+        app.touch_typing();
+        app.session.type_text_with_strokes_at(&group_str, group_str.chars().count() as u32, Duration::from_secs(30));
+
+        assert!(app.session.take_target_failure().is_some());
+        assert_eq!(app.session.len(), 0);
+        assert_eq!(app.session.completed_groups(), 0);
+
+        let shuffled_group = app.session.current_group_target_chars();
+        let shuffled_str: String = shuffled_group.iter().collect();
+        assert_ne!(shuffled_str, group_str, "开启 retry_shuffle 未达标后当前组字符顺序必须改变");
+    }
+
+    #[test]
+    fn app_target_gating_retry_shuffle_zero_target_edits_notice_and_dismiss() {
+        let mut app = test_app(load_builtin_text(BUILTIN_SETS[0]));
+        app.settings.target_wpm = 0;
+        app.settings.target_kps = 0.0;
+        app.settings.retry_shuffle = true;
+        app.restart();
+        assert!(app.session.is_retry_shuffle());
+
+        let initial_group = app.session.current_group_target_chars();
+        let group_str: String = initial_group.iter().collect();
+
+        // 模拟前两个字符敲入后产生回改，再敲完全组
+        app.touch_typing();
+        let first_two: String = group_str.chars().take(2).collect();
+        app.session.type_text(&first_two);
+        app.session.backspace();
+        let rest: String = group_str.chars().skip(1).collect();
+        app.session.type_text(&rest);
+
+        // 验证捕获未达标且提示包含 "含错字/回改" 与 "已打乱重置"
+        let failure = app.session.take_target_failure().expect("发生回改必须触发未达标");
+        assert!(failure.has_edits);
+        let notice = failure.format_notice();
+        assert!(notice.contains("含错字/回改"));
+        assert!(notice.contains("已打乱重置"));
+        app.target_failure_notice = Some(notice);
+
+        // 验证 UI 渲染
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| ui(f, &app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let content = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let clean = content.replace(' ', "");
+        assert!(clean.contains("含错字/回改"));
+        assert!(clean.contains("已打乱重置"));
+
+        // 下一轮重新打字时隐去通知
+        app.target_failure_notice = None;
+        assert!(app.target_failure_notice.is_none());
+    }
+
+    #[test]
+    fn app_target_failure_notice_suppresses_right_metrics_even_with_completed_groups() {
+        let mut app = test_app(load_builtin_text(BUILTIN_SETS[0]));
+        app.settings.target_kps = 4.0;
+        app.settings.target_wpm = 0;
+        app.restart();
+
+        // 模拟打完并通过第 1 组（首字 0s，后续 1s，用时 1 秒，KPS = 10.0 >= 4.0）
+        let group_size = app.settings.group_size as usize;
+        let first_char: String = app.text.content.chars().take(1).collect();
+        let rest_group: String = app.text.content.chars().skip(1).take(group_size - 1).collect();
+        app.touch_typing();
+        app.session.type_text_with_strokes_at(&first_char, 1, Duration::ZERO);
+        app.session.type_text_with_strokes_at(&rest_group, (group_size - 1) as u32, Duration::from_secs(1));
+        assert_eq!(app.session.completed_groups(), 1);
+        assert!(!app.session.is_empty());
+
+        // 模拟第 2 组未达标触发通知
+        app.target_failure_notice = Some("未达标 (击键: 2.4/4.0) — 已重置，请直接打字重打本组".to_string());
+
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| ui(f, &app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let content = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let clean = content.replace(' ', "");
+
+        // 验证：显示未达标通知，但绝对不能并排显示易引起误解的右侧历史指标「速度/击键」
+        assert!(clean.contains("未达标(击键:2.4/4.0)—已重置，请直接打字重打本组"));
+        assert!(!clean.contains("速度0.0"));
+        assert!(!clean.contains("·击键"));
     }
 
     #[test]

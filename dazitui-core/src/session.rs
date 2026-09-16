@@ -155,27 +155,41 @@ pub struct TargetFailure {
     pub actual_kps: f64,
     /// 目标击键（KPS，0.0 表示不设限）。
     pub target_kps: f64,
+    /// 本组跟打期间是否发生过回改。
+    pub has_edits: bool,
+    /// 到达组末是否存在错字。
+    pub has_mismatches: bool,
+    /// 是否触发了就地乱序重打。
+    pub shuffled: bool,
 }
 
 impl TargetFailure {
-    /// 格式化未达标提示文案（仅展示已设定的门槛项）。
+    /// 格式化未达标提示文案（展示失败原因与重置状态）。
     pub fn format_notice(&self) -> String {
         let has_kps = self.target_kps > 0.0;
         let has_wpm = self.target_wpm > 0;
-        match (has_wpm, has_kps) {
-            (true, true) => format!(
-                "未达标 (速度: {:.0}/{} WPM, 击键: {:.1}/{:.1}) — 已重置，按任意键重打",
-                self.actual_wpm, self.target_wpm, self.actual_kps, self.target_kps
-            ),
-            (true, false) => format!(
-                "未达标 (速度: {:.0}/{} WPM) — 已重置，按任意键重打",
-                self.actual_wpm, self.target_wpm
-            ),
-            (false, true) => format!(
-                "未达标 (击键: {:.1}/{:.1}) — 已重置，按任意键重打",
-                self.actual_kps, self.target_kps
-            ),
-            (false, false) => "未达标 — 已重置，按任意键重打".to_string(),
+        let has_err = self.has_edits || self.has_mismatches;
+        let suffix = if self.shuffled {
+            "已打乱重置，请直接打字重打本组"
+        } else {
+            "已重置，请直接打字重打本组"
+        };
+
+        let mut parts = Vec::new();
+        if has_err {
+            parts.push("含错字/回改".to_string());
+        }
+        if has_wpm {
+            parts.push(format!("速度: {:.0}/{} WPM", self.actual_wpm, self.target_wpm));
+        }
+        if has_kps {
+            parts.push(format!("击键: {:.1}/{:.1}", self.actual_kps, self.target_kps));
+        }
+
+        if parts.is_empty() {
+            format!("未达标 — {}", suffix)
+        } else {
+            format!("未达标 ({}) — {}", parts.join(", "), suffix)
         }
     }
 }
@@ -220,6 +234,7 @@ pub struct Session {
     group_snapshot: Option<GroupSnapshot>,
     last_target_failure: Option<TargetFailure>,
     resumed_chars: usize,
+    retry_shuffle: bool,
 }
 
 impl Session {
@@ -283,6 +298,7 @@ impl Session {
             group_snapshot: None,
             last_target_failure: None,
             resumed_chars: 0,
+            retry_shuffle: false,
         }
     }
 
@@ -321,6 +337,56 @@ impl Session {
     /// 查看最近一次目标未达标信息。
     pub fn last_target_failure(&self) -> Option<&TargetFailure> {
         self.last_target_failure.as_ref()
+    }
+
+    /// 设置单字练习未达标乱序重打开关。
+    pub fn set_retry_shuffle(&mut self, retry_shuffle: bool) {
+        self.retry_shuffle = retry_shuffle;
+    }
+
+    /// 获取单字练习未达标乱序重打开关状态。
+    pub fn is_retry_shuffle(&self) -> bool {
+        self.retry_shuffle
+    }
+
+    /// 获取已上屏字符切片。
+    pub fn input_chars(&self) -> &[char] {
+        &self.input
+    }
+
+    /// 获取原文全量字符切片。
+    pub fn original_chars(&self) -> &[char] {
+        &self.original
+    }
+
+    /// 获取当前组目标字符。
+    pub fn current_group_target_chars(&self) -> Vec<char> {
+        let (start, end) = self.current_group_bounds();
+        self.original.get(start..end).map(|s| s.to_vec()).unwrap_or_default()
+    }
+
+    /// 就地随机打乱指定字符区间的顺序（保证不同于打乱前）。
+    pub fn shuffle_group(&mut self, group_start: usize, group_end: usize) {
+        if group_end <= group_start || group_end > self.original.len() {
+            return;
+        }
+        let slice = &mut self.original[group_start..group_end];
+        if slice.len() <= 1 {
+            return;
+        }
+        let all_same = slice.windows(2).all(|w| w[0] == w[1]);
+        if all_same {
+            return;
+        }
+        use rand::seq::SliceRandom;
+        let mut rng = rand::rng();
+        let prev = slice.to_vec();
+        for _ in 0..10 {
+            slice.shuffle(&mut rng);
+            if slice != prev.as_slice() {
+                break;
+            }
+        }
     }
 
     fn take_snapshot(&self) -> GroupSnapshot {
@@ -376,10 +442,11 @@ impl Session {
             chars.len()
         };
 
+        let is_single_char = self.group_bounds.is_empty();
         if accept_len > 0
             && self.group_gated
-            && self.target_gated
-            && (self.target_kps > 0.0 || self.target_wpm > 0)
+            && ((self.target_gated && (self.target_kps > 0.0 || self.target_wpm > 0))
+                || (self.retry_shuffle && is_single_char))
             && self.group_start_elapsed.is_none()
         {
             self.group_start_elapsed = Some(elapsed);
@@ -427,13 +494,69 @@ impl Session {
             });
         }
 
-        // 检查当前组是否全对（仅组门槛模式）
+        // 检查当前组是否达到组末（仅组门槛模式）
         if self.group_gated {
             let (group_start, group_end) = self.current_group_bounds();
             if self.input.len() >= group_end && group_end > group_start {
+                let is_single_char = self.group_bounds.is_empty();
                 let all_correct =
                     (group_start..group_end).all(|i| self.input.get(i) == Some(&self.original[i]));
-                if all_correct {
+
+                if self.retry_shuffle && is_single_char {
+                    let initial_edits = self.group_snapshot.as_ref().map(|s| s.edits).unwrap_or(0);
+                    let has_edits = self.edits > initial_edits;
+                    let has_mismatches = !all_correct;
+
+                    let dur = elapsed.saturating_sub(self.group_start_elapsed.unwrap_or(elapsed));
+                    let dur_secs = dur.as_secs_f64();
+                    let dur_mins = dur_secs / 60.0;
+                    let char_count = group_end - group_start;
+                    let group_wpm = if dur_mins > 0.0001 {
+                        char_count as f64 / dur_mins
+                    } else {
+                        0.0
+                    };
+                    let snap_strokes =
+                        self.group_snapshot.as_ref().map(|s| s.total_strokes).unwrap_or(0);
+                    let group_strokes = self.total_strokes.saturating_sub(snap_strokes);
+                    let group_kps = if dur_secs > 0.0001 {
+                        group_strokes as f64 / dur_secs
+                    } else {
+                        0.0
+                    };
+
+                    let has_kps = self.target_gated && self.target_kps > 0.0;
+                    let has_wpm = self.target_gated && self.target_wpm > 0;
+                    let speed_passed = match (has_kps, has_wpm) {
+                        (true, true) => {
+                            group_kps >= self.target_kps || group_wpm >= self.target_wpm as f64
+                        }
+                        (true, false) => group_kps >= self.target_kps,
+                        (false, true) => group_wpm >= self.target_wpm as f64,
+                        (false, false) => true,
+                    };
+
+                    let passed = all_correct && !has_edits && speed_passed;
+
+                    if passed {
+                        self.completed_groups += 1;
+                        self.group_start_elapsed = None;
+                        self.group_snapshot = None;
+                        self.last_target_failure = None;
+                    } else {
+                        self.last_target_failure = Some(TargetFailure {
+                            actual_wpm: group_wpm,
+                            target_wpm: if self.target_gated { self.target_wpm } else { 0 },
+                            actual_kps: group_kps,
+                            target_kps: if self.target_gated { self.target_kps } else { 0.0 },
+                            has_edits,
+                            has_mismatches,
+                            shuffled: true,
+                        });
+                        self.rollback_current_group(group_start);
+                        self.shuffle_group(group_start, group_end);
+                    }
+                } else if all_correct {
                     if self.target_gated && (self.target_kps > 0.0 || self.target_wpm > 0) {
                         let dur = elapsed.saturating_sub(self.group_start_elapsed.unwrap_or(elapsed));
                         let dur_secs = dur.as_secs_f64();
@@ -475,6 +598,9 @@ impl Session {
                                 target_wpm: self.target_wpm,
                                 actual_kps: group_kps,
                                 target_kps: self.target_kps,
+                                has_edits: false,
+                                has_mismatches: false,
+                                shuffled: false,
                             });
                             self.rollback_current_group(group_start);
                         }
@@ -502,13 +628,20 @@ impl Session {
     ///
     /// 组边界门槛（内置赛文）：已完成组的起始位置不可回改（锁住已完成组）。
     pub fn backspace_at(&mut self, elapsed: Duration) -> bool {
-        if self.group_gated {
-            let (group_start, _) = self.current_group_bounds();
-            if self.input.len() <= group_start {
+        let group_start = if self.group_gated {
+            let (start, _) = self.current_group_bounds();
+            if self.input.len() <= start {
                 return false;
             }
-        }
+            start
+        } else {
+            0
+        };
         if let Some(c) = self.input.pop() {
+            if self.group_gated && self.target_gated && self.input.len() == group_start {
+                self.rollback_current_group(group_start);
+                return true;
+            }
             self.edits += 1;
             self.total_strokes += 1;
             self.edit_details.push(c);
@@ -863,7 +996,7 @@ impl Session {
     ///
     /// 词组赛文（`group_bounds` 非空）：按词组边界确定，每组 `group_size` 个词。
     /// 单字赛文（`group_bounds` 为空）：按字符索引，每组 `group_size` 字。
-    fn current_group_bounds(&self) -> (usize, usize) {
+    pub fn current_group_bounds(&self) -> (usize, usize) {
         if let Some(&(s, e)) = self.group_bounds.get(self.completed_groups) {
             let end = e.min(self.original.len());
             (s, end)
@@ -1590,6 +1723,181 @@ mod tests {
             "结算速度应约为 20 WPM，实际为 {:.1}",
             stats.wpm
         );
+    }
+
+    #[test]
+    fn test_backspace_to_group_start_resets_target_gating_timer() {
+        let text = "一二三四五六七八九十";
+        let mut session = Session::new_gated_with_words_and_size(text, true, &[], 10);
+        session.set_targets(8.0, 100);
+
+        // 用户在 t = 10s 打错 2 字（6 击）
+        session.type_text_with_strokes_at("一一", 6, Duration::from_secs(10));
+        assert_eq!(session.total_strokes(), 6);
+        assert_eq!(session.len(), 2);
+
+        // 用户连续退格删回组首（t = 12s）
+        assert!(session.backspace_at(Duration::from_secs(11)));
+        assert_eq!(session.len(), 1);
+        assert!(session.backspace_at(Duration::from_secs(12)));
+        assert_eq!(session.len(), 0);
+
+        // 回到组首后，击数与打错事件被剥离，起跑时钟被重置为待机态
+        assert_eq!(session.total_strokes(), 0, "回退到组首应完全剥离组内按键流水");
+
+        // 用户停顿至 t = 25s 才重新开始打字，并在 1 秒内（t = 26s）迅速打完 10 字（10 击）
+        // 若时钟未重置，dur = 26 - 10 = 16s，KPS = 10 / 16 = 0.625 < 8.0（必然被误杀未达标）；
+        // 正常重置后，dur = 26 - 25 = 1s，KPS = 10.0 >= 8.0，成功达标放行！
+        session.type_text_with_strokes_at("一二三四五", 5, Duration::from_secs(25));
+        session.type_text_with_strokes_at("六七八九十", 5, Duration::from_secs(26));
+
+        assert_eq!(session.completed_groups(), 1, "退格回退组首重置计时后，应能顺利达标放行");
+        assert!(session.is_complete());
+        assert!(session.take_target_failure().is_none());
+    }
+
+    #[test]
+    fn test_target_failure_notice_wording() {
+        let failure = TargetFailure {
+            actual_wpm: 60.0,
+            target_wpm: 100,
+            actual_kps: 2.4,
+            target_kps: 4.0,
+            has_edits: false,
+            has_mismatches: false,
+            shuffled: false,
+        };
+        let notice = failure.format_notice();
+        assert!(notice.contains("请直接打字重打本组"));
+        assert!(!notice.contains("按任意键重打"));
+    }
+
+    #[test]
+    fn test_retry_shuffle_on_speed_failure() {
+        let text = "一二三四五六七八九十";
+        let mut session = Session::new_gated(text, true);
+        session.set_targets(0.0, 100);
+        session.set_retry_shuffle(true);
+        assert!(session.is_retry_shuffle());
+
+        // 慢速敲完本组（用时 60s，WPM = 10 < 100 触发未达标）
+        session.type_text_with_strokes_at("一二三四五六七八九十", 10, Duration::from_secs(60));
+
+        // 判定未达标：已完成组数为 0，输入已清空回退，且当前组字符顺序已被随机打乱
+        assert_eq!(session.completed_groups(), 0);
+        assert!(session.input_chars().is_empty());
+        assert!(session.take_target_failure().is_some());
+
+        let new_chars: String = session.current_group_target_chars().into_iter().collect();
+        assert_eq!(new_chars.chars().count(), 10);
+        assert_ne!(new_chars, text, "未达标后当前组字符顺序应被打乱");
+
+        // 字符集合仍保持一致
+        let mut sorted_orig: Vec<char> = text.chars().collect();
+        sorted_orig.sort();
+        let mut sorted_new: Vec<char> = new_chars.chars().collect();
+        sorted_new.sort();
+        assert_eq!(sorted_orig, sorted_new);
+    }
+
+    #[test]
+    fn test_retry_shuffle_false_preserves_order_on_failure() {
+        let text = "一二三四五六七八九十";
+        let mut session = Session::new_gated(text, true);
+        session.set_targets(0.0, 100);
+        session.set_retry_shuffle(false);
+        assert!(!session.is_retry_shuffle());
+
+        session.type_text_with_strokes_at("一二三四五六七八九十", 10, Duration::from_secs(60));
+
+        assert_eq!(session.completed_groups(), 0);
+        assert!(session.input_chars().is_empty());
+        let current_chars: String = session.current_group_target_chars().into_iter().collect();
+        assert_eq!(current_chars, text, "关闭乱序重打时字符顺序不应被改变");
+    }
+
+    #[test]
+    fn test_retry_shuffle_fails_on_group_end_with_edits_without_speed_targets() {
+        let text = "一二三四五六七八九十";
+        let mut session = Session::new_gated(text, true);
+        // 不设速度与击键门槛（均为 0）
+        session.set_targets(0.0, 0);
+        session.set_retry_shuffle(true);
+
+        // 先敲入 "一二"，再回改删除 "二"（产生回改），再打完本组
+        session.type_text("一二");
+        session.backspace();
+        session.type_text("二三四五六七八九十");
+
+        // 到达组末，虽然当前屏幕全部匹配原文，但因为发生了回改，必须判定未达标并就地打乱重跑！
+        assert_eq!(session.completed_groups(), 0, "有回改时不得放行进下一组");
+        assert!(session.input_chars().is_empty(), "未达标应清空本组输入");
+        let failure = session.take_target_failure().expect("必须生成未达标记录");
+        assert!(failure.has_edits);
+        let notice = failure.format_notice();
+        assert!(notice.contains("含错字/回改"));
+        assert!(notice.contains("已打乱重置"));
+
+        let new_chars: String = session.current_group_target_chars().into_iter().collect();
+        assert_ne!(new_chars, text, "有回改未达标后当前组字符顺序必须被打乱");
+    }
+
+    #[test]
+    fn test_retry_shuffle_passes_clean_run_without_targets() {
+        let text = "一二三四五六七八九十";
+        let mut session = Session::new_gated(text, true);
+        session.set_targets(0.0, 0);
+        session.set_retry_shuffle(true);
+
+        // 零错字零回改一次性打完
+        session.type_text("一二三四五六七八九十");
+
+        assert_eq!(session.completed_groups(), 1);
+        assert!(session.is_complete());
+        assert!(session.take_target_failure().is_none());
+    }
+
+    #[test]
+    fn test_retry_shuffle_fails_on_uncorrected_mismatch_at_group_end() {
+        let text = "一二三四五六七八九十";
+        let mut session = Session::new_gated(text, true);
+        session.set_targets(0.0, 0);
+        session.set_retry_shuffle(true);
+
+        // 前 9 个对，第 10 个打错为 "错"
+        session.type_text("一二三四五六七八九错");
+
+        // 到达组末长度且存在错字，触发未达标清空并打乱
+        assert_eq!(session.completed_groups(), 0);
+        assert!(session.input_chars().is_empty());
+        let failure = session.take_target_failure().expect("错字到达组末必须触发未达标");
+        assert!(failure.has_mismatches);
+
+        let new_chars: String = session.current_group_target_chars().into_iter().collect();
+        assert_ne!(new_chars, text);
+    }
+
+    #[test]
+    fn test_retry_shuffle_consecutive_failures_reshuffles_each_time() {
+        let text = "一二三四五六七八九十";
+        let mut session = Session::new_gated(text, true);
+        session.set_targets(0.0, 100);
+        session.set_retry_shuffle(true);
+
+        // 第 1 次慢速打完触发未达标
+        let round1_target = session.current_group_target_chars();
+        let str1: String = round1_target.iter().collect();
+        session.type_text_with_strokes_at(&str1, 10, Duration::from_secs(30));
+        assert!(session.take_target_failure().is_some());
+        let round2_target = session.current_group_target_chars();
+        assert_ne!(round1_target, round2_target);
+
+        // 第 2 次针对新乱序依然慢速打完触发未达标
+        let str2: String = round2_target.iter().collect();
+        session.type_text_with_strokes_at(&str2, 10, Duration::from_secs(30));
+        assert!(session.take_target_failure().is_some());
+        let round3_target = session.current_group_target_chars();
+        assert_ne!(round2_target, round3_target);
     }
 }
 

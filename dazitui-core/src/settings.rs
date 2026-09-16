@@ -722,6 +722,8 @@ pub struct Settings {
     pub target_kps: f64,
     /// 单字练习目标速度（WPM，0 表示关闭门槛）。
     pub target_wpm: u16,
+    /// 单字练习未达标乱序重打开关（issue #108/#109，默认关闭）。
+    pub retry_shuffle: bool,
 }
 
 impl Settings {
@@ -831,6 +833,7 @@ impl Default for Settings {
             rank_columns: RankColumnConfig::default(),
             target_kps: 0.0,
             target_wpm: 0,
+            retry_shuffle: false,
         }
     }
 }
@@ -897,7 +900,7 @@ impl SettingsStore {
             std::fs::create_dir_all(parent)?;
         }
         let mut content = format!(
-            "theme={}\nreference_ratio={}\nbold={}\nkeyboard_mode={}\nscheme={}\ninput_method={}\nheatmap_layout={}\ngroup_size={}\ncode_hint={}\nmonitor_scheme={}\nrank_columns={}\ntarget_kps={}\ntarget_wpm={}\n",
+            "theme={}\nreference_ratio={}\nbold={}\nkeyboard_mode={}\nscheme={}\ninput_method={}\nheatmap_layout={}\ngroup_size={}\ncode_hint={}\nmonitor_scheme={}\nrank_columns={}\ntarget_kps={}\ntarget_wpm={}\nretry_shuffle={}\n",
             settings.theme.as_str(),
             settings.reference_ratio,
             settings.bold,
@@ -911,6 +914,7 @@ impl SettingsStore {
             settings.rank_columns.to_keys(),
             settings.target_kps,
             settings.target_wpm,
+            settings.retry_shuffle,
         );
         for (scheme, path) in &settings.scheme_dict_paths {
             content.push_str(&format!("scheme_dict.{}={}\n", scheme, path));
@@ -1008,6 +1012,11 @@ impl SettingsStore {
                         if v <= 500 {
                             settings.target_wpm = v;
                         }
+                    }
+                }
+                "retry_shuffle" => {
+                    if let Ok(b) = value.parse::<bool>() {
+                        settings.retry_shuffle = b;
                     }
                 }
                 "rank_columns" => settings.rank_columns.apply_keys(value),
@@ -1229,6 +1238,7 @@ mod tests {
             rank_columns: RankColumnConfig::default(),
             target_kps: 0.0,
             target_wpm: 0,
+            retry_shuffle: false,
         };
         store.save(&s).unwrap();
         assert_eq!(store.load(), s);
@@ -1711,6 +1721,27 @@ mod tests {
         let loaded_old = store_old.load();
         assert_eq!(loaded_old.target_kps, 0.0);
         assert_eq!(loaded_old.target_wpm, 0);
+
+        let _ = std::fs::remove_file(store.path());
+        let _ = std::fs::remove_file(store_old.path());
+    }
+
+    #[test]
+    fn test_retry_shuffle_defaults_false_and_roundtrips_through_store() {
+        let default_settings = Settings::default();
+        assert!(!default_settings.retry_shuffle);
+
+        let store = SettingsStore::new(temp_path("retry_shuffle_roundtrip"));
+        let mut s = Settings::default();
+        s.retry_shuffle = true;
+        store.save(&s).unwrap();
+        let loaded = store.load();
+        assert!(loaded.retry_shuffle);
+
+        let store_old = SettingsStore::new(temp_path("retry_shuffle_absent"));
+        std::fs::write(store_old.path(), "theme=catppuccin-mocha\n").unwrap();
+        let loaded_old = store_old.load();
+        assert!(!loaded_old.retry_shuffle);
 
         let _ = std::fs::remove_file(store.path());
         let _ = std::fs::remove_file(store_old.path());
