@@ -6096,8 +6096,11 @@ fn render_builtin_preview(frame: &mut Frame, app: &App, area: ratatui::layout::R
     } else {
         "乱序"
     };
-    let hint_str = if is_words {
-        format!(" Enter 载入 | s {shuffle_label} | g 分组({group_size}{unit_label}) | Esc 取消 ")
+    let (hint_str, single_labels) = if is_words {
+        (
+            format!(" Enter 载入 | s {shuffle_label} | g 分组({group_size}{unit_label}) | Esc 取消 "),
+            None,
+        )
     } else {
         let kps_label = if app.settings.target_kps <= 0.0 {
             "关".to_string()
@@ -6114,7 +6117,10 @@ fn render_builtin_preview(frame: &mut Frame, app: &App, area: ratatui::layout::R
         } else {
             "关"
         };
-        format!(" Enter 载入 | s {shuffle_label} | r 乱序重打({retry_label}) | g 分组({group_size}字) | t 击键({kps_label}) | w 速度({wpm_label}) | Esc 取消 ")
+        (
+            format!(" Enter 载入 | s {shuffle_label} | r 乱序重打({retry_label}) | g 分组({group_size}字) | t 击键({kps_label}) | w 速度({wpm_label}) | Esc 取消 "),
+            Some((kps_label, wpm_label, retry_label)),
+        )
     };
     lines.push(hint_bar_line(&hint_str, &palette));
     let mut title_spans = vec![
@@ -6130,22 +6136,7 @@ fn render_builtin_preview(frame: &mut Frame, app: &App, area: ratatui::layout::R
             Style::default().bold().fg(palette.accent),
         ),
     ];
-    if !is_words {
-        let kps_label = if app.settings.target_kps <= 0.0 {
-            "关".to_string()
-        } else {
-            format!("{:.1}击", app.settings.target_kps)
-        };
-        let wpm_label = if app.settings.target_wpm == 0 {
-            "关".to_string()
-        } else {
-            format!("{}WPM", app.settings.target_wpm)
-        };
-        let retry_label = if app.settings.retry_shuffle {
-            "开"
-        } else {
-            "关"
-        };
+    if let Some((kps_label, wpm_label, retry_label)) = single_labels {
         title_spans.push(Span::styled(
             format!("[r] 乱序重打: {retry_label}  [t] 击键: {kps_label}  [w] 速度: {wpm_label} "),
             Style::default().fg(palette.muted),

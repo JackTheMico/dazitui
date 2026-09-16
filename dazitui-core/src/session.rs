@@ -168,6 +168,14 @@ impl TargetFailure {
     pub fn format_notice(&self) -> String {
         let has_kps = self.target_kps > 0.0;
         let has_wpm = self.target_wpm > 0;
+        let speed_passed = match (has_kps, has_wpm) {
+            (true, true) => {
+                self.actual_kps >= self.target_kps || self.actual_wpm >= self.target_wpm as f64
+            }
+            (true, false) => self.actual_kps >= self.target_kps,
+            (false, true) => self.actual_wpm >= self.target_wpm as f64,
+            (false, false) => true,
+        };
         let has_err = self.has_edits || self.has_mismatches;
         let suffix = if self.shuffled {
             "已打乱重置，请直接打字重打本组"
@@ -179,11 +187,13 @@ impl TargetFailure {
         if has_err {
             parts.push("含错字/回改".to_string());
         }
-        if has_wpm {
-            parts.push(format!("速度: {:.0}/{} WPM", self.actual_wpm, self.target_wpm));
-        }
-        if has_kps {
-            parts.push(format!("击键: {:.1}/{:.1}", self.actual_kps, self.target_kps));
+        if !speed_passed {
+            if has_wpm {
+                parts.push(format!("速度: {:.0}/{} WPM", self.actual_wpm, self.target_wpm));
+            }
+            if has_kps {
+                parts.push(format!("击键: {:.1}/{:.1}", self.actual_kps, self.target_kps));
+            }
         }
 
         if parts.is_empty() {
@@ -354,11 +364,6 @@ impl Session {
         &self.input
     }
 
-    /// 获取原文全量字符切片。
-    pub fn original_chars(&self) -> &[char] {
-        &self.original
-    }
-
     /// 获取当前组目标字符。
     pub fn current_group_target_chars(&self) -> Vec<char> {
         let (start, end) = self.current_group_bounds();
@@ -411,6 +416,41 @@ impl Session {
             self.edit_details.truncate(snap.edit_details_len);
         }
         self.group_start_elapsed = None;
+    }
+
+    fn calculate_group_metrics(
+        &self,
+        group_start: usize,
+        group_end: usize,
+        elapsed: Duration,
+    ) -> (f64, f64, bool) {
+        let dur = elapsed.saturating_sub(self.group_start_elapsed.unwrap_or(elapsed));
+        let dur_secs = dur.as_secs_f64();
+        let dur_mins = dur_secs / 60.0;
+        let char_count = group_end - group_start;
+        let group_wpm = if dur_mins > 0.0001 {
+            char_count as f64 / dur_mins
+        } else {
+            0.0
+        };
+        let snap_strokes = self.group_snapshot.as_ref().map(|s| s.total_strokes).unwrap_or(0);
+        let group_strokes = self.total_strokes.saturating_sub(snap_strokes);
+        let group_kps = if dur_secs > 0.0001 {
+            group_strokes as f64 / dur_secs
+        } else {
+            0.0
+        };
+
+        let has_kps = self.target_gated && self.target_kps > 0.0;
+        let has_wpm = self.target_gated && self.target_wpm > 0;
+        let speed_passed = match (has_kps, has_wpm) {
+            (true, true) => group_kps >= self.target_kps || group_wpm >= self.target_wpm as f64,
+            (true, false) => group_kps >= self.target_kps,
+            (false, true) => group_wpm >= self.target_wpm as f64,
+            (false, false) => true,
+        };
+
+        (group_wpm, group_kps, speed_passed)
     }
 
     /// 上屏一段文本：追加到输入末尾，重新与原文比对，返回本次字符的对/错。
@@ -506,36 +546,8 @@ impl Session {
                     let initial_edits = self.group_snapshot.as_ref().map(|s| s.edits).unwrap_or(0);
                     let has_edits = self.edits > initial_edits;
                     let has_mismatches = !all_correct;
-
-                    let dur = elapsed.saturating_sub(self.group_start_elapsed.unwrap_or(elapsed));
-                    let dur_secs = dur.as_secs_f64();
-                    let dur_mins = dur_secs / 60.0;
-                    let char_count = group_end - group_start;
-                    let group_wpm = if dur_mins > 0.0001 {
-                        char_count as f64 / dur_mins
-                    } else {
-                        0.0
-                    };
-                    let snap_strokes =
-                        self.group_snapshot.as_ref().map(|s| s.total_strokes).unwrap_or(0);
-                    let group_strokes = self.total_strokes.saturating_sub(snap_strokes);
-                    let group_kps = if dur_secs > 0.0001 {
-                        group_strokes as f64 / dur_secs
-                    } else {
-                        0.0
-                    };
-
-                    let has_kps = self.target_gated && self.target_kps > 0.0;
-                    let has_wpm = self.target_gated && self.target_wpm > 0;
-                    let speed_passed = match (has_kps, has_wpm) {
-                        (true, true) => {
-                            group_kps >= self.target_kps || group_wpm >= self.target_wpm as f64
-                        }
-                        (true, false) => group_kps >= self.target_kps,
-                        (false, true) => group_wpm >= self.target_wpm as f64,
-                        (false, false) => true,
-                    };
-
+                    let (group_wpm, group_kps, speed_passed) =
+                        self.calculate_group_metrics(group_start, group_end, elapsed);
                     let passed = all_correct && !has_edits && speed_passed;
 
                     if passed {
@@ -558,34 +570,8 @@ impl Session {
                     }
                 } else if all_correct {
                     if self.target_gated && (self.target_kps > 0.0 || self.target_wpm > 0) {
-                        let dur = elapsed.saturating_sub(self.group_start_elapsed.unwrap_or(elapsed));
-                        let dur_secs = dur.as_secs_f64();
-                        let dur_mins = dur_secs / 60.0;
-                        let char_count = group_end - group_start;
-                        let group_wpm = if dur_mins > 0.0001 {
-                            char_count as f64 / dur_mins
-                        } else {
-                            0.0
-                        };
-                        let snap_strokes =
-                            self.group_snapshot.as_ref().map(|s| s.total_strokes).unwrap_or(0);
-                        let group_strokes = self.total_strokes.saturating_sub(snap_strokes);
-                        let group_kps = if dur_secs > 0.0001 {
-                            group_strokes as f64 / dur_secs
-                        } else {
-                            0.0
-                        };
-
-                        let has_kps = self.target_kps > 0.0;
-                        let has_wpm = self.target_wpm > 0;
-                        let passed = match (has_kps, has_wpm) {
-                            (true, true) => {
-                                group_kps >= self.target_kps || group_wpm >= self.target_wpm as f64
-                            }
-                            (true, false) => group_kps >= self.target_kps,
-                            (false, true) => group_wpm >= self.target_wpm as f64,
-                            (false, false) => true,
-                        };
+                        let (group_wpm, group_kps, passed) =
+                            self.calculate_group_metrics(group_start, group_end, elapsed);
 
                         if passed {
                             self.completed_groups += 1;
@@ -611,6 +597,7 @@ impl Session {
                         self.last_target_failure = None;
                     }
                 }
+
             }
         }
         TypeResult {
