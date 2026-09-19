@@ -3,6 +3,7 @@ use std::time::Duration;
 
 mod code_hint;
 mod db;
+pub mod font16;
 mod lttb;
 pub mod paths;
 mod scheme;

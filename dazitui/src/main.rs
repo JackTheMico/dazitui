@@ -24,6 +24,7 @@ use dazitui_core::{
     TigerCupClient, TigerDraft, TigerDraftStore, TigerLeaderboardEntry,
     build_tiger_payload, format_tiger_share_text,
 };
+use dazitui_core::font16::{glyph_for_char_or_fallback, render_glyph_braille};
 
 
 /// 方案源文件热监控封装（issue #91 / #93），基于 `notify`。
@@ -5082,6 +5083,7 @@ fn ui(frame: &mut Frame, app: &App) {
         }
 
         let is_builtin = matches!(app.text.source, TextSource::Builtin { .. });
+        let is_builtin_chars = matches!(app.text.source, TextSource::Builtin { set } if !set.is_words());
         let is_kongming_1hit = matches!(
             app.text.source,
             TextSource::Builtin {
@@ -5107,6 +5109,20 @@ fn ui(frame: &mut Frame, app: &App) {
         //  若各自按自身高度居中，会出现对照区滞后、不跟随打字位置的错位）。
         let type_inner_width = type_area.width.saturating_sub(2);
         let type_inner_height = type_area.height.saturating_sub(2);
+        let dot_matrix_typing_opt = if is_builtin_chars {
+            render_dot_matrix_typing_single_chars(
+                &app.session,
+                &app.text,
+                app.theme(),
+                app.settings.bold,
+                app.settings.code_hint,
+                ref_inner_height,
+                type_inner_width,
+                type_inner_height,
+            )
+        } else {
+            None
+        };
         let rendered_type_lines = type_line(
             &app.session,
             &app.text,
@@ -5130,7 +5146,24 @@ fn ui(frame: &mut Frame, app: &App) {
             0
         };
 
-        let (mut ref_text, ref_cursor_grid_line) = if use_code_hint_grid {
+        let dot_matrix_single_chars_opt = if is_builtin_chars {
+            render_dot_matrix_single_chars(
+                &app.session,
+                &app.text,
+                app.theme(),
+                app.settings.bold,
+                app.settings.code_hint,
+                app.scheme_dict.as_ref(),
+                ref_inner_width,
+                ref_inner_height,
+            )
+        } else {
+            None
+        };
+
+        let (mut ref_text, ref_cursor_grid_line) = if let Some(dm_lines) = dot_matrix_single_chars_opt {
+            (dm_lines, None)
+        } else if use_code_hint_grid {
             // 非内置长文双行词格：提示行与正文行已按词宽锁步预排版（无需 Paragraph 再折行）。
             match code_hint_grid_text(
                 &app.session,
@@ -5164,10 +5197,10 @@ fn ui(frame: &mut Frame, app: &App) {
                 None,
             )
         };
-        // 遍码提示（编码提示）：开启时，有可用词典或内置物理指法赛文走正常提示路径，否则显示占位引导。
-        if app.settings.code_hint {
+        // 遍码提示（编码提示）：开启时，非单字大字点阵路径走正常提示路径，否则显示占位引导。
+        if app.settings.code_hint && !is_builtin_chars {
             if dict_ok || is_kongming_1hit {
-                // 内置词组赛文与空明一击字：正文行之上插入单行提示（单页，由 Paragraph 按词宽折行）。
+                // 内置词组赛文：正文行之上插入单行提示（单页，由 Paragraph 按词宽折行）。
                 if let Some(hint_line) = code_hint_overlay_line(
                     &app.session,
                     &app.text,
@@ -5184,9 +5217,11 @@ fn ui(frame: &mut Frame, app: &App) {
                     .insert(0, code_hint_placeholder_line(app.theme()));
             }
         }
-        // 对照区滚动：编码提示双行词格路径按光标真实网格行定位，保证严格跟随打字位置；
+        // 对照区滚动：编码提示双行词格路径按光标真实网格行定位，单字点阵固定居中（0），
         // 其余路径（含词格生成失败回退）与跟打区共用同一偏移（type_scroll_y），二者垂直等宽、换行一致。
-        let ref_scroll_y = if use_code_hint_grid {
+        let ref_scroll_y = if is_builtin_chars {
+            0
+        } else if use_code_hint_grid {
             match ref_cursor_grid_line {
                 Some(gl) => gl.saturating_sub(ref_inner_height / 2),
                 None => type_scroll_y,
@@ -5254,8 +5289,15 @@ fn ui(frame: &mut Frame, app: &App) {
         let typing_title = Line::from(typing_title_spans);
 
         // 跟打区尺寸/滚动变量已在上方对照区之前计算，此处直接复用。
+        let (type_text_to_render, dm_cursor_pos) =
+            if let Some((dm_type_lines, cursor_pos)) = dot_matrix_typing_opt {
+                (dm_type_lines, Some(cursor_pos))
+            } else {
+                (rendered_type_lines, None)
+            };
+
         frame.render_widget(
-            Paragraph::new(rendered_type_lines)
+            Paragraph::new(type_text_to_render)
                 .block(themed_block(&palette, typing_active).title(typing_title))
                 .wrap(Wrap { trim: false })
                 .scroll((type_scroll_y, 0)),
@@ -5263,19 +5305,22 @@ fn ui(frame: &mut Frame, app: &App) {
         );
 
         if !app.paused && matches!(app.state, AppState::Typing) {
-            let eff_line = if type_cursor_col >= type_inner_width {
-                type_cursor_line.saturating_add(1)
+            let (cursor_x, cursor_y) = if let Some((c_col, c_line)) = dm_cursor_pos {
+                (type_area.x + 1 + c_col, type_area.y + 1 + c_line)
             } else {
-                type_cursor_line
+                let eff_line = if type_cursor_col >= type_inner_width {
+                    type_cursor_line.saturating_add(1)
+                } else {
+                    type_cursor_line
+                };
+                let eff_col = if type_cursor_col >= type_inner_width {
+                    0
+                } else {
+                    type_cursor_col
+                };
+                let cursor_inner_row = eff_line.saturating_sub(type_scroll_y);
+                (type_area.x + 1 + eff_col, type_area.y + 1 + cursor_inner_row)
             };
-            let eff_col = if type_cursor_col >= type_inner_width {
-                0
-            } else {
-                type_cursor_col
-            };
-            let cursor_inner_row = eff_line.saturating_sub(type_scroll_y);
-            let cursor_x = type_area.x + 1 + eff_col;
-            let cursor_y = type_area.y + 1 + cursor_inner_row;
             if cursor_y < type_area.y + type_area.height.saturating_sub(1)
                 && cursor_x < type_area.x + type_area.width.saturating_sub(1)
             {
@@ -8419,6 +8464,448 @@ fn builtin_page_start(session: &Session) -> usize {
     session.completed_groups() * session.group_size()
 }
 
+/// 单字提示编码提取与前缀去皮（与编码提示保持同一口径）。
+fn single_char_hint(
+    c: char,
+    set: BuiltinSet,
+    scheme_dict: Option<&SchemeDict>,
+) -> Option<(String, HintHand)> {
+    if set == BuiltinSet::KongmingOneHitChars {
+        if let Some((chord, hand)) = kongming_1hit_hint(c) {
+            return Some((chord.to_string(), hand));
+        }
+    } else if let Some(dict) = scheme_dict {
+        let words = [c.to_string()];
+        let hints = dict.build_code_hints(&words);
+        if let Some(h) = hints.first().filter(|h| !h.is_oov && !h.code.is_empty()) {
+            let hand = hand_of_code(&h.code);
+            let raw_code = h.code.strip_prefix('%').unwrap_or(&h.code);
+            let clean = raw_code.strip_prefix(['_', '+', '-']).unwrap_or(raw_code);
+            return Some((clean.to_string(), hand));
+        }
+    }
+    None
+}
+
+/// 单字练习单元结构体（承载字符、跟打状态、焦点与 8×4 盲文微点阵块）。
+struct SingleCharUnit {
+    c: char,
+    status: Option<CharStatus>,
+    is_active: bool,
+    hint: Option<(String, HintHand)>,
+    braille: [[char; 8]; 4],
+}
+
+/// 内置单字赛文对照区：8×4 盲文微点阵大字完全居中渲染（自适应折行或空间不足回退）。
+fn render_dot_matrix_single_chars(
+    session: &Session,
+    text: &Text,
+    theme: Theme,
+    bold: bool,
+    code_hint: bool,
+    scheme_dict: Option<&SchemeDict>,
+    ref_inner_width: u16,
+    ref_inner_height: u16,
+) -> Option<TextLines<'static>> {
+    let set = match text.source {
+        TextSource::Builtin { set } if !set.is_words() => set,
+        _ => return None,
+    };
+    let page_start = builtin_page_start(session);
+    let group_size = session.group_size();
+    let statuses = session.original_status();
+    if page_start >= statuses.len() {
+        return None;
+    }
+    let page_end = (page_start + group_size).min(statuses.len());
+    let current_typed_len = session.len();
+
+    let mut units: Vec<SingleCharUnit> = Vec::with_capacity(page_end - page_start);
+    for (offset, &(c, status)) in statuses[page_start..page_end].iter().enumerate() {
+        let global_idx = page_start + offset;
+        let is_active = global_idx == current_typed_len;
+        let hint = if code_hint {
+            single_char_hint(c, set, scheme_dict)
+        } else {
+            None
+        };
+        let glyph = glyph_for_char_or_fallback(c);
+        let braille = render_glyph_braille(glyph);
+        units.push(SingleCharUnit {
+            c,
+            status,
+            is_active,
+            hint,
+            braille,
+        });
+    }
+
+    if units.is_empty() {
+        return None;
+    }
+
+    let n = units.len();
+    let char_w = 8;
+    let char_gap = 2;
+    let single_row_w = n * char_w + (n.saturating_sub(1)) * char_gap;
+    let lines_per_row = if code_hint { 5 } else { 4 };
+    let can_single_row = (ref_inner_width as usize) >= single_row_w
+        && (ref_inner_height as usize) >= lines_per_row;
+
+    let row1_len = n.div_ceil(2);
+    let two_rows_w = row1_len * char_w + (row1_len.saturating_sub(1)) * char_gap;
+    let two_rows_h = lines_per_row * 2 + 1;
+    let can_two_rows = (ref_inner_width as usize) >= two_rows_w
+        && (ref_inner_height as usize) >= two_rows_h;
+
+    // 若宽度或高度不足以排版盲文微点阵大字，安全回退到普通单字大间距居中显示
+    if !can_single_row && !can_two_rows {
+        return Some(render_single_chars_spaced_fallback(
+            &units,
+            code_hint,
+            theme,
+            bold,
+            ref_inner_width,
+            ref_inner_height,
+        ));
+    }
+
+    let rows: Vec<&[SingleCharUnit]> = if can_single_row {
+        vec![&units[..]]
+    } else {
+        vec![&units[..row1_len], &units[row1_len..]]
+    };
+
+    let mut content_lines: Vec<Line<'static>> = Vec::new();
+    for (r_idx, row_units) in rows.iter().enumerate() {
+        if r_idx > 0 {
+            content_lines.push(Line::raw(""));
+        }
+        let r_w = row_units.len() * char_w + (row_units.len().saturating_sub(1)) * char_gap;
+        let left_pad = (ref_inner_width as usize).saturating_sub(r_w) / 2;
+        let pad_str = " ".repeat(left_pad);
+
+        if code_hint {
+            let mut hint_spans: Vec<Span<'static>> = Vec::new();
+            if left_pad > 0 {
+                hint_spans.push(Span::raw(pad_str.clone()));
+            }
+            for (u_idx, unit) in row_units.iter().enumerate() {
+                if u_idx > 0 {
+                    hint_spans.push(Span::raw("  "));
+                }
+                if let Some((hint_text, hand)) = &unit.hint {
+                    let h_len = UnicodeWidthStr::width(hint_text.as_str());
+                    let h_pad_left = 8usize.saturating_sub(h_len) / 2;
+                    let h_pad_right = 8usize.saturating_sub(h_len + h_pad_left);
+                    if h_pad_left > 0 {
+                        hint_spans.push(Span::raw(" ".repeat(h_pad_left)));
+                    }
+                    hint_spans.push(Span::styled(
+                        hint_text.clone(),
+                        code_hint_hand_style(*hand, theme),
+                    ));
+                    if h_pad_right > 0 {
+                        hint_spans.push(Span::raw(" ".repeat(h_pad_right)));
+                    }
+                } else {
+                    hint_spans.push(Span::raw(" ".repeat(8)));
+                }
+            }
+            content_lines.push(Line::from(hint_spans));
+        }
+
+        for line_idx in 0..4 {
+            let mut glyph_spans: Vec<Span<'static>> = Vec::new();
+            if left_pad > 0 {
+                glyph_spans.push(Span::raw(pad_str.clone()));
+            }
+            for (u_idx, unit) in row_units.iter().enumerate() {
+                if u_idx > 0 {
+                    glyph_spans.push(Span::raw("  "));
+                }
+                let char_style = match unit.status {
+                    Some(CharStatus::Correct) => {
+                        Style::default().fg(color(theme.correct)).add_modifier(bold_modifier(bold))
+                    }
+                    Some(CharStatus::Wrong) => {
+                        Style::default().fg(color(theme.wrong)).add_modifier(bold_modifier(bold))
+                    }
+                    None if unit.is_active => {
+                        Style::default().fg(color(theme.accent)).add_modifier(Modifier::BOLD)
+                    }
+                    None => {
+                        Style::default().fg(color(theme.text)).add_modifier(bold_modifier(bold))
+                    }
+                };
+                let line_str: String = unit.braille[line_idx].iter().collect();
+                glyph_spans.push(Span::styled(line_str, char_style));
+            }
+            content_lines.push(Line::from(glyph_spans));
+        }
+    }
+
+    let content_h = content_lines.len();
+    if (ref_inner_height as usize) > content_h {
+        let top_pad = ((ref_inner_height as usize) - content_h) / 2;
+        for _ in 0..top_pad {
+            content_lines.insert(0, Line::raw(""));
+        }
+    }
+    Some(TextLines::from(content_lines))
+}
+
+/// 空间受限时安全回退：普通单字加大间距居中显示。
+fn render_single_chars_spaced_fallback(
+    units: &[SingleCharUnit],
+    code_hint: bool,
+    theme: Theme,
+    bold: bool,
+    ref_inner_width: u16,
+    ref_inner_height: u16,
+) -> TextLines<'static> {
+    let mut cell_widths = Vec::with_capacity(units.len());
+    for u in units {
+        let char_w = u.c.width().unwrap_or(1);
+        let hint_w = u.hint.as_ref().map(|(h, _)| UnicodeWidthStr::width(h.as_str())).unwrap_or(0);
+        cell_widths.push(char_w.max(hint_w).max(2));
+    }
+    let cell_gap = 3;
+    let total_w: usize = cell_widths.iter().sum::<usize>() + (units.len().saturating_sub(1)) * cell_gap;
+    let left_pad = (ref_inner_width as usize).saturating_sub(total_w) / 2;
+    let pad_str = " ".repeat(left_pad);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if code_hint {
+        let mut hint_spans: Vec<Span<'static>> = Vec::new();
+        if left_pad > 0 {
+            hint_spans.push(Span::raw(pad_str.clone()));
+        }
+        for (i, u) in units.iter().enumerate() {
+            if i > 0 {
+                hint_spans.push(Span::raw(" ".repeat(cell_gap)));
+            }
+            let cw = cell_widths[i];
+            if let Some((hint_str, hand)) = &u.hint {
+                let hw = UnicodeWidthStr::width(hint_str.as_str());
+                let pl = cw.saturating_sub(hw) / 2;
+                let pr = cw.saturating_sub(hw + pl);
+                if pl > 0 {
+                    hint_spans.push(Span::raw(" ".repeat(pl)));
+                }
+                hint_spans.push(Span::styled(hint_str.clone(), code_hint_hand_style(*hand, theme)));
+                if pr > 0 {
+                    hint_spans.push(Span::raw(" ".repeat(pr)));
+                }
+            } else {
+                hint_spans.push(Span::raw(" ".repeat(cw)));
+            }
+        }
+        lines.push(Line::from(hint_spans));
+    }
+
+    let mut char_spans: Vec<Span<'static>> = Vec::new();
+    if left_pad > 0 {
+        char_spans.push(Span::raw(pad_str.clone()));
+    }
+    for (i, u) in units.iter().enumerate() {
+        if i > 0 {
+            char_spans.push(Span::raw(" ".repeat(cell_gap)));
+        }
+        let cw = cell_widths[i];
+        let char_w = u.c.width().unwrap_or(1);
+        let pl = cw.saturating_sub(char_w) / 2;
+        let pr = cw.saturating_sub(char_w + pl);
+        if pl > 0 {
+            char_spans.push(Span::raw(" ".repeat(pl)));
+        }
+        let char_style = match u.status {
+            Some(CharStatus::Correct) => {
+                Style::default().fg(color(theme.correct)).add_modifier(bold_modifier(bold))
+            }
+            Some(CharStatus::Wrong) => {
+                Style::default().fg(color(theme.wrong)).add_modifier(bold_modifier(bold))
+            }
+            None if u.is_active => {
+                Style::default().fg(color(theme.accent)).add_modifier(Modifier::BOLD)
+            }
+            None => {
+                Style::default().fg(color(theme.text)).add_modifier(bold_modifier(bold))
+            }
+        };
+        char_spans.push(Span::styled(u.c.to_string(), char_style));
+        if pr > 0 {
+            char_spans.push(Span::raw(" ".repeat(pr)));
+        }
+    }
+    lines.push(Line::from(char_spans));
+
+    let content_h = lines.len();
+    if (ref_inner_height as usize) > content_h {
+        let top_pad = ((ref_inner_height as usize) - content_h) / 2;
+        for _ in 0..top_pad {
+            lines.insert(0, Line::raw(""));
+        }
+    }
+    TextLines::from(lines)
+}
+
+struct TypingDotMatrixSlot {
+    braille: [[char; 8]; 4],
+    style: Style,
+}
+
+/// 内置单字跟打区：8×4 盲文微点阵大字镜像渲染与输入法硬件光标定位。
+fn render_dot_matrix_typing_single_chars(
+    session: &Session,
+    text: &Text,
+    theme: Theme,
+    bold: bool,
+    code_hint: bool,
+    ref_inner_height: u16,
+    type_inner_width: u16,
+    type_inner_height: u16,
+) -> Option<(TextLines<'static>, (u16, u16))> {
+    let _set = match text.source {
+        TextSource::Builtin { set } if !set.is_words() => set,
+        _ => return None,
+    };
+    let page_start = builtin_page_start(session);
+    let group_size = session.group_size();
+    let statuses = session.original_status();
+    if page_start >= statuses.len() {
+        return None;
+    }
+    let page_end = (page_start + group_size).min(statuses.len());
+    let n = page_end - page_start;
+    if n == 0 {
+        return None;
+    }
+
+    let char_w = 8;
+    let char_gap = 2;
+    let single_row_w = n * char_w + (n.saturating_sub(1)) * char_gap;
+    let ref_lines_per_row = if code_hint { 5 } else { 4 };
+    let can_single_row = (type_inner_width as usize) >= single_row_w
+        && (ref_inner_height as usize) >= ref_lines_per_row
+        && (type_inner_height as usize) >= 4;
+
+    let row1_len = n.div_ceil(2);
+    let two_rows_w = row1_len * char_w + (row1_len.saturating_sub(1)) * char_gap;
+    let ref_two_rows_h = ref_lines_per_row * 2 + 1;
+    let can_two_rows = (type_inner_width as usize) >= two_rows_w
+        && (ref_inner_height as usize) >= ref_two_rows_h
+        && (type_inner_height as usize) >= 9;
+
+    if !can_single_row && !can_two_rows {
+        return None;
+    }
+
+    let display = session.display();
+    let mut slots: Vec<Option<TypingDotMatrixSlot>> = Vec::with_capacity(n);
+    for i in 0..n {
+        let global_idx = page_start + i;
+        if global_idx < display.len() {
+            let (typed_char, status) = display[global_idx];
+            let glyph = glyph_for_char_or_fallback(typed_char);
+            let braille = render_glyph_braille(glyph);
+            let style = match status {
+                CharStatus::Correct => {
+                    Style::default().fg(color(theme.correct)).add_modifier(bold_modifier(bold))
+                }
+                CharStatus::Wrong => {
+                    Style::default().fg(color(theme.wrong)).add_modifier(bold_modifier(bold))
+                }
+            };
+            slots.push(Some(TypingDotMatrixSlot { braille, style }));
+        } else {
+            slots.push(None);
+        }
+    }
+
+    #[allow(clippy::single_range_in_vec_init)]
+    let rows: Vec<std::ops::Range<usize>> = if can_single_row {
+        vec![0..n]
+    } else {
+        vec![0..row1_len, row1_len..n]
+    };
+
+    let mut content_lines: Vec<Line<'static>> = Vec::new();
+    for (r_idx, slot_range) in rows.iter().enumerate() {
+        if r_idx > 0 {
+            content_lines.push(Line::raw(""));
+        }
+        let r_w = slot_range.len() * char_w + (slot_range.len().saturating_sub(1)) * char_gap;
+        let left_pad = (type_inner_width as usize).saturating_sub(r_w) / 2;
+        let pad_str = " ".repeat(left_pad);
+
+        for line_idx in 0..4 {
+            let mut glyph_spans: Vec<Span<'static>> = Vec::new();
+            if left_pad > 0 {
+                glyph_spans.push(Span::raw(pad_str.clone()));
+            }
+            for (offset, slot_idx) in slot_range.clone().enumerate() {
+                if offset > 0 {
+                    glyph_spans.push(Span::raw("  "));
+                }
+                if let Some(slot) = &slots[slot_idx] {
+                    let line_str: String = slot.braille[line_idx].iter().collect();
+                    glyph_spans.push(Span::styled(line_str, slot.style));
+                } else {
+                    glyph_spans.push(Span::raw("        "));
+                }
+            }
+            content_lines.push(Line::from(glyph_spans));
+        }
+    }
+
+    let content_h = content_lines.len();
+    let top_pad = if (type_inner_height as usize) > content_h {
+        ((type_inner_height as usize) - content_h) / 2
+    } else {
+        0
+    };
+    for _ in 0..top_pad {
+        content_lines.insert(0, Line::raw(""));
+    }
+
+    // 计算活动槽位的终端网格相对坐标 (cursor_col, cursor_line)
+    let current_typed_len = session.len();
+    let active_offset = current_typed_len.saturating_sub(page_start);
+
+    let (cursor_col, cursor_line) = if can_single_row {
+        let r_w = n * char_w + (n.saturating_sub(1)) * char_gap;
+        let left_pad = (type_inner_width as usize).saturating_sub(r_w) / 2;
+        let col = if active_offset < n {
+            left_pad + active_offset * (char_w + char_gap)
+        } else {
+            left_pad + (n.saturating_sub(1)) * (char_w + char_gap) + char_w
+        };
+        (col as u16, (top_pad + 3) as u16)
+    } else {
+        let row2_len = n - row1_len;
+        if active_offset < row1_len {
+            let r_w = row1_len * char_w + (row1_len.saturating_sub(1)) * char_gap;
+            let left_pad = (type_inner_width as usize).saturating_sub(r_w) / 2;
+            let col = left_pad + active_offset * (char_w + char_gap);
+            (col as u16, (top_pad + 3) as u16)
+        } else {
+            let r_w = row2_len * char_w + (row2_len.saturating_sub(1)) * char_gap;
+            let left_pad = (type_inner_width as usize).saturating_sub(r_w) / 2;
+            let offset_in_row = active_offset - row1_len;
+            let col = if offset_in_row < row2_len {
+                left_pad + offset_in_row * (char_w + char_gap)
+            } else {
+                left_pad + (row2_len.saturating_sub(1)) * (char_w + char_gap) + char_w
+            };
+            (col as u16, (top_pad + 8) as u16)
+        }
+    };
+
+    Some((TextLines::from(content_lines), (cursor_col, cursor_line)))
+}
+
+
 /// 对照区：将当前页指定数量词的原文按跟打状态着色，词间插入空格 span（不可打）。
 ///
 /// `cell_widths` 为遍码提示开启时的词格列宽（`max(词宽, 提示码宽)`，按页内词条序）；
@@ -9277,7 +9764,7 @@ mod tests {
     }
 
     /// 测试用 App：临时 token/设置存储 + 不可达 API（无 token 文件时不发网络请求）。
-    fn test_app(text: Text) -> App {
+    pub(crate) fn test_app(text: Text) -> App {
         let store = temp_token_store();
         App::new_with(
             text,
@@ -17342,5 +17829,327 @@ mod scheme_hot_reload_regression_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod dot_matrix_tests {
+    use super::*;
+    use super::tests::test_app;
+
+    #[test]
+    fn test_render_dot_matrix_single_chars_wide_screen() {
+        let text = load_builtin_text(BUILTIN_SETS[0]);
+        let session = Session::new(&text.content);
+        let theme = Theme::preset(ThemePreset::CatppuccinMocha);
+        let res = render_dot_matrix_single_chars(
+            &session,
+            &text,
+            theme,
+            false,
+            false,
+            None,
+            110, // 宽屏，容纳 1 行 10 字（98 列）
+            15,
+        );
+        assert!(res.is_some(), "宽屏下应成功渲染盲文微点阵大字");
+        let text_lines = res.unwrap();
+        // 验证包含有效盲文字符（U+2801..=U+28FF）
+        let has_braille = text_lines.lines.iter().any(|l| {
+            l.spans.iter().any(|s| {
+                s.content
+                    .chars()
+                    .any(|c| ('\u{2801}'..='\u{28FF}').contains(&c))
+            })
+        });
+        assert!(has_braille, "盲文微点阵渲染结果应包含 Unicode 盲文字符");
+    }
+
+    #[test]
+    fn test_render_dot_matrix_single_chars_standard_screen() {
+        let text = load_builtin_text(BUILTIN_SETS[0]);
+        let session = Session::new(&text.content);
+        let theme = Theme::preset(ThemePreset::CatppuccinMocha);
+        let res = render_dot_matrix_single_chars(
+            &session,
+            &text,
+            theme,
+            false,
+            false,
+            None,
+            70, // 普通屏，单行 98 列放不下，折为两行（5+5 字，每行 48 列）
+            15,
+        );
+        assert!(res.is_some(), "普通屏下应折为两行盲文大字渲染");
+        let text_lines = res.unwrap();
+        let non_empty_lines = text_lines
+            .lines
+            .iter()
+            .filter(|l| !l.spans.is_empty() && l.spans.iter().any(|s| !s.content.trim().is_empty()))
+            .count();
+        assert_eq!(non_empty_lines, 8, "两行大字应有 8 行非空盲文点阵行（4 + 4）");
+    }
+
+    #[test]
+    fn test_render_dot_matrix_single_chars_small_height_fallback() {
+        let text = load_builtin_text(BUILTIN_SETS[0]);
+        let session = Session::new(&text.content);
+        let theme = Theme::preset(ThemePreset::CatppuccinMocha);
+        let res = render_dot_matrix_single_chars(
+            &session,
+            &text,
+            theme,
+            false,
+            false,
+            None,
+            70,
+            6, // 宽度仅 70（放不下单行 98），高度仅 6（放不下双行 9），触发回退
+        );
+        assert!(res.is_some(), "极小窗口应安全回退");
+        let text_lines = res.unwrap();
+        let first_char = text.content.chars().next().unwrap().to_string();
+        let contains_first_char = text_lines
+            .lines
+            .iter()
+            .any(|l| l.spans.iter().any(|s| s.content == first_char));
+        assert!(contains_first_char, "回退文本中应包含常规单字字符");
+    }
+
+    #[test]
+    fn test_render_dot_matrix_single_chars_with_code_hint() {
+        let text = load_builtin_text(BuiltinSet::KongmingOneHitChars);
+        let session = Session::new(&text.content);
+        let theme = Theme::preset(ThemePreset::CatppuccinMocha);
+        let res = render_dot_matrix_single_chars(
+            &session,
+            &text,
+            theme,
+            false,
+            true, // 开启提示
+            None,
+            120,
+            20,
+        );
+        assert!(res.is_some());
+        let text_lines = res.unwrap();
+        let has_hint_spans = text_lines.lines.iter().any(|l| {
+            l.spans.iter().any(|s| {
+                let trimmed = s.content.trim();
+                !trimmed.is_empty()
+                    && !trimmed
+                        .chars()
+                        .any(|c| ('\u{2800}'..='\u{28FF}').contains(&c))
+            })
+        });
+        assert!(has_hint_spans, "开启遍码提示时应渲染盲文字符头顶的提示编码");
+    }
+
+    #[test]
+    fn test_render_dot_matrix_single_chars_color_brightness() {
+        let text = load_builtin_text(BUILTIN_SETS[0]);
+        let session = Session::new(&text.content);
+        let theme = Theme::preset(ThemePreset::CatppuccinMocha);
+        let res = render_dot_matrix_single_chars(
+            &session,
+            &text,
+            theme,
+            true, // bold
+            false,
+            None,
+            120,
+            20,
+        );
+        assert!(res.is_some());
+        let text_lines = res.unwrap();
+        let text_color = color(theme.text);
+        let accent_color = color(theme.accent);
+        let has_text_colored_span = text_lines.lines.iter().any(|l| {
+            l.spans.iter().any(|s| s.style.fg == Some(text_color))
+        });
+        let has_accent_colored_span = text_lines.lines.iter().any(|l| {
+            l.spans.iter().any(|s| s.style.fg == Some(accent_color))
+        });
+        assert!(has_text_colored_span, "未打字符应使用明亮的主题前景色 theme.text");
+        assert!(has_accent_colored_span, "当前待打字应使用 theme.accent 高亮");
+    }
+
+    #[test]
+    fn test_render_dot_matrix_typing_single_chars_empty() {
+        let text = load_builtin_text(BUILTIN_SETS[0]);
+        let session = Session::new(&text.content);
+        let theme = Theme::preset(ThemePreset::CatppuccinMocha);
+        let res = render_dot_matrix_typing_single_chars(
+            &session,
+            &text,
+            theme,
+            false,
+            false,
+            15,
+            110,
+            15,
+        );
+        assert!(res.is_some(), "宽屏空跟打区应成功渲染");
+        let (text_lines, (col, line)) = res.unwrap();
+        // 未打字时跟打区不应包含任何盲文字符
+        let has_braille = text_lines.lines.iter().any(|l| {
+            l.spans.iter().any(|s| {
+                s.content
+                    .chars()
+                    .any(|c| ('\u{2801}'..='\u{28FF}').contains(&c))
+            })
+        });
+        assert!(!has_braille, "未打字时跟打区槽位均应为空白");
+        // 单行 10 字居中：single_row_w = 98, left_pad = (110 - 98) / 2 = 6
+        // content_h = 4, top_pad = (15 - 4) / 2 = 5
+        // cursor_col = left_pad = 6, cursor_line = top_pad + 3 = 8
+        assert_eq!(col, 6, "光标应位于第 0 槽位起始列");
+        assert_eq!(line, 8, "光标应位于槽位底行");
+    }
+
+    #[test]
+    fn test_render_dot_matrix_typing_single_chars_correct_and_wrong() {
+        let text = load_builtin_text(BUILTIN_SETS[0]);
+        let mut session = Session::new(&text.content);
+        let theme = Theme::preset(ThemePreset::CatppuccinMocha);
+
+        // 1. 打入 1 个正确字符
+        let first_char = text.content.chars().next().unwrap();
+        session.type_text(&first_char.to_string());
+        let res_correct = render_dot_matrix_typing_single_chars(
+            &session,
+            &text,
+            theme,
+            false,
+            false,
+            15,
+            110,
+            15,
+        );
+        assert!(res_correct.is_some());
+        let (lines_correct, (c_col, c_line)) = res_correct.unwrap();
+        let correct_color = color(theme.correct);
+        let has_green_braille = lines_correct.lines.iter().any(|l| {
+            l.spans.iter().any(|s| {
+                s.style.fg == Some(correct_color)
+                    && s.content.chars().any(|c| ('\u{2801}'..='\u{28FF}').contains(&c))
+            })
+        });
+        assert!(has_green_braille, "打对字符应显示绿色盲文大字");
+        // 打了 1 字后光标应移至第 1 槽位：6 + 10 = 16
+        assert_eq!(c_col, 16, "打 1 字后光标应移至第 1 槽位");
+        assert_eq!(c_line, 8);
+
+        // 2. 打入 1 个错误字符
+        session.backspace();
+        session.type_text("错");
+        let res_wrong = render_dot_matrix_typing_single_chars(
+            &session,
+            &text,
+            theme,
+            false,
+            false,
+            15,
+            110,
+            15,
+        );
+        assert!(res_wrong.is_some());
+        let (lines_wrong, (w_col, w_line)) = res_wrong.unwrap();
+        let wrong_color = color(theme.wrong);
+        let has_red_braille = lines_wrong.lines.iter().any(|l| {
+            l.spans.iter().any(|s| {
+                s.style.fg == Some(wrong_color)
+                    && s.content.chars().any(|c| ('\u{2801}'..='\u{28FF}').contains(&c))
+            })
+        });
+        assert!(has_red_braille, "打错字符应显示红色盲文大字");
+        assert_eq!(w_col, 16, "打错后光标同样移至第 1 槽位");
+        assert_eq!(w_line, 8);
+    }
+
+    #[test]
+    fn test_render_dot_matrix_typing_single_chars_two_rows_cursor_wrap() {
+        let text = load_builtin_text(BUILTIN_SETS[0]);
+        let mut session = Session::new(&text.content);
+        let theme = Theme::preset(ThemePreset::CatppuccinMocha);
+
+        // 70 列宽度：折为两行（5+5 字，每行 48 列）
+        // 打入第 1 行的 5 个字符
+        for c in text.content.chars().take(5) {
+            session.type_text(&c.to_string());
+        }
+        let res = render_dot_matrix_typing_single_chars(
+            &session,
+            &text,
+            theme,
+            false,
+            false,
+            15,
+            70,
+            15,
+        );
+        assert!(res.is_some());
+        let (_lines, (col, line)) = res.unwrap();
+        // row2_w = 48, left_pad = (70 - 48) / 2 = 11
+        // top_pad = (15 - 9) / 2 = 3
+        // 第 5 字打完后进入第 2 行第 0 槽位：
+        // col = left_pad = 11, line = top_pad + 8 = 11
+        assert_eq!(col, 11, "打完 5 字后光标应折行到第 2 行第 0 槽位起始列");
+        assert_eq!(line, 11, "光标应位于第 2 行底行");
+    }
+
+    #[test]
+    fn test_render_dot_matrix_typing_single_chars_small_screen_fallback() {
+        let text = load_builtin_text(BUILTIN_SETS[0]);
+        let session = Session::new(&text.content);
+        let theme = Theme::preset(ThemePreset::CatppuccinMocha);
+        // 高度仅 6，不足以排版 9 行双行大字
+        let res = render_dot_matrix_typing_single_chars(
+            &session,
+            &text,
+            theme,
+            false,
+            false,
+            6,
+            70,
+            6,
+        );
+        assert!(res.is_none(), "高度不足时跟打区应返回 None 触发安全回退");
+    }
+
+    #[test]
+    fn test_ui_cursor_follows_braille_when_sidebar_hidden() {
+        let text = load_builtin_text(BUILTIN_SETS[0]);
+        let mut app = test_app(text);
+        app.sidebar_visible = false;
+        app.settings.reference_ratio = 50;
+        // 80 列，26 行（main 23 行，ref 11 行 inner 9，type 12 行 inner 10）
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 26)).unwrap();
+
+        // 初始第 1 页第 1 字前
+        term.draw(|f| ui(f, &app)).unwrap();
+        let (init_x, init_y): (u16, u16) = term.get_cursor_position().unwrap().into();
+
+        // 打入 1 个字符
+        let first_char = BUILTIN_SETS[0].content().chars().next().unwrap();
+        app.session.type_text(&first_char.to_string());
+        term.draw(|f| ui(f, &app)).unwrap();
+        let (p1_x, p1_y): (u16, u16) = term.get_cursor_position().unwrap().into();
+        // 盲文大字每个槽位占 8 列 + 2 列间隔 = 10 列
+        assert_eq!(
+            (p1_x, p1_y),
+            (init_x + 10, init_y),
+            "跟打区盲文大字打入 1 字后光标应前进 10 列"
+        );
+
+        // 验证缓冲区中确实渲染了盲文字符
+        let buf = term.backend().buffer();
+        let has_braille = (0..buf.area.height).any(|y| {
+            (0..buf.area.width).any(|x| {
+                let sym = buf[(x, y)].symbol();
+                sym.chars().any(|c| ('\u{2801}'..='\u{28FF}').contains(&c))
+            })
+        });
+        assert!(has_braille, "UI 跟打区应渲染 Unicode 盲文大字");
+    }
+}
+
 
 
