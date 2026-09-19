@@ -129,6 +129,17 @@ pub fn default_token_path() -> PathBuf {
     dazitui_config_dir().join("token")
 }
 
+/// 默认虎码杯凭据文件路径（~/.config/dazitui/tokens/tigercup.json）。
+pub fn default_tigercup_token_path() -> PathBuf {
+    dazitui_config_dir().join("tokens").join("tigercup.json")
+}
+
+/// 默认虎码杯当日草稿暂存文件路径（~/.local/share/dazitui/tigercup_draft.json）。
+pub fn default_tigercup_draft_path() -> PathBuf {
+    dazitui_data_dir().join("tigercup_draft.json")
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;

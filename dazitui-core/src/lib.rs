@@ -48,6 +48,13 @@ pub use online::protocol::{ProtocolError, build_request, decrypt, encrypt, parse
 pub use online::share::{UploadStats, build_upload_payload, osc52_clipboard, to_upload_stats};
 #[cfg(feature = "online")]
 pub use online::token::{AuthSession, TokenStore};
+#[cfg(feature = "online")]
+pub use online::tigercup::{
+    TIGER_BASE_URL, TigerCredentials, TigerCupClient, TigerDraft, TigerDraftStore,
+    TigerLeaderboardEntry, TigerLoginResult, TigerScorePayload, TigerTokenStore,
+    TigerUploadResponse, build_tiger_payload, format_tiger_share_text,
+    parse_tiger_article_response, parse_tiger_leaderboard_response,
+};
 
 /// 赛文：练习/比赛用的文字内容，来自本地文件或 52dazi.cn。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,6 +116,8 @@ pub enum TextSource {
     Builtin { set: BuiltinSet },
     /// 52dazi.cn 在线赛文。
     Online { competition_type: CompetitionType },
+    /// 虎码杯（race.tiger-code.com）在线赛文。
+    TigerCup,
 }
 
 impl TextSource {
@@ -375,9 +384,9 @@ impl CompetitionType {
 }
 
 impl Text {
-    /// 是否在线赛文（来自 52dazi.cn）。在线赛文跟打时禁用重打。
+    /// 是否在线赛文（来自 52dazi.cn 或 虎码杯）。在线赛文跟打时禁用重打。
     pub fn is_online(&self) -> bool {
-        matches!(self.source, TextSource::Online { .. })
+        matches!(self.source, TextSource::Online { .. } | TextSource::TigerCup)
     }
 }
 
@@ -614,6 +623,7 @@ pub fn format_stats_share_text(
         TextSource::Clipboard => "剪贴板",
         TextSource::Builtin { set } => set.name(),
         TextSource::Online { competition_type } => competition_type.name(),
+        TextSource::TigerCup => "虎码杯",
     };
     let rank_part = rank.map(|r| format!(" 第{r}名")).unwrap_or_default();
     let total_chars = text.content.chars().count();
