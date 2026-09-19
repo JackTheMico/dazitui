@@ -718,10 +718,10 @@ pub struct Settings {
     pub builtin_progress: HashMap<String, BuiltinProgress>,
     /// 在线排行榜各列显隐配置（v2：可定制展示哪些列，默认全显）。
     pub rank_columns: RankColumnConfig,
-    /// 单字练习目标击键（KPS，0.0 表示关闭门槛）。
+    /// 单字练习目标击键（KPS，0.0 表示关闭门槛），最多 1 位小数（ADR 0015）。
     pub target_kps: f64,
-    /// 单字练习目标速度（WPM，0 表示关闭门槛）。
-    pub target_wpm: u16,
+    /// 单字练习目标速度（WPM，0.0 表示关闭门槛），最多 1 位小数（ADR 0015）。
+    pub target_wpm: f64,
     /// 单字练习未达标乱序重打开关（issue #108/#109，默认关闭）。
     pub retry_shuffle: bool,
 }
@@ -744,9 +744,59 @@ impl Settings {
     /// 单字练习常用目标击键（KPS）预设档位（0.0 表示关闭门槛）。
     pub const TARGET_KPS_PRESETS: &'static [f64] =
         &[0.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 12.0, 15.0];
-    /// 单字练习常用目标速度（WPM）预设档位（0 表示关闭门槛）。
-    pub const TARGET_WPM_PRESETS: &'static [u16] =
-        &[0, 40, 50, 60, 70, 80, 90, 100, 120, 140, 160, 180, 200];
+    /// 单字练习常用目标速度（WPM）预设档位（0.0 表示关闭门槛）。
+    pub const TARGET_WPM_PRESETS: &'static [f64] = &[
+        0.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 100.0, 120.0, 140.0, 160.0, 180.0, 200.0,
+    ];
+    /// 单字练习目标击键（KPS）的合法上限。
+    pub const TARGET_KPS_MAX: f64 = 30.0;
+    /// 单字练习目标速度（WPM）的合法上限。
+    pub const TARGET_WPM_MAX: f64 = 500.0;
+    /// 单字练习目标门槛保留的小数位数（ADR 0015：最多 1 位，提交即量化）。
+    pub const TARGET_DECIMALS: i32 = 1;
+
+    /// 量化并钳制目标门槛到 `[0, max]`（ADR 0015）。
+    ///
+    /// 先按 [`Self::TARGET_DECIMALS`] 位小数四舍五入，再钳制到边界；`0` 表示关闭门槛。
+    /// 非有限值（NaN / Inf）归零，负零归一为 `0` 以避免写入配置时出现 `-0`。
+    pub fn clamp_target(value: f64, max: f64) -> f64 {
+        if !value.is_finite() {
+            return 0.0;
+        }
+        let factor = 10f64.powi(Self::TARGET_DECIMALS);
+        let rounded = (value * factor).round() / factor;
+        if rounded == 0.0 {
+            0.0
+        } else {
+            rounded.clamp(0.0, max)
+        }
+    }
+
+    /// 解析用户输入的目标门槛（ADR 0015 D4）。
+    ///
+    /// 返回 `None` 表示输入不是合法数值（空串 / 含非数字字符 / 非有限值），
+    /// 调用方应**保持原值不变**；可解析但越界时按 [`Self::clamp_target`] 钳制到边界。
+    pub fn parse_target(input: &str, max: f64) -> Option<f64> {
+        let value = input.trim().parse::<f64>().ok()?;
+        if !value.is_finite() {
+            return None;
+        }
+        Some(Self::clamp_target(value, max))
+    }
+
+    /// 目标击键的显示文案（恒 1 位小数，避免宽度跳动）。
+    pub fn format_target_kps(kps: f64) -> String {
+        format!("{:.1}", kps)
+    }
+
+    /// 目标速度的显示文案：整数省去小数，含小数时保留 1 位。
+    pub fn format_target_wpm(wpm: f64) -> String {
+        if (wpm - wpm.round()).abs() < 0.05 {
+            format!("{:.0}", wpm)
+        } else {
+            format!("{:.1}", wpm)
+        }
+    }
 
     /// 校验并修正占比到合法范围。
     pub fn clamp_ratio(ratio: u8) -> u8 {
@@ -795,9 +845,9 @@ impl Settings {
     }
 
     /// 循环获取下一个预设目标速度（WPM）档位。
-    pub fn next_target_wpm_preset(current: u16) -> u16 {
+    pub fn next_target_wpm_preset(current: f64) -> f64 {
         for &preset in Self::TARGET_WPM_PRESETS {
-            if preset > current {
+            if preset > current + 0.05 {
                 return preset;
             }
         }
@@ -805,13 +855,13 @@ impl Settings {
     }
 
     /// 循环获取上一个预设目标速度（WPM）档位。
-    pub fn prev_target_wpm_preset(current: u16) -> u16 {
+    pub fn prev_target_wpm_preset(current: f64) -> f64 {
         for &preset in Self::TARGET_WPM_PRESETS.iter().rev() {
-            if preset < current {
+            if preset + 0.05 < current {
                 return preset;
             }
         }
-        *Self::TARGET_WPM_PRESETS.last().unwrap_or(&0)
+        *Self::TARGET_WPM_PRESETS.last().unwrap_or(&0.0)
     }
 }
 
@@ -832,7 +882,7 @@ impl Default for Settings {
             builtin_progress: HashMap::new(),
             rank_columns: RankColumnConfig::default(),
             target_kps: 0.0,
-            target_wpm: 0,
+            target_wpm: 0.0,
             retry_shuffle: false,
         }
     }
@@ -1001,17 +1051,17 @@ impl SettingsStore {
                     }
                 }
                 "target_kps" => {
-                    if let Ok(v) = value.parse::<f64>() {
-                        if (0.0..=30.0).contains(&v) {
-                            settings.target_kps = v;
-                        }
+                    if let Ok(v) = value.parse::<f64>()
+                        && (0.0..=Settings::TARGET_KPS_MAX).contains(&v)
+                    {
+                        settings.target_kps = Settings::clamp_target(v, Settings::TARGET_KPS_MAX);
                     }
                 }
                 "target_wpm" => {
-                    if let Ok(v) = value.parse::<u16>() {
-                        if v <= 500 {
-                            settings.target_wpm = v;
-                        }
+                    if let Ok(v) = value.parse::<f64>()
+                        && (0.0..=Settings::TARGET_WPM_MAX).contains(&v)
+                    {
+                        settings.target_wpm = Settings::clamp_target(v, Settings::TARGET_WPM_MAX);
                     }
                 }
                 "retry_shuffle" => {
@@ -1237,7 +1287,7 @@ mod tests {
             builtin_progress: HashMap::new(),
             rank_columns: RankColumnConfig::default(),
             target_kps: 0.0,
-            target_wpm: 0,
+            target_wpm: 0.0,
             retry_shuffle: false,
         };
         store.save(&s).unwrap();
@@ -1697,11 +1747,87 @@ mod tests {
         assert_eq!(Settings::prev_target_kps_preset(0.0), 15.0);
         assert_eq!(Settings::prev_target_kps_preset(3.0), 0.0);
 
-        assert_eq!(Settings::next_target_wpm_preset(0), 40);
-        assert_eq!(Settings::next_target_wpm_preset(40), 50);
-        assert_eq!(Settings::next_target_wpm_preset(200), 0);
-        assert_eq!(Settings::prev_target_wpm_preset(0), 200);
-        assert_eq!(Settings::prev_target_wpm_preset(40), 0);
+        assert_eq!(Settings::next_target_wpm_preset(0.0), 40.0);
+        assert_eq!(Settings::next_target_wpm_preset(40.0), 50.0);
+        assert_eq!(Settings::next_target_wpm_preset(200.0), 0.0);
+        assert_eq!(Settings::prev_target_wpm_preset(0.0), 200.0);
+        assert_eq!(Settings::prev_target_wpm_preset(40.0), 0.0);
+
+        // 非档位自由值按「就近跳档」处理（ADR 0015 D2：←/→ 仍走预设粗调）。
+        assert_eq!(Settings::next_target_kps_preset(4.3), 5.0);
+        assert_eq!(Settings::prev_target_kps_preset(4.3), 4.0);
+        assert_eq!(Settings::next_target_wpm_preset(115.5), 120.0);
+        assert_eq!(Settings::prev_target_wpm_preset(115.5), 100.0);
+    }
+
+    #[test]
+    fn target_value_quantizes_and_clamps() {
+        // 量化到 1 位小数
+        assert_eq!(Settings::clamp_target(4.26, Settings::TARGET_KPS_MAX), 4.3);
+        assert_eq!(Settings::clamp_target(4.24, Settings::TARGET_KPS_MAX), 4.2);
+        assert_eq!(
+            Settings::clamp_target(115.56, Settings::TARGET_WPM_MAX),
+            115.6
+        );
+        // 越界钳制到边界
+        assert_eq!(Settings::clamp_target(35.0, Settings::TARGET_KPS_MAX), 30.0);
+        assert_eq!(Settings::clamp_target(-1.0, Settings::TARGET_KPS_MAX), 0.0);
+        assert_eq!(Settings::clamp_target(999.0, Settings::TARGET_WPM_MAX), 500.0);
+        // 非有限值归零，负零归一（避免写入 "-0"）
+        assert_eq!(Settings::clamp_target(f64::NAN, Settings::TARGET_KPS_MAX), 0.0);
+        assert_eq!(
+            Settings::clamp_target(f64::INFINITY, Settings::TARGET_KPS_MAX),
+            0.0
+        );
+        assert_eq!(Settings::clamp_target(-0.0, Settings::TARGET_KPS_MAX), 0.0);
+    }
+
+    #[test]
+    fn parse_target_distinguishes_invalid_from_out_of_range() {
+        // 合法值：解析并量化
+        assert_eq!(
+            Settings::parse_target("4.3", Settings::TARGET_KPS_MAX),
+            Some(4.3)
+        );
+        assert_eq!(
+            Settings::parse_target(" 115.5 ", Settings::TARGET_WPM_MAX),
+            Some(115.5)
+        );
+        // 越界：钳制而非拒绝
+        assert_eq!(
+            Settings::parse_target("35", Settings::TARGET_KPS_MAX),
+            Some(30.0)
+        );
+        assert_eq!(
+            Settings::parse_target("-3", Settings::TARGET_KPS_MAX),
+            Some(0.0)
+        );
+        // 非数字：None（调用方保持原值）
+        assert_eq!(Settings::parse_target("", Settings::TARGET_KPS_MAX), None);
+        assert_eq!(
+            Settings::parse_target("abc", Settings::TARGET_KPS_MAX),
+            None
+        );
+        assert_eq!(Settings::parse_target("4.3abc", Settings::TARGET_KPS_MAX), None);
+        assert_eq!(
+            Settings::parse_target("nan", Settings::TARGET_KPS_MAX),
+            None
+        );
+        assert_eq!(
+            Settings::parse_target("inf", Settings::TARGET_KPS_MAX),
+            None
+        );
+    }
+
+    #[test]
+    fn target_display_keeps_kps_fixed_and_wpm_lean() {
+        // 击键恒 1 位，宽度稳定
+        assert_eq!(Settings::format_target_kps(4.0), "4.0");
+        assert_eq!(Settings::format_target_kps(4.3), "4.3");
+        // 速度整数省小数，含小数保留 1 位
+        assert_eq!(Settings::format_target_wpm(0.0), "0");
+        assert_eq!(Settings::format_target_wpm(100.0), "100");
+        assert_eq!(Settings::format_target_wpm(115.5), "115.5");
     }
 
     #[test]
@@ -1709,21 +1835,63 @@ mod tests {
         let store = SettingsStore::new(temp_path("target_roundtrip"));
         let mut s = Settings::default();
         s.target_kps = 6.0;
-        s.target_wpm = 60;
+        s.target_wpm = 60.0;
         store.save(&s).unwrap();
         let loaded = store.load();
         assert!((loaded.target_kps - 6.0).abs() < 0.001);
-        assert_eq!(loaded.target_wpm, 60);
+        assert!((loaded.target_wpm - 60.0).abs() < 0.001);
 
-        // 缺省时默认 0.0 / 0
+        // 缺省时默认 0.0 / 0.0
         let store_old = SettingsStore::new(temp_path("target_absent"));
         std::fs::write(store_old.path(), "theme=catppuccin-mocha\n").unwrap();
         let loaded_old = store_old.load();
         assert_eq!(loaded_old.target_kps, 0.0);
-        assert_eq!(loaded_old.target_wpm, 0);
+        assert_eq!(loaded_old.target_wpm, 0.0);
 
         let _ = std::fs::remove_file(store.path());
         let _ = std::fs::remove_file(store_old.path());
+    }
+
+    #[test]
+    fn target_wpm_fractional_roundtrips_through_store() {
+        // ADR 0015：目标速度支持小数（如 115.5），往返不丢精度。
+        let store = SettingsStore::new(temp_path("target_wpm_fractional"));
+        let mut s = Settings::default();
+        s.target_kps = 4.3;
+        s.target_wpm = 115.5;
+        store.save(&s).unwrap();
+        let loaded = store.load();
+        assert!((loaded.target_kps - 4.3).abs() < 0.001);
+        assert!((loaded.target_wpm - 115.5).abs() < 0.001);
+
+        // 整数速度写回文件时形如 "100"，旧版程序仍可 parse::<u16>() 成功——
+        // 只有真小数才会触发静默降级（ADR 0015 D6）。
+        let mut s_int = Settings::default();
+        s_int.target_wpm = 100.0;
+        store.save(&s_int).unwrap();
+        let raw = std::fs::read_to_string(store.path()).unwrap();
+        assert!(
+            raw.contains("target_wpm=100\n"),
+            "整数速度应写为无小数点的文本，实际: {raw}"
+        );
+
+        let _ = std::fs::remove_file(store.path());
+    }
+
+    #[test]
+    fn stored_target_beyond_range_falls_back_to_default() {
+        // 文件里越界/非数值时保持默认 0.0（与改动前的 kps 分支语义一致）。
+        let store = SettingsStore::new(temp_path("target_out_of_range"));
+        std::fs::write(
+            store.path(),
+            "target_kps=99\ntarget_wpm=9999\ntarget_wpm_x=abc\n",
+        )
+        .unwrap();
+        let loaded = store.load();
+        assert_eq!(loaded.target_kps, 0.0);
+        assert_eq!(loaded.target_wpm, 0.0);
+
+        let _ = std::fs::remove_file(store.path());
     }
 
     #[test]

@@ -344,7 +344,7 @@ fn test_tiger_sentence_keystroke_and_strokes_statistics() {
         // 验证 100 WPM (600ms/字) 下能正常通过 4.0 击键放行门槛
         let text1 = "的一是了不在有个人这";
         let mut session = dazitui_core::Session::new_gated_with_words_and_size(text1, true, &[], 10);
-        session.set_targets(4.0, 0);
+        session.set_targets(4.0, 0.0);
         let mut elapsed = std::time::Duration::from_millis(500);
         for c in text1.chars() {
             let (s, _) = dict_schema.resolve_strokes_and_keys(&c.to_string());
@@ -365,7 +365,7 @@ fn test_tiger_sentence_keystroke_and_strokes_statistics() {
 
         let text11 = "左块索酒值态按陈河巴";
         let mut session = dazitui_core::Session::new_gated_with_words_and_size(text11, true, &[], 10);
-        session.set_targets(4.0, 0);
+        session.set_targets(4.0, 0.0);
         let mut elapsed = std::time::Duration::from_millis(500);
         for c in text11.chars() {
             let (s, _) = dict_codes.resolve_strokes_and_keys(&c.to_string());

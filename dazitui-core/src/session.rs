@@ -3,6 +3,8 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use crate::settings::Settings;
+
 /// 单个字符的比对状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CharStatus {
@@ -149,8 +151,8 @@ fn is_punctuation(c: char) -> bool {
 pub struct TargetFailure {
     /// 实际单组速度（WPM）。
     pub actual_wpm: f64,
-    /// 目标速度（WPM，0 表示不设限）。
-    pub target_wpm: u16,
+    /// 目标速度（WPM，0.0 表示不设限），最多 1 位小数（ADR 0015）。
+    pub target_wpm: f64,
     /// 实际单组击键（KPS）。
     pub actual_kps: f64,
     /// 目标击键（KPS，0.0 表示不设限）。
@@ -167,13 +169,11 @@ impl TargetFailure {
     /// 格式化未达标提示文案（展示失败原因与重置状态）。
     pub fn format_notice(&self) -> String {
         let has_kps = self.target_kps > 0.0;
-        let has_wpm = self.target_wpm > 0;
+        let has_wpm = self.target_wpm > 0.0;
         let speed_passed = match (has_kps, has_wpm) {
-            (true, true) => {
-                self.actual_kps >= self.target_kps || self.actual_wpm >= self.target_wpm as f64
-            }
+            (true, true) => self.actual_kps >= self.target_kps || self.actual_wpm >= self.target_wpm,
             (true, false) => self.actual_kps >= self.target_kps,
-            (false, true) => self.actual_wpm >= self.target_wpm as f64,
+            (false, true) => self.actual_wpm >= self.target_wpm,
             (false, false) => true,
         };
         let has_err = self.has_edits || self.has_mismatches;
@@ -189,10 +189,18 @@ impl TargetFailure {
         }
         if !speed_passed {
             if has_wpm {
-                parts.push(format!("速度: {:.0}/{} WPM", self.actual_wpm, self.target_wpm));
+                parts.push(format!(
+                    "速度: {}/{} WPM",
+                    Settings::format_target_wpm(self.actual_wpm),
+                    Settings::format_target_wpm(self.target_wpm)
+                ));
             }
             if has_kps {
-                parts.push(format!("击键: {:.1}/{:.1}", self.actual_kps, self.target_kps));
+                parts.push(format!(
+                    "击键: {}/{}",
+                    Settings::format_target_kps(self.actual_kps),
+                    Settings::format_target_kps(self.target_kps)
+                ));
             }
         }
 
@@ -238,7 +246,7 @@ pub struct Session {
     events: Vec<TypingEvent>,
     group_size: usize,
     target_kps: f64,
-    target_wpm: u16,
+    target_wpm: f64,
     target_gated: bool,
     group_start_elapsed: Option<Duration>,
     group_snapshot: Option<GroupSnapshot>,
@@ -302,7 +310,7 @@ impl Session {
             events: Vec::new(),
             group_size,
             target_kps: 0.0,
-            target_wpm: 0,
+            target_wpm: 0.0,
             target_gated: false,
             group_start_elapsed: None,
             group_snapshot: None,
@@ -317,10 +325,10 @@ impl Session {
         self.total_strokes
     }
 
-    /// 设置单字练习目标门槛（目标击键 KPS 与目标速度 WPM）。
-    pub fn set_targets(&mut self, target_kps: f64, target_wpm: u16) {
+    /// 设置单字练习目标门槛（目标击键 KPS 与目标速度 WPM，均支持 1 位小数，ADR 0015）。
+    pub fn set_targets(&mut self, target_kps: f64, target_wpm: f64) {
         self.target_kps = target_kps.max(0.0);
-        self.target_wpm = target_wpm;
+        self.target_wpm = target_wpm.max(0.0);
         self.target_gated = true;
     }
 
@@ -330,13 +338,13 @@ impl Session {
     }
 
     /// 获取当前目标速度设置。
-    pub fn target_wpm(&self) -> u16 {
+    pub fn target_wpm(&self) -> f64 {
         self.target_wpm
     }
 
     /// 是否开启了目标门槛且至少有一项设定值 > 0。
     pub fn is_target_gated(&self) -> bool {
-        self.target_gated && (self.target_kps > 0.0 || self.target_wpm > 0)
+        self.target_gated && (self.target_kps > 0.0 || self.target_wpm > 0.0)
     }
 
     /// 提取并清空最近一次目标未达标信息。
@@ -442,11 +450,11 @@ impl Session {
         };
 
         let has_kps = self.target_gated && self.target_kps > 0.0;
-        let has_wpm = self.target_gated && self.target_wpm > 0;
+        let has_wpm = self.target_gated && self.target_wpm > 0.0;
         let speed_passed = match (has_kps, has_wpm) {
-            (true, true) => group_kps >= self.target_kps || group_wpm >= self.target_wpm as f64,
+            (true, true) => group_kps >= self.target_kps || group_wpm >= self.target_wpm,
             (true, false) => group_kps >= self.target_kps,
-            (false, true) => group_wpm >= self.target_wpm as f64,
+            (false, true) => group_wpm >= self.target_wpm,
             (false, false) => true,
         };
 
@@ -485,7 +493,7 @@ impl Session {
         let is_single_char = self.group_bounds.is_empty();
         if accept_len > 0
             && self.group_gated
-            && ((self.target_gated && (self.target_kps > 0.0 || self.target_wpm > 0))
+            && ((self.target_gated && (self.target_kps > 0.0 || self.target_wpm > 0.0))
                 || (self.retry_shuffle && is_single_char))
             && self.group_start_elapsed.is_none()
         {
@@ -558,7 +566,7 @@ impl Session {
                     } else {
                         self.last_target_failure = Some(TargetFailure {
                             actual_wpm: group_wpm,
-                            target_wpm: if self.target_gated { self.target_wpm } else { 0 },
+                            target_wpm: if self.target_gated { self.target_wpm } else { 0.0 },
                             actual_kps: group_kps,
                             target_kps: if self.target_gated { self.target_kps } else { 0.0 },
                             has_edits,
@@ -569,7 +577,7 @@ impl Session {
                         self.shuffle_group(group_start, group_end);
                     }
                 } else if all_correct {
-                    if self.target_gated && (self.target_kps > 0.0 || self.target_wpm > 0) {
+                    if self.target_gated && (self.target_kps > 0.0 || self.target_wpm > 0.0) {
                         let (group_wpm, group_kps, passed) =
                             self.calculate_group_metrics(group_start, group_end, elapsed);
 
@@ -1563,7 +1571,7 @@ mod tests {
         let text = "一二三四五六七八九十";
         // 目标：6.0 KPS 或 60 WPM
         let mut session = Session::new_gated_with_words_and_size(text, true, &[], 10);
-        session.set_targets(6.0, 60);
+        session.set_targets(6.0, 60.0);
         assert!(session.is_target_gated());
 
         // 模拟 10 个字用时 5 秒打完，总击数 35 次：
@@ -1582,7 +1590,7 @@ mod tests {
         let text = "一二三四五六七八九十";
         // 目标：8.0 KPS 或 100 WPM
         let mut session = Session::new_gated_with_words_and_size(text, true, &[], 10);
-        session.set_targets(8.0, 100);
+        session.set_targets(8.0, 100.0);
 
         // 两次输入在 10s 和 20s 发生，组跨度为 20s - 10s = 10s：
         // KPS = 10 / 10 = 1.0 (< 8.0)
@@ -1596,7 +1604,7 @@ mod tests {
         assert_eq!(session.total_strokes(), 0, "击数应回滚剥离");
 
         let failure = session.take_target_failure().expect("应记录未达标信息");
-        assert_eq!(failure.target_wpm, 100);
+        assert_eq!(failure.target_wpm, 100.0);
         assert_eq!(failure.target_kps, 8.0);
         assert!((failure.actual_wpm - 60.0).abs() < 1.0);
         assert!((failure.actual_kps - 1.0).abs() < 0.1);
@@ -1617,7 +1625,7 @@ mod tests {
         let text = "一二三四五六七八九十";
         // 目标：苛刻的 15.0 KPS 或 宽松的 30 WPM
         let mut session = Session::new_gated_with_words_and_size(text, true, &[], 10);
-        session.set_targets(15.0, 30);
+        session.set_targets(15.0, 30.0);
 
         // 用时 10 秒打完，10 击：
         // KPS = 1.0 (< 15.0，未达成)
@@ -1635,7 +1643,7 @@ mod tests {
         let text = "一二三四五六七八九十";
         let mut session = Session::new_gated_with_words_and_size(text, true, &[], 10);
         // 用户仅配置目标击键 8.0，目标速度为 0（关）
-        session.set_targets(8.0, 0);
+        session.set_targets(8.0, 0.0);
 
         // 用时 10 秒打完 10 个字（第一字 0s，后续 10s），实际击键 1.0 < 8.0，实际速度 60 WPM
         session.type_text_with_strokes_at("一", 1, Duration::ZERO);
@@ -1651,7 +1659,7 @@ mod tests {
         let text = "一二三四五六七八九十";
         let mut session = Session::new_gated_with_words_and_size(text, true, &[], 10);
         // 用户仅配置目标速度 120 WPM，目标击键为 0.0（关）
-        session.set_targets(0.0, 120);
+        session.set_targets(0.0, 120.0);
 
         // 用时 10 秒打完 10 个字，实际速度 60 WPM < 120 WPM
         session.type_text_with_strokes_at("一", 1, Duration::ZERO);
@@ -1666,7 +1674,7 @@ mod tests {
     fn repro_single_batch_commit_should_not_fabricate_speed() {
         let text = "一二三四五六七八九十";
         let mut session = Session::new_gated_with_words_and_size(text, true, &[], 10);
-        session.set_targets(8.0, 100);
+        session.set_targets(8.0, 100.0);
 
         // 一次性打完/提交 10 个字，耗时为 0 时绝不能虚构 600,000 WPM 放行！
         session.type_text_with_strokes_at("一二三四五六七八九十", 10, Duration::from_secs(5));
@@ -1716,7 +1724,7 @@ mod tests {
     fn test_backspace_to_group_start_resets_target_gating_timer() {
         let text = "一二三四五六七八九十";
         let mut session = Session::new_gated_with_words_and_size(text, true, &[], 10);
-        session.set_targets(8.0, 100);
+        session.set_targets(8.0, 100.0);
 
         // 用户在 t = 10s 打错 2 字（6 击）
         session.type_text_with_strokes_at("一一", 6, Duration::from_secs(10));
@@ -1744,10 +1752,32 @@ mod tests {
     }
 
     #[test]
+    fn fractional_wpm_target_gates_at_its_exact_value() {
+        // ADR 0015：目标速度支持小数后，判定按原值比较，不得先取整。
+        // 10 字 / 5.2s => 实际 115.3846 WPM，恰好落在 115.0 与 115.5 之间。
+        let text = "一二三四五六七八九十";
+        let run = |target_wpm: f64| {
+            let mut session = Session::new_gated_with_words_and_size(text, true, &[], 10);
+            session.set_targets(0.0, target_wpm);
+            session.type_text_with_strokes_at("一", 1, Duration::ZERO);
+            session.type_text_with_strokes_at("二三四五六七八九十", 9, Duration::from_millis(5200));
+            session
+        };
+
+        let mut passed = run(115.0);
+        assert_eq!(passed.completed_groups(), 1, "115.3846 WPM 应达标 115.0");
+        assert!(passed.take_target_failure().is_none());
+
+        let mut failed = run(115.5);
+        assert_eq!(failed.completed_groups(), 0, "115.3846 WPM 不应达标 115.5");
+        assert!(failed.take_target_failure().is_some());
+    }
+
+    #[test]
     fn test_target_failure_notice_wording() {
         let failure = TargetFailure {
             actual_wpm: 60.0,
-            target_wpm: 100,
+            target_wpm: 100.0,
             actual_kps: 2.4,
             target_kps: 4.0,
             has_edits: false,
@@ -1760,10 +1790,50 @@ mod tests {
     }
 
     #[test]
+    fn target_failure_notice_keeps_display_consistent_with_gate() {
+        // ADR 0015 D5：未达标提示中实际值与目标值同规渲染，
+        // 避免出现「显示 115 却判定未达 115.5」这类自相矛盾的文案。
+        let failure = TargetFailure {
+            actual_wpm: 115.4,
+            target_wpm: 115.5,
+            actual_kps: 4.2,
+            target_kps: 4.3,
+            has_edits: false,
+            has_mismatches: false,
+            shuffled: false,
+        };
+        let notice = failure.format_notice();
+        assert!(
+            notice.contains("速度: 115.4/115.5 WPM"),
+            "小数速度应原值渲染，实际: {notice}"
+        );
+        assert!(
+            notice.contains("击键: 4.2/4.3"),
+            "击键恒 1 位小数，实际: {notice}"
+        );
+
+        // 整数目标速度省去小数位
+        let integral = TargetFailure {
+            actual_wpm: 45.0,
+            target_wpm: 100.0,
+            actual_kps: 0.0,
+            target_kps: 0.0,
+            has_edits: false,
+            has_mismatches: false,
+            shuffled: false,
+        };
+        assert!(
+            integral.format_notice().contains("速度: 45/100 WPM"),
+            "整数速度不带小数，实际: {}",
+            integral.format_notice()
+        );
+    }
+
+    #[test]
     fn test_retry_shuffle_on_speed_failure() {
         let text = "一二三四五六七八九十";
         let mut session = Session::new_gated(text, true);
-        session.set_targets(0.0, 100);
+        session.set_targets(0.0, 100.0);
         session.set_retry_shuffle(true);
         assert!(session.is_retry_shuffle());
 
@@ -1791,7 +1861,7 @@ mod tests {
     fn test_retry_shuffle_false_preserves_order_on_failure() {
         let text = "一二三四五六七八九十";
         let mut session = Session::new_gated(text, true);
-        session.set_targets(0.0, 100);
+        session.set_targets(0.0, 100.0);
         session.set_retry_shuffle(false);
         assert!(!session.is_retry_shuffle());
 
@@ -1808,7 +1878,7 @@ mod tests {
         let text = "一二三四五六七八九十";
         let mut session = Session::new_gated(text, true);
         // 不设速度与击键门槛（均为 0）
-        session.set_targets(0.0, 0);
+        session.set_targets(0.0, 0.0);
         session.set_retry_shuffle(true);
 
         // 先敲入 "一二"，再回改删除 "二"（产生回改），再打完本组
@@ -1833,7 +1903,7 @@ mod tests {
     fn test_retry_shuffle_passes_clean_run_without_targets() {
         let text = "一二三四五六七八九十";
         let mut session = Session::new_gated(text, true);
-        session.set_targets(0.0, 0);
+        session.set_targets(0.0, 0.0);
         session.set_retry_shuffle(true);
 
         // 零错字零回改一次性打完
@@ -1848,7 +1918,7 @@ mod tests {
     fn test_retry_shuffle_fails_on_uncorrected_mismatch_at_group_end() {
         let text = "一二三四五六七八九十";
         let mut session = Session::new_gated(text, true);
-        session.set_targets(0.0, 0);
+        session.set_targets(0.0, 0.0);
         session.set_retry_shuffle(true);
 
         // 前 9 个对，第 10 个打错为 "错"
@@ -1868,7 +1938,7 @@ mod tests {
     fn test_retry_shuffle_consecutive_failures_reshuffles_each_time() {
         let text = "一二三四五六七八九十";
         let mut session = Session::new_gated(text, true);
-        session.set_targets(0.0, 100);
+        session.set_targets(0.0, 100.0);
         session.set_retry_shuffle(true);
 
         // 第 1 次慢速打完触发未达标

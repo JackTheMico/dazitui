@@ -1198,6 +1198,10 @@ enum LoginAction {
 enum TextSettingTarget {
     Scheme,
     InputMethod,
+    /// 单字目标击键（KPS，ADR 0015）。
+    TargetKps,
+    /// 单字目标速度（WPM，ADR 0015）。
+    TargetWpm,
 }
 
 /// 文本设置模态框按键动作。
@@ -1208,7 +1212,7 @@ enum TextSettingModalAction {
     Cancel,
 }
 
-/// 自定义设置文本弹窗状态（用于反查方案路径与输入法名称）。
+/// 自定义设置文本弹窗状态（用于反查方案路径、输入法名称与单字目标门槛）。
 #[derive(Debug)]
 struct TextSettingModal {
     target: TextSettingTarget,
@@ -1218,10 +1222,13 @@ struct TextSettingModal {
 
 impl TextSettingModal {
     /// 新建弹窗，预填当前自定义值（若为「无」或预设，则置空）。
+    ///
+    /// 单字目标门槛（ADR 0015）预填当前数值文本，便于在原值上微调。
     fn new(target: TextSettingTarget, current: &str) -> Self {
         let is_preset = match target {
             TextSettingTarget::Scheme => current == SCHEME_CUSTOM,
             TextSettingTarget::InputMethod => current == INPUT_METHOD_CUSTOM,
+            TextSettingTarget::TargetKps | TextSettingTarget::TargetWpm => false,
         };
         let prefill = if is_preset {
             String::new()
@@ -1239,6 +1246,8 @@ impl TextSettingModal {
         match self.target {
             TextSettingTarget::Scheme => 128,
             TextSettingTarget::InputMethod => Settings::INPUT_METHOD_MAX_CHARS,
+            // 目标门槛最长形如 `500.0`，留出余量即可。
+            TextSettingTarget::TargetKps | TextSettingTarget::TargetWpm => 8,
         }
     }
 
@@ -1260,6 +1269,10 @@ impl TextSettingModal {
         match self.target {
             TextSettingTarget::Scheme => self.input.trim().to_string(),
             TextSettingTarget::InputMethod => Settings::clamp_input_method(&self.input),
+            // 数值门槛原样提交，由 App 层按 `Settings::parse_target` 解析（ADR 0015 D4）。
+            TextSettingTarget::TargetKps | TextSettingTarget::TargetWpm => {
+                self.input.trim().to_string()
+            }
         }
     }
 }
@@ -2399,9 +2412,7 @@ impl App {
         self.settings.target_kps = Settings::next_target_kps_preset(self.settings.target_kps);
         let _ = self.settings_store.save(&self.settings);
         self.refresh_builtin_preview();
-        if let TextSource::Builtin { set } = self.text.source && !set.is_words() {
-            self.session.set_targets(self.settings.target_kps, self.settings.target_wpm);
-        }
+        self.sync_targets_to_session();
     }
 
     /// 循环切换单字目标速度（WPM）档位并即时持久化。
@@ -2409,9 +2420,52 @@ impl App {
         self.settings.target_wpm = Settings::next_target_wpm_preset(self.settings.target_wpm);
         let _ = self.settings_store.save(&self.settings);
         self.refresh_builtin_preview();
+        self.sync_targets_to_session();
+    }
+
+    /// 把设置中的单字目标门槛同步到当前会话（仅内置单字赛文生效）。
+    fn sync_targets_to_session(&mut self) {
         if let TextSource::Builtin { set } = self.text.source && !set.is_words() {
             self.session.set_targets(self.settings.target_kps, self.settings.target_wpm);
         }
+    }
+
+    /// 打开单字目标击键（KPS）数值输入弹窗（ADR 0015 D2/D3）。
+    fn open_target_kps_modal(&mut self) {
+        self.text_setting_modal = Some(TextSettingModal::new(
+            TextSettingTarget::TargetKps,
+            &Settings::format_target_kps(self.settings.target_kps),
+        ));
+    }
+
+    /// 打开单字目标速度（WPM）数值输入弹窗（ADR 0015 D2/D3）。
+    fn open_target_wpm_modal(&mut self) {
+        self.text_setting_modal = Some(TextSettingModal::new(
+            TextSettingTarget::TargetWpm,
+            &Settings::format_target_wpm(self.settings.target_wpm),
+        ));
+    }
+
+    /// 应用数值输入弹窗提交的目标击键：非数字输入保持原值（ADR 0015 D4）。
+    fn apply_target_kps_input(&mut self, raw: &str) {
+        let Some(value) = Settings::parse_target(raw, Settings::TARGET_KPS_MAX) else {
+            return;
+        };
+        self.settings.target_kps = value;
+        let _ = self.settings_store.save(&self.settings);
+        self.refresh_builtin_preview();
+        self.sync_targets_to_session();
+    }
+
+    /// 应用数值输入弹窗提交的目标速度：非数字输入保持原值（ADR 0015 D4）。
+    fn apply_target_wpm_input(&mut self, raw: &str) {
+        let Some(value) = Settings::parse_target(raw, Settings::TARGET_WPM_MAX) else {
+            return;
+        };
+        self.settings.target_wpm = value;
+        let _ = self.settings_store.save(&self.settings);
+        self.refresh_builtin_preview();
+        self.sync_targets_to_session();
     }
 
     /// 切换单字练习未达标乱序重打开关并即时持久化。
@@ -2890,7 +2944,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                     }
                     continue;
                 }
-                // 自定义设置文本弹窗（方案/输入法）打开时优先处理其按键。
+                // 自定义设置文本弹窗（方案/输入法/数值门槛）打开时优先处理其按键。
                 if let Some(modal) = app.text_setting_modal.as_mut() {
                     let action = text_setting_modal_input(modal, key);
                     match action {
@@ -2909,6 +2963,8 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                                     app.settings.input_method = value;
                                     let _ = app.settings_store.save(&app.settings);
                                 }
+                                TextSettingTarget::TargetKps => app.apply_target_kps_input(&value),
+                                TextSettingTarget::TargetWpm => app.apply_target_wpm_input(&value),
                             }
                         }
                         TextSettingModalAction::None => {}
@@ -3269,11 +3325,12 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                             KeyCode::Char('g') | KeyCode::Char('G') => {
                                 app.cycle_group_size();
                             }
-                            KeyCode::Char('t') | KeyCode::Char('T') => {
-                                app.cycle_target_kps();
-                            }
-                            KeyCode::Char('w') | KeyCode::Char('W') => {
-                                app.cycle_target_wpm();
+                            // 小写轮转预设档位（粗调），大写打开数值输入弹窗（ADR 0015 D3）。
+                            KeyCode::Char('t')
+                            | KeyCode::Char('T')
+                            | KeyCode::Char('w')
+                            | KeyCode::Char('W') => {
+                                builtin_target_shortcut(&mut app, key.code);
                             }
                             KeyCode::Char('r') | KeyCode::Char('R') => {
                                 let is_words = BUILTIN_SETS
@@ -3388,9 +3445,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                                     };
                                     app.settings.target_kps = next;
                                     let _ = app.settings_store.save(&app.settings);
-                                    if let TextSource::Builtin { set } = app.text.source && !set.is_words() {
-                                        app.session.set_targets(app.settings.target_kps, app.settings.target_wpm);
-                                    }
+                                    app.sync_targets_to_session();
                                 }
                                 FOCUS_TARGET_WPM => {
                                     let curr = app.settings.target_wpm;
@@ -3401,9 +3456,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                                     };
                                     app.settings.target_wpm = next;
                                     let _ = app.settings_store.save(&app.settings);
-                                    if let TextSource::Builtin { set } = app.text.source && !set.is_words() {
-                                        app.session.set_targets(app.settings.target_kps, app.settings.target_wpm);
-                                    }
+                                    app.sync_targets_to_session();
                                 }
                                 FOCUS_RETRY_SHUFFLE => {
                                     app.toggle_retry_shuffle();
@@ -3432,6 +3485,10 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                                         &app.settings.input_method,
                                     ));
                                 }
+                            } else if app.settings_focus == FOCUS_TARGET_KPS {
+                                app.open_target_kps_modal();
+                            } else if app.settings_focus == FOCUS_TARGET_WPM {
+                                app.open_target_wpm_modal();
                             }
                         }
                         KeyCode::Esc | KeyCode::Char('q') => app.state = AppState::Typing,
@@ -4523,6 +4580,20 @@ fn login_input(form: &mut LoginForm, key: KeyEvent) -> LoginAction {
     }
 }
 
+/// 内置单字预览弹窗中的目标门槛快捷键（ADR 0015 D3）：
+/// 小写 `t` / `w` 轮转预设档位（粗调），大写 `T` / `W` 打开数值输入弹窗（精确值）。
+/// 返回 `true` 表示该按键已被消费。
+fn builtin_target_shortcut(app: &mut App, code: KeyCode) -> bool {
+    match code {
+        KeyCode::Char('t') => app.cycle_target_kps(),
+        KeyCode::Char('T') => app.open_target_kps_modal(),
+        KeyCode::Char('w') => app.cycle_target_wpm(),
+        KeyCode::Char('W') => app.open_target_wpm_modal(),
+        _ => return false,
+    }
+    true
+}
+
 /// 处理自定义设置模态框按键，返回动作。
 fn text_setting_modal_input(modal: &mut TextSettingModal, key: KeyEvent) -> TextSettingModalAction {
     match key.code {
@@ -5029,11 +5100,17 @@ fn ui(frame: &mut Frame, app: &App) {
             ]));
         } else if app.session.is_target_gated() {
             let mut target_parts = Vec::new();
-            if app.session.target_wpm() > 0 {
-                target_parts.push(format!("{} WPM", app.session.target_wpm()));
+            if app.session.target_wpm() > 0.0 {
+                target_parts.push(format!(
+                    "{} WPM",
+                    Settings::format_target_wpm(app.session.target_wpm())
+                ));
             }
             if app.session.target_kps() > 0.0 {
-                target_parts.push(format!("{:.1} 击/秒", app.session.target_kps()));
+                target_parts.push(format!(
+                    "{} 击/秒",
+                    Settings::format_target_kps(app.session.target_kps())
+                ));
             }
             ref_block = ref_block.title_bottom(Line::from(vec![
                 Span::styled(" 目标: ", Style::default().fg(palette.muted)),
@@ -5452,7 +5529,7 @@ fn render_login_modal(frame: &mut Frame, form: &LoginForm, palette: &ThemePalett
     }
 }
 
-/// 自定义设置文本弹窗（方案路径 / 输入法名称）：居中弹层，单行文本输入。
+/// 自定义设置文本弹窗（方案路径 / 输入法名称 / 单字目标门槛）：居中弹层，单行文本输入。
 fn render_text_setting_modal(
     frame: &mut Frame,
     modal: &TextSettingModal,
@@ -5473,6 +5550,22 @@ fn render_text_setting_modal(
                     .fg(palette.muted),
             )
         }
+        TextSettingTarget::TargetKps => (
+            " 单字目标击键（KPS） ",
+            Line::from(format!(
+                " 0 为关闭；0.0–{}，最多 1 位小数",
+                Settings::format_target_kps(Settings::TARGET_KPS_MAX)
+            ))
+            .fg(palette.muted),
+        ),
+        TextSettingTarget::TargetWpm => (
+            " 单字目标速度（WPM） ",
+            Line::from(format!(
+                " 0 为关闭；0–{}，最多 1 位小数",
+                Settings::format_target_wpm(Settings::TARGET_WPM_MAX)
+            ))
+            .fg(palette.muted),
+        ),
     };
     let area = centered_rect(frame.area(), 56, 8);
     frame.render_widget(Clear, area);
@@ -6150,12 +6243,18 @@ fn render_builtin_preview(frame: &mut Frame, app: &App, area: ratatui::layout::R
         let kps_label = if app.settings.target_kps <= 0.0 {
             "关".to_string()
         } else {
-            format!("{:.1}击", app.settings.target_kps)
+            format!(
+                "{}击",
+                Settings::format_target_kps(app.settings.target_kps)
+            )
         };
-        let wpm_label = if app.settings.target_wpm == 0 {
+        let wpm_label = if app.settings.target_wpm <= 0.0 {
             "关".to_string()
         } else {
-            format!("{}WPM", app.settings.target_wpm)
+            format!(
+                "{}WPM",
+                Settings::format_target_wpm(app.settings.target_wpm)
+            )
         };
         let retry_label = if app.settings.retry_shuffle {
             "开"
@@ -6163,7 +6262,7 @@ fn render_builtin_preview(frame: &mut Frame, app: &App, area: ratatui::layout::R
             "关"
         };
         (
-            format!(" Enter 载入 | s {shuffle_label} | r 乱序重打({retry_label}) | g 分组({group_size}字) | t 击键({kps_label}) | w 速度({wpm_label}) | Esc 取消 "),
+            format!(" Enter 载入 | s {shuffle_label} | r 乱序重打({retry_label}) | g 分组({group_size}字) | t 击键({kps_label}) | w 速度({wpm_label}) | Shift+T/W 输入数值 | Esc 取消 "),
             Some((kps_label, wpm_label, retry_label)),
         )
     };
@@ -6183,7 +6282,9 @@ fn render_builtin_preview(frame: &mut Frame, app: &App, area: ratatui::layout::R
     ];
     if let Some((kps_label, wpm_label, retry_label)) = single_labels {
         title_spans.push(Span::styled(
-            format!("[r] 乱序重打: {retry_label}  [t] 击键: {kps_label}  [w] 速度: {wpm_label} "),
+            format!(
+                "[r] 乱序重打: {retry_label}  [t] 击键: {kps_label}  [w] 速度: {wpm_label}  [Shift+T/W] 自定义 "
+            ),
             Style::default().fg(palette.muted),
         ));
     }
@@ -7391,22 +7492,28 @@ fn render_settings(frame: &mut Frame, app: &App) {
     let kps_label = if app.settings.target_kps <= 0.0 {
         "关".to_string()
     } else {
-        format!("{:.1} 击/秒", app.settings.target_kps)
+        format!(
+            "{} 击/秒",
+            Settings::format_target_kps(app.settings.target_kps)
+        )
     };
     lines.push(settings_row(
         "单字目标击键",
-        &kps_label,
+        &format!("{kps_label}  (Enter 输入)"),
         focus == FOCUS_TARGET_KPS,
         &palette,
     ));
-    let wpm_label = if app.settings.target_wpm == 0 {
+    let wpm_label = if app.settings.target_wpm <= 0.0 {
         "关".to_string()
     } else {
-        format!("{} WPM", app.settings.target_wpm)
+        format!(
+            "{} WPM",
+            Settings::format_target_wpm(app.settings.target_wpm)
+        )
     };
     lines.push(settings_row(
         "单字目标速度",
-        &wpm_label,
+        &format!("{wpm_label}  (Enter 输入)"),
         focus == FOCUS_TARGET_WPM,
         &palette,
     ));
@@ -7423,7 +7530,10 @@ fn render_settings(frame: &mut Frame, app: &App) {
     lines.push(Line::from("  对正确对正确").fg(palette.success));
     lines.push(Line::from("  错错误错错误").fg(palette.error));
     lines.push(Line::from(""));
-    lines.push(hint_bar_line(" jk 选择 | hl 调整 | Esc/q 返回 ", &palette));
+    lines.push(hint_bar_line(
+        " jk 选择 | hl 调整 | Enter 自定义输入 | Esc/q 返回 ",
+        &palette,
+    ));
 
     let area = centered_rect(frame.area(), 60, 24);
     frame.render_widget(Clear, area);
@@ -16693,7 +16803,7 @@ mod tests {
     fn app_cycle_target_kps_and_wpm() {
         let mut app = test_app(load_builtin_text(BUILTIN_SETS[0]));
         assert_eq!(app.settings.target_kps, 0.0);
-        assert_eq!(app.settings.target_wpm, 0);
+        assert_eq!(app.settings.target_wpm, 0.0);
 
         // 正向循环击键：0.0 -> 3.0
         app.cycle_target_kps();
@@ -16711,17 +16821,151 @@ mod tests {
 
         // 正向循环速度：0 -> 40
         app.cycle_target_wpm();
-        assert_eq!(app.settings.target_wpm, 40);
-        assert_eq!(app.settings_store.load().target_wpm, 40);
-        assert_eq!(app.session.target_wpm(), 40);
+        assert_eq!(app.settings.target_wpm, 40.0);
+        assert_eq!(app.settings_store.load().target_wpm, 40.0);
+        assert_eq!(app.session.target_wpm(), 40.0);
 
         // 循环直到回绕到 0（共 13 个预设档位，已走 1 步，再走 12 步）
         for _ in 0..12 {
             app.cycle_target_wpm();
         }
-        assert_eq!(app.settings.target_wpm, 0);
-        assert_eq!(app.settings_store.load().target_wpm, 0);
-        assert_eq!(app.session.target_wpm(), 0);
+        assert_eq!(app.settings.target_wpm, 0.0);
+        assert_eq!(app.settings_store.load().target_wpm, 0.0);
+        assert_eq!(app.session.target_wpm(), 0.0);
+    }
+
+    #[test]
+    fn app_free_target_values_persist_and_sync() {
+        // ADR 0015：数值输入弹窗可设任意值（如 4.3 击/秒、115.5 WPM）。
+        let mut app = test_app(load_builtin_text(BUILTIN_SETS[0]));
+
+        app.apply_target_kps_input("4.3");
+        assert_eq!(app.settings.target_kps, 4.3);
+        assert_eq!(app.settings_store.load().target_kps, 4.3);
+        assert_eq!(app.session.target_kps(), 4.3);
+
+        app.apply_target_wpm_input("115.5");
+        assert_eq!(app.settings.target_wpm, 115.5);
+        assert_eq!(app.settings_store.load().target_wpm, 115.5);
+        assert_eq!(app.session.target_wpm(), 115.5);
+
+        // 提交即量化到 1 位小数
+        app.apply_target_kps_input("4.26");
+        assert_eq!(app.settings.target_kps, 4.3);
+        app.apply_target_wpm_input("115.56");
+        assert_eq!(app.settings.target_wpm, 115.6);
+    }
+
+    #[test]
+    fn app_target_input_cancels_on_garbage_and_clamps_on_overflow() {
+        // ADR 0015 D4：非数字输入保持原值；越界钳制到边界。
+        let mut app = test_app(load_builtin_text(BUILTIN_SETS[0]));
+        app.apply_target_kps_input("4.3");
+        app.apply_target_wpm_input("115.5");
+
+        for garbage in ["", "   ", "abc", "4.3abc", "nan", "inf", "."] {
+            app.apply_target_kps_input(garbage);
+            app.apply_target_wpm_input(garbage);
+            assert_eq!(
+                app.settings.target_kps, 4.3,
+                "输入 {garbage:?} 不应改变目标击键"
+            );
+            assert_eq!(
+                app.settings.target_wpm, 115.5,
+                "输入 {garbage:?} 不应改变目标速度"
+            );
+        }
+
+        app.apply_target_kps_input("35");
+        assert_eq!(app.settings.target_kps, Settings::TARGET_KPS_MAX);
+        assert_eq!(app.session.target_kps(), Settings::TARGET_KPS_MAX);
+
+        app.apply_target_wpm_input("999");
+        assert_eq!(app.settings.target_wpm, Settings::TARGET_WPM_MAX);
+        assert_eq!(app.session.target_wpm(), Settings::TARGET_WPM_MAX);
+
+        // 0 表示关闭门槛；两项皆 0 时会话不再受目标门槛约束
+        app.apply_target_kps_input("-1");
+        assert_eq!(app.settings.target_kps, 0.0);
+        app.apply_target_wpm_input("0");
+        assert_eq!(app.settings.target_wpm, 0.0);
+        assert!(!app.session.is_target_gated(), "两项均为 0 时应关闭门槛");
+    }
+
+    #[test]
+    fn target_modal_prefills_current_value() {
+        let mut app = test_app(load_builtin_text(BUILTIN_SETS[0]));
+        app.apply_target_kps_input("4.3");
+        app.apply_target_wpm_input("115.5");
+
+        app.open_target_kps_modal();
+        let modal = app.text_setting_modal.as_ref().expect("应打开击键弹窗");
+        assert_eq!(modal.target, TextSettingTarget::TargetKps);
+        assert_eq!(modal.input, "4.3", "应预填当前值以便微调");
+        app.text_setting_modal = None;
+
+        app.open_target_wpm_modal();
+        let modal = app.text_setting_modal.as_ref().expect("应打开速度弹窗");
+        assert_eq!(modal.target, TextSettingTarget::TargetWpm);
+        assert_eq!(modal.input, "115.5");
+        app.text_setting_modal = None;
+
+        // 关闭门槛（0）时按各自显示规则预填：击键恒 1 位小数
+        app.apply_target_kps_input("0");
+        app.open_target_kps_modal();
+        assert_eq!(
+            app.text_setting_modal
+                .as_ref()
+                .expect("应打开击键弹窗")
+                .input,
+            "0.0"
+        );
+        app.text_setting_modal = None;
+
+        // 速度整数省小数
+        app.apply_target_wpm_input("0");
+        app.open_target_wpm_modal();
+        assert_eq!(
+            app.text_setting_modal
+                .as_ref()
+                .expect("应打开速度弹窗")
+                .input,
+            "0"
+        );
+    }
+
+    #[test]
+    fn builtin_target_shortcut_cycles_on_lowercase_and_opens_modal_on_uppercase() {
+        // ADR 0015 D3：预览弹窗中小写轮转预设、大写打开数值输入弹窗。
+        let mut app = test_app(load_builtin_text(BUILTIN_SETS[0]));
+
+        assert!(builtin_target_shortcut(&mut app, KeyCode::Char('t')));
+        assert_eq!(app.settings.target_kps, 3.0, "小写 t 应轮转预设档位");
+        assert!(app.text_setting_modal.is_none());
+
+        assert!(builtin_target_shortcut(&mut app, KeyCode::Char('w')));
+        assert_eq!(app.settings.target_wpm, 40.0, "小写 w 应轮转预设档位");
+        assert!(app.text_setting_modal.is_none());
+
+        assert!(builtin_target_shortcut(&mut app, KeyCode::Char('T')));
+        assert_eq!(
+            app.text_setting_modal.as_ref().map(|m| m.target),
+            Some(TextSettingTarget::TargetKps),
+            "大写 T 应打开击键输入弹窗"
+        );
+        app.text_setting_modal = None;
+
+        assert!(builtin_target_shortcut(&mut app, KeyCode::Char('W')));
+        assert_eq!(
+            app.text_setting_modal.as_ref().map(|m| m.target),
+            Some(TextSettingTarget::TargetWpm),
+            "大写 W 应打开速度输入弹窗"
+        );
+        app.text_setting_modal = None;
+
+        // 无关按键不被消费
+        assert!(!builtin_target_shortcut(&mut app, KeyCode::Char('x')));
+        assert!(app.text_setting_modal.is_none());
     }
 
     #[test]
@@ -16737,7 +16981,7 @@ mod tests {
         // 焦点切到目标速度并递增
         app.settings_focus = FOCUS_TARGET_WPM;
         app.cycle_target_wpm();
-        assert_eq!(app.settings.target_wpm, 40);
+        assert_eq!(app.settings.target_wpm, 40.0);
 
         // UI 渲染检查
         let backend = ratatui::backend::TestBackend::new(90, 32);
@@ -16798,11 +17042,11 @@ mod tests {
         let mut app = test_app(load_builtin_text(BUILTIN_SETS[0]));
         // 设置极高门槛：100 WPM, 100.0 KPS
         app.settings.target_kps = 100.0;
-        app.settings.target_wpm = 100;
+        app.settings.target_wpm = 100.0;
         app.restart();
         assert!(app.session.is_target_gated());
         assert_eq!(app.session.target_kps(), 100.0);
-        assert_eq!(app.session.target_wpm(), 100);
+        assert_eq!(app.session.target_wpm(), 100.0);
 
         // 获取第 1 组字符
         let group_size = app.settings.group_size as usize;
@@ -16851,7 +17095,7 @@ mod tests {
     #[test]
     fn app_target_gating_retry_shuffle_shuffles_and_resets() {
         let mut app = test_app(load_builtin_text(BUILTIN_SETS[0]));
-        app.settings.target_wpm = 100;
+        app.settings.target_wpm = 100.0;
         app.settings.retry_shuffle = true;
         app.restart();
         assert!(app.session.is_retry_shuffle());
@@ -16875,7 +17119,7 @@ mod tests {
     #[test]
     fn app_target_gating_retry_shuffle_zero_target_edits_notice_and_dismiss() {
         let mut app = test_app(load_builtin_text(BUILTIN_SETS[0]));
-        app.settings.target_wpm = 0;
+        app.settings.target_wpm = 0.0;
         app.settings.target_kps = 0.0;
         app.settings.retry_shuffle = true;
         app.restart();
@@ -16926,7 +17170,7 @@ mod tests {
     fn app_target_failure_notice_suppresses_right_metrics_even_with_completed_groups() {
         let mut app = test_app(load_builtin_text(BUILTIN_SETS[0]));
         app.settings.target_kps = 4.0;
-        app.settings.target_wpm = 0;
+        app.settings.target_wpm = 0.0;
         app.restart();
 
         // 模拟打完并通过第 1 组（首字 0s，后续 1s，用时 1 秒，KPS = 10.0 >= 4.0）
@@ -16967,7 +17211,7 @@ mod tests {
         // 测试用户仅设置了单一门槛时的判定（复现 issue：只设一个目标未达标却被放行）
         let mut app = test_app(load_builtin_text(BUILTIN_SETS[0]));
         app.settings.target_kps = 8.0;
-        app.settings.target_wpm = 0;
+        app.settings.target_wpm = 0.0;
         app.restart();
 
         let group_size = app.settings.group_size as usize;
@@ -16981,14 +17225,14 @@ mod tests {
 
         let failure = app.session.take_target_failure().expect("仅设 target_kps 且未达标时必须判定失败");
         assert_eq!(failure.target_kps, 8.0);
-        assert_eq!(failure.target_wpm, 0);
+        assert_eq!(failure.target_wpm, 0.0);
         assert!(failure.format_notice().contains("击键:"));
         assert!(!failure.format_notice().contains("速度:")); // 未设 WPM 时不应显示速度 0
 
         // 测试仅设 WPM
         let mut app_wpm = test_app(load_builtin_text(BUILTIN_SETS[0]));
         app_wpm.settings.target_kps = 0.0;
-        app_wpm.settings.target_wpm = 120;
+        app_wpm.settings.target_wpm = 120.0;
         app_wpm.restart();
 
         app_wpm.touch_typing();
@@ -16996,7 +17240,7 @@ mod tests {
         app_wpm.session.type_text_with_strokes_at(&rest_group, (group_size - 1) as u32, Duration::from_secs(10));
 
         let failure_wpm = app_wpm.session.take_target_failure().expect("仅设 target_wpm 且未达标时必须判定失败");
-        assert_eq!(failure_wpm.target_wpm, 120);
+        assert_eq!(failure_wpm.target_wpm, 120.0);
         assert_eq!(failure_wpm.target_kps, 0.0);
         assert!(failure_wpm.format_notice().contains("速度:"));
         assert!(!failure_wpm.format_notice().contains("击键:"));
