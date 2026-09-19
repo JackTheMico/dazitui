@@ -290,6 +290,9 @@ pub fn display_width(s: &str) -> usize {
 }
 
 /// 提示单元的实际显示文本：去掉手区修饰符与 `%` 前缀，空格并击简词追加空格键标记。
+///
+/// 上屏/选重键由 `SchemeDict` 直接写进 `code`（`␣` / `;` / `'` / 位次数字，ADR 0014 D2），
+/// 渲染层原样呈现，保证「提示串 = 要按的键序列」。
 fn hint_display_text(code: &str) -> String {
     let mut s = strip_hand_prefix(code).to_string();
     if code.starts_with('%') {
@@ -459,6 +462,7 @@ pub fn layout_code_hint_grid(
                         code: String::new(),
                         strokes: 0,
                         is_oov: true,
+                        rank: 1,
                     })
                 })
                 .collect();
@@ -492,6 +496,7 @@ mod tests {
             code: code.to_string(),
             strokes: 0,
             is_oov: false,
+            rank: 1,
         }
     }
 
@@ -528,6 +533,25 @@ mod tests {
     }
 
     #[test]
+    fn layout_select_key_is_part_of_displayed_code() {
+        // ADR 0014 D2：上屏/选重键由 SchemeDict 直接写进 `code`，渲染层原样呈现，
+        // 保证「提示串 = 要按的键序列」；渲染层不再依 rank 二次追加 `·n`。
+        let words = vec!["佳人".to_string()];
+        // 万象虎字母表含 `;` → 第 2 位显示 `jgjr;`。
+        let hints = vec![hint("jgjr;")];
+        assert_eq!(
+            cells_text(&layout_code_hint_line(&words, &hints, &[])),
+            "jgjr;"
+        );
+        // 首选且唯一 → 不追加任何键。
+        let hints1 = vec![hint("igqe")];
+        assert_eq!(
+            cells_text(&layout_code_hint_line(&words, &hints1, &[])),
+            "igqe"
+        );
+    }
+
+    #[test]
     fn layout_oov_is_blank_padded() {
         // 未登录词提示留空，但定宽占位（2 空格），不破坏对齐。
         let words = vec!["中".to_string()];
@@ -536,6 +560,7 @@ mod tests {
             code: String::new(),
             strokes: 0,
             is_oov: true,
+            rank: 1,
         }];
         assert_eq!(
             cells_text(&layout_code_hint_line(&words, &hints, &[])),

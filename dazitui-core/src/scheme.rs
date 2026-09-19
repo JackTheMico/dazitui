@@ -8,6 +8,13 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 
+/// 反查索引中的一条记录：共享某编码的词条原文与其词库权重（权重越高越靠前）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IndexedEntry {
+    word: String,
+    weight: i64,
+}
+
 /// 方案反查与码表映射管理器。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SchemeDict {
@@ -15,6 +22,13 @@ pub struct SchemeDict {
     name: Option<String>,
     /// 词/单字 -> 编码列表（可能有重码，保留首选编码）
     word_to_codes: HashMap<String, Vec<String>>,
+    /// 编码 -> 共享该编码的词条（含权重），用于判定候选位次与重码（ADR 0013）。
+    ///
+    /// 仅定长形码方案（`four_auto_commit`）需要；其余方案跳过收集（大型并击词库可省下
+    /// 约三分之一加载耗时与该表本身的内存）。
+    code_index: HashMap<String, Vec<IndexedEntry>>,
+    /// 是否收集 `code_index`。加载前依方案类型预先判定，避免为用不到的方案白建索引。
+    collect_index: bool,
     /// 并击代数指法规则逆向引擎（若方案提供了 .schema.yaml 中的 chord_composer.algebra）
     chord_algebra: Option<ChordAlgebra>,
     /// 需要追加 `'` 提交符的编码集合（剥离手区前缀后的逻辑码）。
@@ -40,11 +54,34 @@ pub struct SchemeDict {
     /// - 句中简词引导键 `/` 计入击数与按键序列；
     /// - 不追加双拼次选 `'` 提交符。
     four_auto_commit: bool,
+    /// 是否为「变长整句」方案（如虎整句 tiger_sentence）。
+    ///
+    /// 与定长形码的区别（ADR 0014）：
+    /// - 编码连续输入、由语言模型分词，字词之间不按上屏键；
+    /// - 一码段（单字母码）只在「整段输入只有一码」时合法，故多字连续码中每字
+    ///   必须取长度 >= 2 的码（否则解码走错切分，如「个人」拼 `jgj` 出「佝」）；
+    /// - 末尾恒定计一次提交键（空格；非首选时为选重键 `;` / `'` / 数字）。
+    sentence_mode: bool,
+    /// `speller/alphabet` 含 `;`：第 2 候选以 `;` 选重（虎整句、万象虎均如此）。
+    select_semicolon: bool,
+    /// `speller/alphabet` 含 `'`：第 3 候选以 `'` 选重（虎整句）。
+    select_apostrophe: bool,
 }
 
 /// 规范路径：解析软链到真实文件，失败则回退原路径（与 watcher canonicalize 策略一致）。
 fn canonicalize_path(p: &Path) -> PathBuf {
     std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
+/// 定长形码下一个候选编码的评估结果（ADR 0013）。
+#[derive(Debug, Clone)]
+struct CodeCandidate {
+    /// 逻辑编码（不含上屏/选号标记）。
+    code: String,
+    /// 真实按键数：码长 + 上屏键（空格）或选号键。
+    strokes: u32,
+    /// 打完该码后目标词的候选位次：1 = 首选。
+    rank: u8,
 }
 
 /// 单个词组单位的编码提示结果（供渲染层逐词对齐）。
@@ -55,9 +92,14 @@ pub struct CodeHint {
     /// 最优输入编码（逻辑码元：拼音/形码字母/并击逻辑码元）；未登录留空串。
     pub code: String,
     /// 该编码的击数（并击记 1 击，即每个逻辑码元算 1）；未登录为 0。
+    /// 定长形码下为「真实按键数」：含上屏键（空格）与选号键（ADR 0013 D5）。
     pub strokes: u32,
     /// 是否未登录（码表未收录，提示留空）。
     pub is_oov: bool,
+    /// 打完该编码后目标词在候选中的位次：1 = 首选。>1 表示需按该数字键选号。
+    ///
+    /// 仅定长形码方案（`four_auto_commit`）下会被填充，其余方案恒为 1。
+    pub rank: u8,
 }
 
 impl std::str::FromStr for SchemeDict {
@@ -99,7 +141,13 @@ impl SchemeDict {
 
     /// 从字符串内容解析码表（支持纯文本与 Rime .dict.yaml 格式）。
     pub fn parse(content: &str) -> Self {
+        Self::parse_with(content, true)
+    }
+
+    /// 同 `parse`，但可关闭编码反查索引的收集（`collect_index`）。
+    fn parse_with(content: &str, collect_index: bool) -> Self {
         let mut dict = Self::default();
+        dict.collect_index = collect_index;
 
         let columns = Self::extract_columns(content);
         if let Some(ref cols) = columns {
@@ -115,6 +163,13 @@ impl SchemeDict {
             (Some(t_idx), c_idx)
         } else {
             (None, None)
+        };
+
+        // 权重列：显式声明时取 `weight` 的位置；未声明 columns 时按 Rime 默认 [text, code, weight]。
+        // 权重用于判定「同一编码下谁排第一」（ADR 0013 D2），缺省记 0（等价于原始文件顺序）。
+        let weight_col = match columns.as_ref() {
+            Some(cols) => cols.iter().position(|c| c == "weight"),
+            None => Some(2),
         };
 
         let has_initial_dashes = content
@@ -153,7 +208,8 @@ impl SchemeDict {
                     let word = parts[t_idx].trim();
                     let code = parts[c_idx].trim();
                     if !word.is_empty() && !code.is_empty() {
-                        dict.add_entry(word, &Self::clean_raw_code(code));
+                        let w = Self::parse_weight(&parts, weight_col);
+                        dict.add_entry_weighted(word, &Self::clean_raw_code(code), w);
                     }
                 } else {
                     let space_parts: Vec<&str> = trimmed.split_whitespace().collect();
@@ -161,7 +217,8 @@ impl SchemeDict {
                         let word = space_parts[t_idx];
                         let code = space_parts[c_idx];
                         if !word.is_empty() && !code.is_empty() {
-                            dict.add_entry(word, &Self::clean_raw_code(code));
+                            let w = Self::parse_weight(&space_parts, weight_col);
+                            dict.add_entry_weighted(word, &Self::clean_raw_code(code), w);
                         }
                     }
                 }
@@ -172,7 +229,8 @@ impl SchemeDict {
                     let word = parts[0].trim();
                     let code = parts[1].trim();
                     if !word.is_empty() && !code.is_empty() {
-                        dict.add_entry(word, &Self::clean_raw_code(code));
+                        let w = Self::parse_weight(&parts, weight_col);
+                        dict.add_entry_weighted(word, &Self::clean_raw_code(code), w);
                     }
                 } else if parts.len() == 2 {
                     let first = parts[0].trim();
@@ -195,7 +253,8 @@ impl SchemeDict {
                         let word = space_parts[0];
                         let code = space_parts[1];
                         if !word.is_empty() && !code.is_empty() {
-                            dict.add_entry(word, &Self::clean_raw_code(code));
+                            let w = Self::parse_weight(&space_parts, weight_col);
+                            dict.add_entry_weighted(word, &Self::clean_raw_code(code), w);
                         }
                     } else if space_parts.len() == 2 {
                         let first = space_parts[0];
@@ -301,7 +360,11 @@ impl SchemeDict {
     ///
     /// `visited` 用规范路径去重，避免循环导入导致无限递归。导入文件缺失时静默跳过
     /// （与 Rime 宽松语义一致），不影响主词典已收录的词条。
-    fn load_dict_with_imports(path: &Path, visited: &mut HashSet<PathBuf>) -> io::Result<Self> {
+    fn load_dict_with_imports(
+        path: &Path,
+        visited: &mut HashSet<PathBuf>,
+        collect_index: bool,
+    ) -> io::Result<Self> {
         let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         if visited.contains(&canon) {
             return Ok(Self::default());
@@ -309,13 +372,14 @@ impl SchemeDict {
         visited.insert(canon.clone());
 
         let content = std::fs::read_to_string(path)?;
-        let mut dict = Self::parse(&content);
+        let mut dict = Self::parse_with(&content, collect_index);
         dict.source_paths.push(canon);
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
         for name in Self::extract_import_tables(&content) {
             let import_path = parent.join(format!("{name}.dict.yaml"));
             if import_path.exists() {
-                if let Ok(child) = Self::load_dict_with_imports(&import_path, visited) {
+                if let Ok(child) = Self::load_dict_with_imports(&import_path, visited, collect_index)
+                {
                     dict.merge(&child);
                 }
             }
@@ -330,6 +394,20 @@ impl SchemeDict {
             for c in codes {
                 if !entry.contains(c) {
                     entry.push(c.clone());
+                }
+            }
+        }
+        // 反查索引随词条一并合并，保证跨词典的重码/首选判定完整。
+        for (code, group) in &other.code_index {
+            let target = self.code_index.entry(code.clone()).or_default();
+            for e in group {
+                match target.iter_mut().find(|x| x.word == e.word) {
+                    Some(x) => {
+                        if e.weight > x.weight {
+                            x.weight = e.weight;
+                        }
+                    }
+                    None => target.push(e.clone()),
                 }
             }
         }
@@ -385,6 +463,11 @@ impl SchemeDict {
         self.four_auto_commit
     }
 
+    /// 是否为变长整句方案（虎整句）：连续码输入、每字段长 >= 2、末尾恒定计一次提交键。
+    pub fn is_sentence_mode(&self) -> bool {
+        self.sentence_mode
+    }
+
     /// 设置定长 4 码自动上屏标记。
     pub fn set_four_auto_commit(&mut self, val: bool) {
         self.four_auto_commit = val;
@@ -438,6 +521,46 @@ impl SchemeDict {
             }
         }
         false
+    }
+
+    /// 判定是否为「变长整句」方案（ADR 0014）。
+    ///
+    /// 判据（命中任一即可）：`schema_id`/文件名含 `sentence`，或方案名含「整句」。
+    /// 整句方案没有 `speller/max_code_length`，编码连续输入后由语言模型分词；
+    /// 这类方案即使文件名以 `tiger` 开头（虎整句）也不应走定长形码分支。
+    fn detect_sentence_mode(
+        schema_doc: Option<&YamlValue>,
+        schema_name: Option<&str>,
+        schema_stem: &str,
+    ) -> bool {
+        if let Some(doc) = schema_doc {
+            let schema_id = doc
+                .get("schema/schema_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if schema_id.to_ascii_lowercase().contains("sentence") {
+                return true;
+            }
+        }
+        if schema_stem.to_ascii_lowercase().contains("sentence") {
+            return true;
+        }
+        schema_name.is_some_and(|n| n.contains("整句"))
+    }
+
+    /// 读取 `speller/alphabet`，判断 `;` 与 `'` 是否可作为选重键（ADR 0014 D2）。
+    ///
+    /// 虎整句 alphabet 为 `zyxwvutsrqponmlkjihgfedcba;';0123456789~` → 两者皆可；
+    /// 万象虎为 `...7890;*/\[]` → 仅 `;`（`'` 是其拼音反查前缀，不能选重）；
+    /// 取不到该配置时退化为数字选号。
+    fn read_select_keys(doc: Option<&YamlValue>) -> (bool, bool) {
+        let Some(alphabet) = doc
+            .and_then(|d| d.get("speller/alphabet"))
+            .and_then(|v| v.as_str())
+        else {
+            return (false, false);
+        };
+        (alphabet.contains(';'), alphabet.contains('\''))
     }
 
     /// 从 .schema.yaml 文档中提取所有声明的词典名称，按优先级（`initial_quality` 降序）返回。
@@ -533,18 +656,27 @@ impl SchemeDict {
             // 2. 查找伴随词典（按 initial_quality 降序优先选取主输入词典，如万象虎中 initial_quality: 9999 的 tigress）
             let schema_doc = resolver.load_doc(path).ok().cloned();
             let schema_stem = file_name.strip_suffix(".schema.yaml").unwrap_or(file_name);
+            // 定长形码判定不依赖词典内容，先行算出：据此决定是否收集编码反查索引，
+            // 避免为并击/双拼等大型词库白建一份用不到的索引（ADR 0013）。
+            let four_auto_commit = Self::detect_four_auto_commit(
+                schema_doc.as_ref(),
+                schema_name.as_deref(),
+                schema_stem,
+                algebra.is_some(),
+            );
             let dict_names = Self::extract_schema_dictionary_candidates(schema_doc.as_ref(), schema_stem);
 
             let mut candidate_dicts = Vec::new();
             for dict_name in &dict_names {
                 candidate_dicts.push(parent_dir.join(format!("{dict_name}.dict.yaml")));
+                candidate_dicts.push(parent_dir.join(format!("{dict_name}.codes.txt")));
                 candidate_dicts.push(parent_dir.join(format!("{dict_name}.txt")));
             }
 
             let mut dict = if let Some(dict_path) = candidate_dicts.into_iter().find(|p| p.exists())
             {
                 let mut visited = HashSet::new();
-                Self::load_dict_with_imports(&dict_path, &mut visited)?
+                Self::load_dict_with_imports(&dict_path, &mut visited, four_auto_commit)?
             } else {
                 Self::default()
             };
@@ -553,14 +685,21 @@ impl SchemeDict {
             dict.source_paths.push(canonicalize_path(path));
 
             dict.pure_chord = algebra.is_some() && rules_have_long_code_cap(&rules);
-            dict.four_auto_commit = Self::detect_four_auto_commit(
+            dict.four_auto_commit = four_auto_commit;
+            // 变长整句方案（虎整句）走 ADR 0014 的连续码模型，优先级高于定长形码。
+            dict.sentence_mode = Self::detect_sentence_mode(
                 schema_doc.as_ref(),
                 schema_name.as_deref(),
                 schema_stem,
-                algebra.is_some(),
             );
+            let (semi, apo) = Self::read_select_keys(schema_doc.as_ref());
+            dict.select_semicolon = semi;
+            dict.select_apostrophe = apo;
             if dict.four_auto_commit {
                 dict.prefix_commit_codes.clear();
+            } else {
+                // 反查索引只服务于定长形码的首选判定（ADR 0013），其余方案释放内存。
+                dict.clear_code_index();
             }
             if let Some(alg) = algebra {
                 dict.set_chord_algebra(alg);
@@ -571,13 +710,12 @@ impl SchemeDict {
             return Ok(dict);
         }
 
-        // 加载词典文本（含 import_tables 导入的兄弟词典合并）
-        let mut visited = HashSet::new();
-        let mut dict = Self::load_dict_with_imports(path, &mut visited)?;
-
-        // 尝试自动绑定同目录同名 schema.yaml
+        // 先按文件名推断词干，并预读同名 schema（只解析 YAML，开销远小于读词典），
+        // 使「是否定长形码」在载入词典之前即已知——据此决定是否收集编码反查索引。
         let stem = if file_name.ends_with(".dict.yaml") {
             file_name.strip_suffix(".dict.yaml").unwrap_or(file_name)
+        } else if file_name.ends_with(".codes.txt") {
+            file_name.strip_suffix(".codes.txt").unwrap_or(file_name)
         } else if let Some(pos) = file_name.rfind('.') {
             &file_name[..pos]
         } else {
@@ -585,36 +723,91 @@ impl SchemeDict {
         };
 
         let schema_candidate = parent_dir.join(format!("{stem}.schema.yaml"));
-        if schema_candidate.exists() {
+        let companion: Option<(Option<YamlValue>, Option<String>, Vec<String>)> =
+            if schema_candidate.exists() {
+                let mut resolver = RimeSchemaResolver::new();
+                let rules = resolver.resolve_chord_algebra(&schema_candidate);
+                let doc = resolver.load_doc(&schema_candidate).ok().cloned();
+                let name = Self::extract_schema_name(&schema_candidate);
+                Some((doc, name, rules))
+            } else {
+                None
+            };
+        let guess_four = match &companion {
+            Some((doc, name, rules)) => {
+                Self::detect_four_auto_commit(doc.as_ref(), name.as_deref(), stem, !rules.is_empty())
+            }
+            None => Self::detect_four_auto_commit(None, None, stem, false),
+        };
+
+        // 加载词典文本（含 import_tables 导入的兄弟词典合并）
+        let mut visited = HashSet::new();
+        let mut dict = Self::load_dict_with_imports(path, &mut visited, guess_four)?;
+
+        // 绑定同目录同名 schema.yaml 的指法规则与方案名
+        if let Some((doc, name, rules)) = companion {
             // 记录伴随 schema 路径（热监控闭包的一部分）；与已记录的自身路径去重。
             let sc = canonicalize_path(&schema_candidate);
             if !dict.source_paths.contains(&sc) {
                 dict.source_paths.push(sc);
             }
-            let mut resolver = RimeSchemaResolver::new();
-            let rules = resolver.resolve_chord_algebra(&schema_candidate);
             if !rules.is_empty() {
                 dict.set_chord_algebra(ChordAlgebra::from_rules(&rules));
             }
-            dict.pure_chord =
-                dict.chord_algebra.is_some() && rules_have_long_code_cap(&rules);
-            let companion_doc = resolver.load_doc(&schema_candidate).ok().cloned();
-            let schema_name = Self::extract_schema_name(&schema_candidate);
+            dict.pure_chord = dict.chord_algebra.is_some() && rules_have_long_code_cap(&rules);
             dict.four_auto_commit = Self::detect_four_auto_commit(
-                companion_doc.as_ref(),
-                schema_name.as_deref().or(dict.name.as_deref()),
+                doc.as_ref(),
+                name.as_deref().or(dict.name.as_deref()),
                 stem,
                 dict.chord_algebra.is_some(),
             );
-            if dict.four_auto_commit {
-                dict.prefix_commit_codes.clear();
-            }
-            if let Some(name) = schema_name {
+            dict.sentence_mode = Self::detect_sentence_mode(doc.as_ref(), name.as_deref(), stem);
+            let (semi, apo) = Self::read_select_keys(doc.as_ref());
+            dict.select_semicolon = semi;
+            dict.select_apostrophe = apo;
+            if let Some(name) = name {
                 dict.set_name(name);
             }
+        } else {
+            dict.four_auto_commit = Self::detect_four_auto_commit(
+                None,
+                dict.name.as_deref(),
+                stem,
+                dict.chord_algebra.is_some(),
+            );
+            dict.sentence_mode = Self::detect_sentence_mode(None, dict.name.as_deref(), stem);
+        }
+        if dict.four_auto_commit {
+            dict.prefix_commit_codes.clear();
+            // 预判定失误（如方案名含「虎」而文件名不含关键词）时补建索引。
+            if !guess_four {
+                dict.ensure_code_index(path);
+            }
+        } else {
+            dict.clear_code_index();
         }
 
         Ok(dict)
+    }
+
+    /// 补建编码反查索引：预判定未收集、但最终被认定为定长形码时，以带索引的方式重读同一
+    /// 词典文件，并保留已解析出的方案名、指法代数、纯并击标记与来源路径闭包。
+    fn ensure_code_index(&mut self, path: &Path) {
+        if self.collect_index {
+            return;
+        }
+        let mut visited = HashSet::new();
+        let Ok(mut reloaded) = Self::load_dict_with_imports(path, &mut visited, true) else {
+            return;
+        };
+        reloaded.source_paths = std::mem::take(&mut self.source_paths);
+        reloaded.name = self.name.clone();
+        if let Some(alg) = self.chord_algebra.clone() {
+            reloaded.set_chord_algebra(alg);
+        }
+        reloaded.pure_chord = self.pure_chord;
+        reloaded.four_auto_commit = true;
+        *self = reloaded;
     }
 
     /// 查找系统预设或自定义配置的方案码表文件路径。
@@ -690,10 +883,44 @@ impl SchemeDict {
     }
 
     /// 添加一条词条编码。
+    /// 从已切分的词条字段中取权重；缺失或非数字记 0（等价于保留文件原始顺序）。
+    fn parse_weight(parts: &[&str], weight_col: Option<usize>) -> i64 {
+        match weight_col {
+            Some(i) => parts
+                .get(i)
+                .and_then(|s| s.trim().parse::<i64>().ok())
+                .unwrap_or(0),
+            None => 0,
+        }
+    }
+
+    /// 添加一个词条（权重记 0，供手工构造与测试使用）。
     pub fn add_entry(&mut self, word: &str, code: &str) {
+        self.add_entry_weighted(word, code, 0);
+    }
+
+    /// 添加一个词条并记录其词库权重，同时登记到「编码 → 词条」反查索引。
+    ///
+    /// 权重用于判定同一编码下谁排第一（ADR 0013 D2）；同一 (编码, 词条) 重复出现时取较大权重。
+    pub fn add_entry_weighted(&mut self, word: &str, code: &str, weight: i64) {
         let codes = self.word_to_codes.entry(word.to_string()).or_default();
         if !codes.contains(&code.to_string()) {
             codes.push(code.to_string());
+        }
+        if !self.collect_index {
+            return;
+        }
+        let group = self.code_index.entry(code.to_string()).or_default();
+        match group.iter_mut().find(|e| e.word == word) {
+            Some(e) => {
+                if weight > e.weight {
+                    e.weight = weight;
+                }
+            }
+            None => group.push(IndexedEntry {
+                word: word.to_string(),
+                weight,
+            }),
         }
     }
 
@@ -801,9 +1028,9 @@ impl SchemeDict {
         if text.is_empty() {
             return (0, Vec::new());
         }
-        if let Some(code) = self.get_primary_code(text) {
-            let strokes = self.code_strokes(code).max(1);
-            let keys = self.decompose_code(code);
+        if let Some((code, strokes)) = self.primary_or_best(text) {
+            let strokes = strokes.max(1);
+            let keys = self.decompose_code(&code);
             return (strokes, keys);
         }
 
@@ -817,9 +1044,9 @@ impl SchemeDict {
             // 尝试最长前缀匹配（从当前剩余最大长度到 1）
             for len in (1..=(chars.len() - start)).rev() {
                 let sub: String = chars[start..start + len].iter().collect();
-                if let Some(code) = self.get_primary_code(&sub) {
-                    let strokes = self.code_strokes(code).max(1);
-                    let keys = self.decompose_code(code);
+                if let Some((code, strokes)) = self.primary_or_best(&sub) {
+                    let strokes = strokes.max(1);
+                    let keys = self.decompose_code(&code);
                     total_strokes += strokes;
                     all_keys.extend(keys);
                     start += len;
@@ -860,6 +1087,14 @@ impl SchemeDict {
 
     /// 计算单个词组单位的最优编码提示。
     fn build_hint_for_word(&self, word: &str) -> CodeHint {
+        // 变长整句方案（虎整句）走 ADR 0014 的连续码模型，优先级高于定长形码。
+        if self.sentence_mode {
+            return self.build_hint_for_word_sentence(word);
+        }
+        // 定长形码（万象虎等）走 ADR 0013 的「确定性优先」择优，与其他方案的击数模型不同。
+        if self.four_auto_commit {
+            return self.build_hint_for_word_four(word);
+        }
         let word_best = self.best_code(word);
         // 逐字分解使用各字「词组语境」的最优编码（无手区前缀的双手形式），
         // 避免把单字独立输入用的单手简码拼进词组产生不可直接键入的混合码。
@@ -877,6 +1112,7 @@ impl SchemeDict {
                     code: self.apply_commit_terminator(wc),
                     strokes: ws,
                     is_oov: false,
+                    rank: 1,
                 };
             }
             let char_sum: u32 = char_parts
@@ -889,6 +1125,7 @@ impl SchemeDict {
                     code: self.apply_commit_terminator(wc),
                     strokes: ws,
                     is_oov: false,
+                    rank: 1,
                 };
             }
             let code: String = char_parts
@@ -900,6 +1137,7 @@ impl SchemeDict {
                 code: self.apply_commit_terminator(code),
                 strokes: char_sum,
                 is_oov: false,
+                rank: 1,
             };
         }
 
@@ -910,6 +1148,7 @@ impl SchemeDict {
                 code: String::new(),
                 strokes: 0,
                 is_oov: true,
+                rank: 1,
             };
         }
         let code: String = char_parts
@@ -925,6 +1164,7 @@ impl SchemeDict {
             code: self.apply_commit_terminator(code),
             strokes,
             is_oov: false,
+            rank: 1,
         }
     }
 
@@ -947,6 +1187,33 @@ impl SchemeDict {
             format!("{code}'")
         } else {
             code
+        }
+    }
+
+    /// 取某文本用于击键统计的编码与击数。
+    ///
+    /// 定长形码（万象虎等）走 ADR 0013 的确定性择优，使统计口径与词提一致（含上屏/选号键）；
+    /// 其余方案沿用「码表首条编码」（历史行为，不改动既有基准）。
+    fn primary_or_best(&self, text: &str) -> Option<(String, u32)> {
+        // 整句方案：与词提同源（连续码 + 一次提交键），口径不再分裂（ADR 0014）。
+        if self.sentence_mode {
+            let hint = self.build_hint_for_word_sentence(text);
+            return if hint.is_oov {
+                None
+            } else {
+                Some((hint.code, hint.strokes))
+            };
+        }
+        if self.four_auto_commit {
+            self.best_four_code(text)
+                .map(|c| (c.code, c.strokes))
+                .or_else(|| {
+                    self.get_primary_code(text)
+                        .map(|c| (c.to_string(), self.code_strokes(c)))
+                })
+        } else {
+            self.get_primary_code(text)
+                .map(|c| (c.to_string(), self.code_strokes(c)))
         }
     }
 
@@ -995,12 +1262,283 @@ impl SchemeDict {
         Some((best.clone(), self.code_strokes(best)))
     }
 
+    // ---- ADR 0013：定长形码的「确定性优先」择优 ----
+
+    /// 定长形码下编码的有效码长：仅计入实际会按下的字符（字母数字与引导键）。
+    fn four_code_len(code: &str) -> u32 {
+        code.chars()
+            .filter(|&c| {
+                c.is_ascii_alphanumeric()
+                    || c == '/'
+                    || c == ';'
+                    || c == '\''
+                    || c == '*'
+                    || c == '['
+                    || c == ']'
+            })
+            .count() as u32
+    }
+
+    /// 查询某编码下指定词条的候选位次与同码候选总数（按权重降序、同权重按词序稳定）。
+    ///
+    /// 返回 `None` 表示该编码在反查索引中不存在（无法判定，按「唯一且首选」处理）。
+    fn code_rank(&self, code: &str, word: &str) -> Option<(u8, usize)> {
+        let group = self.code_index.get(code)?;
+        if group.is_empty() {
+            return None;
+        }
+        let mut sorted: Vec<&IndexedEntry> = group.iter().collect();
+        // 权重降序；权重相同（如虎整句 `.codes.txt` 无权重列）时**保持码表录入顺序**。
+        // Rust 的 `sort_by` 是稳定排序，不再按词条字符串二次排序——那会让「的」被「工作」
+        // 之类排在前面（按码点 工 < 的），与 RIME 实际候选顺序相反。
+        // 用 `Reverse` 而非 `b.weight.cmp(&a.weight)`，避免 clippy 的 sort_by_key 告警。
+        sorted.sort_by_key(|e| std::cmp::Reverse(e.weight));
+        let pos = sorted.iter().position(|e| e.word == word)?;
+        Some(((pos + 1).min(u8::MAX as usize) as u8, sorted.len()))
+    }
+
+    /// 评估某词条的一个候选编码：算出真实按键数、位次与是否唯一。
+    ///
+    /// 定长形码的上屏规则：
+    /// - 4 码且无重码 → 自动上屏，不额外按键；
+    /// - 其余（短码、长码、有重码）→ 需补一次上屏键（首选按空格，非首选按数字键）。
+    fn eval_candidate(&self, word: &str, code: &str) -> CodeCandidate {
+        let (rank, group_len) = self.code_rank(code, word).unwrap_or((1, 1));
+        let len = Self::four_code_len(code);
+        let unique = group_len <= 1;
+        let auto_commit = len == 4 && unique && !code.ends_with('/');
+        let strokes = if auto_commit { len } else { len + 1 };
+        CodeCandidate {
+            code: code.to_string(),
+            strokes,
+            rank,
+        }
+    }
+
+    /// 按 ADR 0013 选最优编码：先过「确定性」门槛，门槛内取击数最少。
+    ///
+    /// 「确定性」= 打完码后能用**一次确定按键**取到目标词：
+    /// - 第 1 位：空格；
+    /// - 第 2 位：`;`，仅当方案把 `;` 绑定为选重键（万象虎、虎整句均如此）。
+    ///
+    /// 第 3 位及以后需要数字键或组合键，代价更高且未必可用，不算确定。
+    /// 反例驱动：万象虎「不是」的一码简词 `c;` 仅 2 击，全码 `cbot` 需 4 击——
+    /// 若只认「首选」为确定，`tigress_simp_ci` 里 3200+ 条简词会被全码全部压掉。
+    ///
+    /// 若全部候选都不确定，退而取击数最少者，并由调用方标注选号位次。
+    fn best_four_code(&self, word: &str) -> Option<CodeCandidate> {
+        let codes = self.word_to_codes.get(word)?;
+        let mut candidates: Vec<CodeCandidate> =
+            codes.iter().map(|c| self.eval_candidate(word, c)).collect();
+        if candidates.is_empty() {
+            return None;
+        }
+        // 击数（含上屏键/选号键）为第一排序键，位次仅作同击数时的决胜项。
+        let certain = candidates
+            .iter()
+            .filter(|c| c.rank == 1 || (c.rank == 2 && self.select_semicolon))
+            .min_by_key(|c| (c.strokes, c.rank, c.code.len()));
+        match certain {
+            Some(c) => Some(c.clone()),
+            None => candidates
+                .iter_mut()
+                .min_by_key(|c| (c.strokes, c.rank, c.code.len()))
+                .cloned(),
+        }
+    }
+
+    /// 定长形码下单个词组单位的编码提示（ADR 0013 D1/D2/D5/D6）。
+    ///
+    /// - 整词已登录：取「首选且击数最少」的码；4 码唯一则自动上屏，否则在提示里补 `␣`（空格）
+    ///   或由渲染层标注选号位次；
+    /// - 整词未登录：逐字独立上屏，每字取「首选且击数最少」的码，逐字之间以 `␣` 显式分隔，
+    ///   击数为各字按键数之和；
+    /// - 任一字未登录：提示留空并标记 `is_oov`。
+    fn build_hint_for_word_four(&self, word: &str) -> CodeHint {
+        if let Some(cand) = self.best_four_code(word) {
+            return CodeHint {
+                word: word.to_string(),
+                code: self.mark_commit_key(&cand.code, cand.strokes, cand.rank),
+                strokes: cand.strokes,
+                is_oov: false,
+                rank: cand.rank,
+            };
+        }
+
+        // 整词未登录：逐字独立上屏（D6）。
+        let mut per_char: Vec<CodeCandidate> = Vec::new();
+        for c in word.chars() {
+            match self.best_four_code(&c.to_string()) {
+                Some(cand) => per_char.push(cand),
+                None => {
+                    return CodeHint {
+                        word: word.to_string(),
+                        code: String::new(),
+                        strokes: 0,
+                        is_oov: true,
+                        rank: 1,
+                    };
+                }
+            }
+        }
+        if per_char.is_empty() {
+            return CodeHint {
+                word: word.to_string(),
+                code: String::new(),
+                strokes: 0,
+                is_oov: true,
+                rank: 1,
+            };
+        }
+        let code: String = per_char
+            .iter()
+            .map(|c| self.mark_commit_key(&c.code, c.strokes, c.rank))
+            .collect();
+        let strokes: u32 = per_char.iter().map(|c| c.strokes).sum();
+        // 逐字打法整体取各字中的最差位次（渲染层据此标注最需要选号的那一字）。
+        let rank = per_char.iter().map(|c| c.rank).max().unwrap_or(1);
+        CodeHint {
+            word: word.to_string(),
+            code,
+            strokes,
+            is_oov: false,
+            rank,
+        }
+    }
+
+    /// 变长整句方案下单个词组单位的编码提示（ADR 0014）。
+    ///
+    /// - 整词已登录（虎整句的 102 个简词）：取击数最少的整词码，击数 = 码长 + 1；
+    /// - 整词未登录：各字取「长度 >= 2 的最短码」拼成**连续码**，击数 = 连续码长 + 1。
+    ///   一码段只在整段输入只有一码时合法，故多字词不能用单字母码组句（否则解码走错切分）；
+    /// - 二者都取不到：提示留空并标记 `is_oov`。
+    fn build_hint_for_word_sentence(&self, word: &str) -> CodeHint {
+        // 1. 整词条（简词）
+        let mut whole: Option<(String, u32, u8)> = None;
+        if let Some(codes) = self.word_to_codes.get(word) {
+            for c in codes {
+                let (rank, _) = self.code_rank(c, word).unwrap_or((1, 1));
+                let strokes = Self::four_code_len(c) + 1;
+                let better = match &whole {
+                    None => true,
+                    Some((_, ws, wr)) => (strokes, rank) < (*ws, *wr),
+                };
+                if better {
+                    whole = Some((c.clone(), strokes, rank));
+                }
+            }
+        }
+
+        // 2. 连续码
+        let continuous = self.sentence_continuous_code(word);
+
+        let (code, strokes, rank) = match (whole, continuous) {
+            (Some((wc, ws, wr)), Some(cc)) => {
+                let cs = Self::four_code_len(&cc) + 1;
+                if cs < ws { (cc, cs, 1u8) } else { (wc, ws, wr) }
+            }
+            (Some((wc, ws, wr)), None) => (wc, ws, wr),
+            (None, Some(cc)) => {
+                let cs = Self::four_code_len(&cc) + 1;
+                (cc, cs, 1u8)
+            }
+            (None, None) => {
+                return CodeHint {
+                    word: word.to_string(),
+                    code: String::new(),
+                    strokes: 0,
+                    is_oov: true,
+                    rank: 1,
+                };
+            }
+        };
+
+        CodeHint {
+            word: word.to_string(),
+            code: self.mark_commit_key(&code, strokes, rank),
+            strokes,
+            is_oov: false,
+            rank,
+        }
+    }
+
+    /// 整句连续码：各字取「长度 >= 2 的最短码」依次相连（ADR 0014）。
+    ///
+    /// 单字词整段只有一码，不受「一码段」限制，直接取其最短码。
+    fn sentence_continuous_code(&self, word: &str) -> Option<String> {
+        let chars: Vec<char> = word.chars().collect();
+        if chars.is_empty() {
+            return None;
+        }
+        let min_len = if chars.len() <= 1 { 1 } else { 2 };
+        let mut out = String::new();
+        for c in &chars {
+            let s = c.to_string();
+            let codes = self.word_to_codes.get(&s)?;
+            let pick = codes
+                .iter()
+                .filter(|c| Self::four_code_len(c) >= min_len)
+                .min_by_key(|c| (Self::four_code_len(c), c.as_str()))
+                .or_else(|| {
+                    codes
+                        .iter()
+                        .min_by_key(|c| (Self::four_code_len(c), c.as_str()))
+                })?;
+            out.push_str(pick);
+        }
+        if out.is_empty() {
+            None
+        } else {
+            Some(out)
+        }
+    }
+
+    /// 在提示串尾部补出**实际要按的那个键**（ADR 0014 D2）。
+    ///
+    /// - 首选且需提交 → `␣`（空格）；
+    /// - 第 2 位 → `;`（方案字母表含 `;`）否则 `2`；
+    /// - 第 3 位 → `'`（字母表含 `'`）否则 `3`；
+    /// - 更靠后 → 位次数字。
+    fn mark_commit_key(&self, code: &str, strokes: u32, rank: u8) -> String {
+        let len = Self::four_code_len(code);
+        if strokes <= len {
+            return code.to_string();
+        }
+        if rank <= 1 {
+            return format!("{code}\u{2423}");
+        }
+        match rank {
+            2 if self.select_semicolon => format!("{code};"),
+            3 if self.select_apostrophe => format!("{code}'"),
+            n => format!("{code}{n}"),
+        }
+    }
+
+    /// 清空编码反查索引（仅定长形码需要判定首选，其余方案释放该内存）。
+    pub fn clear_code_index(&mut self) {
+        self.code_index.clear();
+        self.code_index.shrink_to_fit();
+    }
+
     /// 分解编码为物理按键序列。
     /// 若方案附带 `chord_composer.algebra` 指法规则，则由指法代数引擎完成逆向映射；
     /// 否则按单字符过滤展开。
     pub fn decompose_code(&self, code: &str) -> Vec<String> {
         if let Some(ref algebra) = self.chord_algebra {
             algebra.decompose_code(code)
+        } else if self.sentence_mode {
+            // 整句方案：连续码逐键展开，末尾补一次提交键；
+            // 若末位已是选重键（`/;` 之类）则不再补空格（ADR 0014）。
+            let mut keys: Vec<String> = code
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric() || *c == ';' || *c == '\'')
+                .map(|c| c.to_ascii_lowercase().to_string())
+                .collect();
+            let selected = code.ends_with(';') || code.ends_with('\'');
+            if !keys.is_empty() && !selected {
+                keys.push("Space".to_string());
+            }
+            keys
         } else if self.four_auto_commit {
             let mut keys = Vec::new();
             for c in code.chars() {
@@ -1902,7 +2440,7 @@ mod tests {
         fs::write(&sub_path, sub).unwrap();
 
         let mut visited = std::collections::HashSet::new();
-        let dict = SchemeDict::load_dict_with_imports(&main_path, &mut visited).unwrap();
+        let dict = SchemeDict::load_dict_with_imports(&main_path, &mut visited, true).unwrap();
 
         // 主词典词条保留
         assert_eq!(dict.get_primary_code("文"), Some("vw"));

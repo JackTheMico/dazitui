@@ -16,7 +16,7 @@ use dazitui_core::{
     HintCell, HintHand, KeyboardMode, KeypressRecordItem, LoadError, LoadOptions, Rgb, SchemeDict,
     SchemeInfo, Session, SessionRecord, Settings, SettingsStore, Stats, StatsDb, Text, TextSource,
     Theme, TokenStore, default_rime_data_dir, discover_schemes, env_credentials,
-    format_stats_share_text, format_time, hint_cell_widths, is_auth_failure, key_accuracy_pct,
+    format_stats_share_text, format_time, hand_of_code, hint_cell_widths, is_auth_failure, key_accuracy_pct,
     kongming_1hit_hint, layout_code_hint_line, load_builtin_text, load_builtin_text_shuffled,
     load_text_from_clipboard, load_text_from_file, load_text_from_string, lttb_downsample,
     normalize_scheme_to_id, osc52_clipboard, pack_words_by_width, prewarm_segmenter,
@@ -8511,6 +8511,7 @@ fn code_hint_overlay_line(
                         code: format!("{prefix}{chord}"),
                         strokes: 1,
                         is_oov: false,
+                        rank: 1,
                     }
                 } else {
                     CodeHint {
@@ -8518,6 +8519,7 @@ fn code_hint_overlay_line(
                         code: String::new(),
                         strokes: 0,
                         is_oov: true,
+                        rank: 1,
                     }
                 }
             })
@@ -8667,6 +8669,7 @@ fn builtin_cell_widths(
                         code: format!("{prefix}{chord}"),
                         strokes: 1,
                         is_oov: false,
+                        rank: 1,
                     }
                 } else {
                     CodeHint {
@@ -8674,6 +8677,7 @@ fn builtin_cell_widths(
                         code: String::new(),
                         strokes: 0,
                         is_oov: true,
+                        rank: 1,
                     }
                 }
             })
