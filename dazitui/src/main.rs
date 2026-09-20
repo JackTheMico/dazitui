@@ -17,7 +17,7 @@ use dazitui_core::{
     RankColumnId, Rgb, SchemeDict, SchemeInfo, Session, SessionRecord, Settings, SettingsStore, Stats,
     StatsDb, Text, TextSource, Theme, TokenStore, default_rime_data_dir, detect_and_parse_book,
     discover_schemes, env_credentials, format_stats_share_text, format_time, hand_of_code,
-    hint_cell_widths, is_auth_failure, key_accuracy_pct, kongming_1hit_hint, layout_code_hint_line,
+    hint_cell_widths, is_auth_failure, key_accuracy_pct, kongming_1hit_hint, kongming_1hit_word_hint, layout_code_hint_line,
     load_builtin_text, load_builtin_text_shuffled, load_text_from_clipboard, load_text_from_file,
     load_text_from_string, lttb_downsample, normalize_scheme_to_id, osc52_clipboard,
     pack_words_by_width, prewarm_segmenter, resolve_scheme_path_via_discovery, save_text_to_file,
@@ -5582,7 +5582,7 @@ fn ui(frame: &mut Frame, app: &App) {
         let is_kongming_1hit = matches!(
             app.text.source,
             TextSource::Builtin {
-                set: BuiltinSet::KongmingOneHitChars
+                set: BuiltinSet::KongmingOneHitChars | BuiltinSet::KongmingOneHitWords
             }
         );
         let dict_ok = code_hint_dict_usable(app.scheme_dict.as_ref());
@@ -9686,6 +9686,53 @@ fn code_hint_overlay_line(
         let cells = layout_code_hint_line(&words, &hints, &typed_mask);
         return Some(code_hint_line_from_cells(&cells, theme));
     }
+    if set == BuiltinSet::KongmingOneHitWords {
+        let boundaries: Vec<(usize, usize)> = match &text.word_boundaries {
+            Some(b) if !b.is_empty() => b.clone(),
+            _ => set.word_boundaries(),
+        };
+        let page_end = (page_start + group_size).min(boundaries.len());
+        if page_start >= boundaries.len() {
+            return None;
+        }
+        let statuses = session.original_status();
+        let mut words: Vec<String> = Vec::new();
+        let mut typed_mask: Vec<bool> = Vec::new();
+        for &(ws, we) in boundaries[page_start..page_end].iter() {
+            let word: String = statuses[ws..we].iter().map(|(c, _)| *c).collect();
+            let all_correct = (ws..we).all(|i| {
+                statuses
+                    .get(i)
+                    .is_some_and(|(_, s)| *s == Some(CharStatus::Correct))
+            });
+            words.push(word);
+            typed_mask.push(all_correct);
+        }
+        let hints: Vec<CodeHint> = words
+            .iter()
+            .map(|w| {
+                if let Some((chord, _hand)) = kongming_1hit_word_hint(w) {
+                    CodeHint {
+                        word: w.clone(),
+                        code: chord.to_string(),
+                        strokes: 1,
+                        is_oov: false,
+                        rank: 1,
+                    }
+                } else {
+                    CodeHint {
+                        word: w.clone(),
+                        code: String::new(),
+                        strokes: 0,
+                        is_oov: true,
+                        rank: 1,
+                    }
+                }
+            })
+            .collect();
+        let cells = layout_code_hint_line(&words, &hints, &typed_mask);
+        return Some(code_hint_line_from_cells(&cells, theme));
+    }
     // 内置单字赛文（常用单字前/中/后五百）：逐字以方案词典反查编码提示。
     // 与空明一击字不同，此处走「已载入方案词典」路径（虎码/万象虎等形码单字练习需求）。
     if set.is_single_char() {
@@ -9833,6 +9880,49 @@ fn builtin_cell_widths(
                 } else {
                     CodeHint {
                         word: c.to_string(),
+                        code: String::new(),
+                        strokes: 0,
+                        is_oov: true,
+                        rank: 1,
+                    }
+                }
+            })
+            .collect();
+        return Some(hint_cell_widths(&words, &hints));
+    }
+    if set == BuiltinSet::KongmingOneHitWords {
+        let owned_boundaries;
+        let boundaries: &[(usize, usize)] = match &text.word_boundaries {
+            Some(b) if !b.is_empty() => b,
+            _ => {
+                owned_boundaries = set.word_boundaries();
+                &owned_boundaries
+            }
+        };
+        let page_start_word = page_start;
+        let page_end_word = (page_start_word + group_size).min(boundaries.len());
+        if page_start_word >= boundaries.len() {
+            return None;
+        }
+        let statuses = session.original_status();
+        let words: Vec<String> = boundaries[page_start_word..page_end_word]
+            .iter()
+            .map(|&(ws, we)| statuses[ws..we].iter().map(|(c, _)| *c).collect())
+            .collect();
+        let hints: Vec<CodeHint> = words
+            .iter()
+            .map(|w| {
+                if let Some((chord, _hand)) = kongming_1hit_word_hint(w) {
+                    CodeHint {
+                        word: w.clone(),
+                        code: chord.to_string(),
+                        strokes: 1,
+                        is_oov: false,
+                        rank: 1,
+                    }
+                } else {
+                    CodeHint {
+                        word: w.clone(),
                         code: String::new(),
                         strokes: 0,
                         is_oov: true,
@@ -12391,6 +12481,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn code_hint_overlay_shows_chord_for_kongming_one_hit_words() {
+        let theme = Theme::preset(ThemePreset::CatppuccinMocha);
+        let set = BuiltinSet::KongmingOneHitWords;
+        let text = load_builtin_text(set);
+        let boundaries = set.word_boundaries();
+        let mut session =
+            Session::new_gated_with_words_and_size(&text.content, true, &boundaries, 10);
+
+        // 1. 无词典（None）也能成功生成提示行！
+        let line = code_hint_overlay_line(&session, &text, None, theme)
+            .expect("空明一击词即便无词典也应生成一击编码提示行");
+
+        // 首词是「可以」，在空明码一击词中编码为 "k'"
+        let first_hint_span = line
+            .spans
+            .iter()
+            .find(|s| s.content.contains("k'"))
+            .expect("首格应含 k' 提示");
+        assert_eq!(first_hint_span.style.fg, Some(color(theme.hand_two)));
+
+        // 2. 即便配置了其他方案（如万象虎 tiger），也必须显示空明码自身一击词提示，而非被其他方案覆盖
+        let foreign_dict = SchemeDict::parse("---\nname: tiger\n...\n可以\txkhr\t100\n");
+        let line_with_foreign = code_hint_overlay_line(&session, &text, Some(&foreign_dict), theme)
+            .expect("配置外部方案时仍应生成提示行");
+        assert!(
+            line_with_foreign.spans.iter().any(|s| s.content.contains("k'")),
+            "空明码一击词不应被外部方案词典覆盖"
+        );
+        assert!(
+            !line_with_foreign.spans.iter().any(|s| s.content.contains("xkhr")),
+            "空明码一击词不应显示外部方案的编码"
+        );
+
+        // 3. 正确输入首词后，首格提示应隐藏（留空占位）
+        session.type_text("可以");
+        let line_after_type = code_hint_overlay_line(&session, &text, None, theme)
+            .expect("输入后仍应生成提示行");
+        let first_cell_text = &line_after_type.spans[0].content;
+        assert!(
+            first_cell_text.chars().all(|c| c == ' '),
+            "已打词提示格应留空: {first_cell_text:?}"
+        );
+
+        // 4. 列宽计算应返回 10 个词格宽
+        let widths = builtin_cell_widths(&session, &text, None).expect("空明码一击词应有词格列宽");
+        assert_eq!(widths.len(), 10);
+    }
 
 
     #[test]

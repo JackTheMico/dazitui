@@ -18,8 +18,8 @@ mod online;
 pub use chapter::{BookCatalog, Chapter, detect_and_parse_book};
 
 pub use code_hint::{
-    HintCell, HintHand, KONGMING_1HIT_CHORDS, display_width, hand_of_code,
-    hint_cell_widths, kongming_1hit_hint, layout_code_hint_grid,
+    HintCell, HintHand, KONGMING_1HIT_CHORDS, KONGMING_1HIT_WORDS, display_width, hand_of_code,
+    hint_cell_widths, kongming_1hit_hint, kongming_1hit_word_hint, layout_code_hint_grid,
     layout_code_hint_line, pack_words_by_width,
 };
 pub use db::{
