@@ -315,23 +315,42 @@ mod tests {
     #[test]
     fn test_is_keyboard_device_sysfs() {
         assert!(is_keyboard_device_sysfs("non_existent_event_9999"));
-        if std::path::Path::new("/dev/input/event26").exists() {
-            assert!(is_keyboard_device_sysfs("event26"));
-        }
-        if std::path::Path::new("/dev/input/event4").exists() {
-            assert!(!is_keyboard_device_sysfs("event4"));
+        let by_id_dir = std::path::Path::new("/dev/input/by-id");
+        if let Ok(entries) = std::fs::read_dir(by_id_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.ends_with("-event-kbd") {
+                    if let Ok(target) = entry.path().canonicalize() {
+                        if let Some(event_name) = target.file_name().and_then(|n| n.to_str()) {
+                            assert!(
+                                is_keyboard_device_sysfs(event_name),
+                                "{event_name} 来自 {name} 应被识别为键盘"
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
         }
     }
 
     #[test]
     fn test_discover_keyboard_devices_finds_all_keyboards() {
         let devs = discover_keyboard_devices();
-        if std::path::Path::new("/dev/input/event26").exists() {
-            assert!(
-                devs.contains(&std::path::PathBuf::from("/dev/input/event26")),
-                "discover_keyboard_devices() missed /dev/input/event26! Found only: {:?}",
-                devs
-            );
+        let by_id_dir = std::path::Path::new("/dev/input/by-id");
+        if let Ok(entries) = std::fs::read_dir(by_id_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.ends_with("-event-kbd") {
+                    if let Ok(target) = entry.path().canonicalize() {
+                        assert!(
+                            devs.contains(&target),
+                            "discover_keyboard_devices() 应包含来自 by-id 的物理键盘: {:?}",
+                            target
+                        );
+                    }
+                }
+            }
         }
     }
 }

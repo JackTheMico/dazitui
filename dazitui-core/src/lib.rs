@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::time::Duration;
 
+pub mod chapter;
 mod code_hint;
 mod db;
 pub mod font16;
@@ -14,13 +15,16 @@ mod settings;
 #[cfg(feature = "online")]
 mod online;
 
+pub use chapter::{BookCatalog, Chapter, detect_and_parse_book};
+
 pub use code_hint::{
-    HintCell, HintHand, KONGMING_1HIT_CHORDS, display_width, hand_of_code, hint_cell_widths,
-    kongming_1hit_hint, layout_code_hint_grid, layout_code_hint_line, pack_words_by_width,
+    HintCell, HintHand, KONGMING_1HIT_CHORDS, display_width, hand_of_code,
+    hint_cell_widths, kongming_1hit_hint, layout_code_hint_grid,
+    layout_code_hint_line, pack_words_by_width,
 };
 pub use db::{
-    DbError, DbTask, DbWorker, ErrorRecordItem, GlobalStatsSummary, KeypressRecordItem,
-    MistypedCharStat, MistypedWordStat, SessionRecord, StatsDb,
+    ChapterProgress, DbError, DbTask, DbWorker, ErrorRecordItem, GlobalStatsSummary,
+    KeypressRecordItem, MistypedCharStat, MistypedWordStat, SessionRecord, StatsDb,
 };
 pub use lttb::lttb_downsample;
 pub use scheme::{
@@ -28,7 +32,10 @@ pub use scheme::{
     default_rime_data_dir, discover_schemes, parse_rime_yaml, resolve_scheme_path_via_discovery,
 };
 pub use segmenter::{WordIndex, WordToken, prewarm_segmenter};
-pub use session::{CharStatus, ErrorPoint, ErrorType, GROUP_SIZE, Session, Stats, TypeResult};
+pub use session::{
+    CharStatus, ErrorPoint, ErrorType, GROUP_SIZE, Session, Stats, TypeResult, chars_match,
+    is_paired_punctuation,
+};
 pub use settings::{
     BuiltinProgress, FONT_SIZE_PT, HeatmapLayout, KeyboardMode, RankColumnConfig, RankColumnId,
     Rgb, Settings, SettingsStore, Theme, ThemePreset, normalize_scheme_to_id,
@@ -118,6 +125,8 @@ pub enum TextSource {
     Online { competition_type: CompetitionType },
     /// 虎码杯（race.tiger-code.com）在线赛文。
     TigerCup,
+    /// 分章赛文（带章节索引）。
+    ChapteredFile { chapter_index: usize },
 }
 
 impl TextSource {
@@ -624,6 +633,7 @@ pub fn format_stats_share_text(
         TextSource::Builtin { set } => set.name(),
         TextSource::Online { competition_type } => competition_type.name(),
         TextSource::TigerCup => "虎码杯",
+        TextSource::ChapteredFile { .. } => "分章赛文",
     };
     let rank_part = rank.map(|r| format!(" 第{r}名")).unwrap_or_default();
     let total_chars = text.content.chars().count();

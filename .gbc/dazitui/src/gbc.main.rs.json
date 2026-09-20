@@ -41,7 +41,8 @@
                 "Session::backspace.records_edit",
                 "Session::backspace.locked_at_boundary",
                 "Session::is_complete.requires_all_correct",
-                "Session::finish.calculates_wpm"
+                "Session::finish.calculates_wpm",
+                "Session::type_char.matches_quote_variants"
             ]
         },
         {

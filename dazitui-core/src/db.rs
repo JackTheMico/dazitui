@@ -256,6 +256,21 @@ pub struct MistypedWordStat {
     pub affected_sessions: u32,
 }
 
+/// 分章赛文断点进度记录。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChapterProgress {
+    /// 规范化文件绝对路径。
+    pub file_path: String,
+    /// 当前章节索引（从 0 开始）。
+    pub chapter_index: usize,
+    /// 章节内已跟打字符数。
+    pub char_offset: usize,
+    /// 章节总字符数。
+    pub total_chars: usize,
+    /// ISO-8601 更新时间戳。
+    pub updated_at: String,
+}
+
 /// 数据库管理对象。
 pub struct StatsDb {
     conn: Connection,
@@ -343,6 +358,14 @@ impl StatsDb {
                  press_count INTEGER NOT NULL,
                  is_raw INTEGER NOT NULL DEFAULT 1,
                  PRIMARY KEY (session_id, key_code, is_raw)
+             );
+
+             CREATE TABLE IF NOT EXISTS chapter_progress (
+                 file_path TEXT PRIMARY KEY,
+                 chapter_index INTEGER NOT NULL,
+                 char_offset INTEGER NOT NULL,
+                 total_chars INTEGER NOT NULL,
+                 updated_at TEXT NOT NULL
              );
 
              CREATE INDEX IF NOT EXISTS idx_sessions_created_at ON sessions(created_at);
@@ -809,6 +832,56 @@ impl StatsDb {
             params![target_word],
         )?;
         Ok(deleted)
+    }
+
+    /// 保存或更新分章赛文的断点进度。
+    pub fn save_chapter_progress(&mut self, progress: &ChapterProgress) -> Result<(), DbError> {
+        self.conn.execute(
+            "INSERT INTO chapter_progress (file_path, chapter_index, char_offset, total_chars, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(file_path) DO UPDATE SET
+                 chapter_index = excluded.chapter_index,
+                 char_offset = excluded.char_offset,
+                 total_chars = excluded.total_chars,
+                 updated_at = excluded.updated_at",
+            params![
+                progress.file_path,
+                progress.chapter_index as i64,
+                progress.char_offset as i64,
+                progress.total_chars as i64,
+                progress.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 获取指定文件的分章赛文断点进度。
+    pub fn get_chapter_progress(&self, file_path: &str) -> Result<Option<ChapterProgress>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT file_path, chapter_index, char_offset, total_chars, updated_at
+             FROM chapter_progress WHERE file_path = ?1",
+        )?;
+        let mut rows = stmt.query([file_path])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(ChapterProgress {
+                file_path: row.get(0)?,
+                chapter_index: row.get::<_, i64>(1)? as usize,
+                char_offset: row.get::<_, i64>(2)? as usize,
+                total_chars: row.get::<_, i64>(3)? as usize,
+                updated_at: row.get(4)?,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// 删除指定文件的分章赛文断点进度。
+    pub fn delete_chapter_progress(&mut self, file_path: &str) -> Result<(), DbError> {
+        self.conn.execute(
+            "DELETE FROM chapter_progress WHERE file_path = ?1",
+            params![file_path],
+        )?;
+        Ok(())
     }
 }
 
@@ -1278,5 +1351,44 @@ mod tests {
         let top_words = db.get_top_mistyped_words(10).unwrap();
         assert_eq!(top_words.len(), 1);
         assert_eq!(top_words[0].target_word, "汉字");
+    }
+
+    #[test]
+    fn test_chapter_progress_crud() {
+        let mut db = StatsDb::open_in_memory().unwrap();
+        let file_path = "/home/test/book.txt";
+
+        // 初始无进度
+        assert_eq!(db.get_chapter_progress(file_path).unwrap(), None);
+
+        // 保存进度
+        let progress = ChapterProgress {
+            file_path: file_path.to_string(),
+            chapter_index: 3,
+            char_offset: 250,
+            total_chars: 2000,
+            updated_at: "2026-09-19T17:00:00Z".to_string(),
+        };
+        db.save_chapter_progress(&progress).unwrap();
+
+        // 读取进度
+        let loaded = db.get_chapter_progress(file_path).unwrap().expect("应存在进度");
+        assert_eq!(loaded, progress);
+
+        // 更新进度
+        let updated = ChapterProgress {
+            file_path: file_path.to_string(),
+            chapter_index: 4,
+            char_offset: 50,
+            total_chars: 3200,
+            updated_at: "2026-09-19T17:30:00Z".to_string(),
+        };
+        db.save_chapter_progress(&updated).unwrap();
+        let loaded2 = db.get_chapter_progress(file_path).unwrap().expect("应存在更新后进度");
+        assert_eq!(loaded2, updated);
+
+        // 删除进度
+        db.delete_chapter_progress(file_path).unwrap();
+        assert_eq!(db.get_chapter_progress(file_path).unwrap(), None);
     }
 }

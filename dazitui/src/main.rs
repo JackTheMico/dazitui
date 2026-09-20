@@ -10,18 +10,18 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use dazitui_core::ThemePreset;
 use dazitui_core::normalize_online_content;
 use dazitui_core::{
-    ApiClient, ApiError, AuthSession, BUILTIN_SETS, BuiltinProgress, BuiltinSet, CharStatus,
-    CodeHint, CompetitionRank, CompetitionRankRow, CompetitionType, DbTask, DbWorker,
-    ErrorRecordItem, ErrorType, HeatmapLayout, RankColumnConfig, RankColumnId,
-    HintCell, HintHand, KeyboardMode, KeypressRecordItem, LoadError, LoadOptions, Rgb, SchemeDict,
-    SchemeInfo, Session, SessionRecord, Settings, SettingsStore, Stats, StatsDb, Text, TextSource,
-    Theme, TokenStore, default_rime_data_dir, discover_schemes, env_credentials,
-    format_stats_share_text, format_time, hand_of_code, hint_cell_widths, is_auth_failure, key_accuracy_pct,
-    kongming_1hit_hint, layout_code_hint_line, load_builtin_text, load_builtin_text_shuffled,
-    load_text_from_clipboard, load_text_from_file, load_text_from_string, lttb_downsample,
-    normalize_scheme_to_id, osc52_clipboard, pack_words_by_width, prewarm_segmenter,
-    resolve_scheme_path_via_discovery, save_text_to_file, today_ymd, word_ratio_pct,
-    TigerCupClient, TigerDraft, TigerDraftStore, TigerLeaderboardEntry,
+    ApiClient, ApiError, AuthSession, BUILTIN_SETS, BookCatalog, BuiltinProgress, BuiltinSet,
+    ChapterProgress, CharStatus, CodeHint, CompetitionRank, CompetitionRankRow,
+    CompetitionType, DbTask, DbWorker, ErrorRecordItem, ErrorType, HeatmapLayout,
+    HintCell, HintHand, KeyboardMode, KeypressRecordItem, LoadError, LoadOptions, RankColumnConfig,
+    RankColumnId, Rgb, SchemeDict, SchemeInfo, Session, SessionRecord, Settings, SettingsStore, Stats,
+    StatsDb, Text, TextSource, Theme, TokenStore, default_rime_data_dir, detect_and_parse_book,
+    discover_schemes, env_credentials, format_stats_share_text, format_time, hand_of_code,
+    hint_cell_widths, is_auth_failure, key_accuracy_pct, kongming_1hit_hint, layout_code_hint_line,
+    load_builtin_text, load_builtin_text_shuffled, load_text_from_clipboard, load_text_from_file,
+    load_text_from_string, lttb_downsample, normalize_scheme_to_id, osc52_clipboard,
+    pack_words_by_width, prewarm_segmenter, resolve_scheme_path_via_discovery, save_text_to_file,
+    today_ymd, word_ratio_pct, TigerCupClient, TigerDraft, TigerDraftStore, TigerLeaderboardEntry,
     build_tiger_payload, format_tiger_share_text,
 };
 use dazitui_core::font16::{glyph_for_char_or_fallback, render_glyph_braille};
@@ -358,6 +358,8 @@ enum AppState {
     Browsing,
     /// 内置赛文浏览：功能栏显示套题列表，可载入。
     BrowsingBuiltin,
+    /// 章节目录视图：分章赛文浏览、跳章与断点续打。
+    ChapterCatalog,
     /// 设置视图：切换主题等外观设置。
     Settings,
     /// 统计视图：速度趋势图、键位热力图与错字排行榜。
@@ -372,6 +374,105 @@ enum AppState {
         deadline: Instant,
         source: CountdownSource,
     },
+}
+
+/// 分章赛文目录交互状态。
+#[derive(Debug, Clone)]
+struct ChapterCatalogState {
+    book: BookCatalog,
+    file_path: PathBuf,
+    selected_index: usize,
+    scroll_offset: usize,
+    search_query: String,
+    is_searching: bool,
+    last_progress: Option<ChapterProgress>,
+}
+
+impl ChapterCatalogState {
+    /// 根据搜索条件获取匹配的章节索引列表。
+    fn filtered_indices(&self) -> Vec<usize> {
+        let q = self.search_query.trim();
+        if q.is_empty() {
+            return (0..self.book.len()).collect();
+        }
+        let q_lower = q.to_lowercase();
+        self.book
+            .chapters
+            .iter()
+            .enumerate()
+            .filter(|(idx, ch)| {
+                ch.title.to_lowercase().contains(&q_lower)
+                    || (idx + 1).to_string() == q
+                    || format!("第{}章", idx + 1).contains(&q_lower)
+            })
+            .map(|(idx, _)| idx)
+            .collect()
+    }
+
+    /// 当前选中的章节在过滤后列表中的下标。
+    fn filtered_pos(&self) -> usize {
+        let filtered = self.filtered_indices();
+        filtered
+            .iter()
+            .position(|&idx| idx == self.selected_index)
+            .unwrap_or(0)
+    }
+
+    fn move_up(&mut self) {
+        let filtered = self.filtered_indices();
+        if filtered.is_empty() {
+            return;
+        }
+        let pos = self.filtered_pos();
+        if pos > 0 {
+            self.selected_index = filtered[pos - 1];
+        }
+    }
+
+    fn move_down(&mut self) {
+        let filtered = self.filtered_indices();
+        if filtered.is_empty() {
+            return;
+        }
+        let pos = self.filtered_pos();
+        if pos + 1 < filtered.len() {
+            self.selected_index = filtered[pos + 1];
+        }
+    }
+
+    fn page_up(&mut self, page_size: usize) {
+        let filtered = self.filtered_indices();
+        if filtered.is_empty() {
+            return;
+        }
+        let pos = self.filtered_pos();
+        let target = pos.saturating_sub(page_size);
+        self.selected_index = filtered[target];
+    }
+
+    fn page_down(&mut self, page_size: usize) {
+        let filtered = self.filtered_indices();
+        if filtered.is_empty() {
+            return;
+        }
+        let pos = self.filtered_pos();
+        let target = (pos + page_size).min(filtered.len().saturating_sub(1));
+        self.selected_index = filtered[target];
+    }
+
+    fn first(&mut self) {
+        let filtered = self.filtered_indices();
+        if let Some(&first) = filtered.first() {
+            self.selected_index = first;
+        }
+    }
+
+    fn last(&mut self) {
+        let filtered = self.filtered_indices();
+        if let Some(&last) = filtered.last() {
+            self.selected_index = last;
+        }
+    }
 }
 
 /// 准备倒计时从哪个浏览界面进入，取消时回到对应界面。
@@ -967,6 +1068,8 @@ struct App {
     resume_prompt: Option<(BuiltinSet, usize, usize)>,
     /// 上次已落盘存档的已完成组数（跟打中用于增量保存，避免每键写盘）。
     last_saved_completed: usize,
+    /// 分章赛文目录交互状态（`Some` 时表示当前持有小说目录）。
+    chapter_state: Option<ChapterCatalogState>,
     /// 自定义设置文本弹窗（`None` = 未打开）。
     text_setting_modal: Option<TextSettingModal>,
     /// 自由发文编辑弹窗（`None` = 未打开）。
@@ -1379,6 +1482,7 @@ impl App {
             builtin_preview: None,
             resume_prompt: None,
             last_saved_completed: 0,
+            chapter_state: None,
             text_setting_modal: None,
             free_input_modal: None,
             live_keyboard,
@@ -1403,6 +1507,51 @@ impl App {
             target_failure_notice: None,
         };
         app.reload_scheme_dict();
+        app
+    }
+
+    /// 载入分章赛文目录并初始化 App。
+    fn new_chaptered(
+        catalog: BookCatalog,
+        file_path: PathBuf,
+        progress: Option<ChapterProgress>,
+    ) -> Self {
+        let initial_selected = if let Some(ref p) = progress {
+            p.chapter_index.min(catalog.len().saturating_sub(1))
+        } else if catalog.len() > 1 && catalog.chapters[0].title == "前言与简介" {
+            1
+        } else {
+            0
+        };
+
+        let initial_text = catalog
+            .chapter_text(initial_selected, &file_path, &LoadOptions::default())
+            .unwrap_or_else(|_| Text {
+                title: catalog.book_title.clone(),
+                content: "准备开始跟打".to_string(),
+                source: TextSource::ChapteredFile {
+                    chapter_index: initial_selected,
+                },
+                word_boundaries: None,
+                shuffled: false,
+            });
+
+        let mut app = Self::new(initial_text);
+        let chapter_state = ChapterCatalogState {
+            book: catalog,
+            file_path,
+            selected_index: initial_selected,
+            scroll_offset: if initial_selected > 10 {
+                initial_selected.saturating_sub(5)
+            } else {
+                0
+            },
+            search_query: String::new(),
+            is_searching: false,
+            last_progress: progress,
+        };
+        app.chapter_state = Some(chapter_state);
+        app.state = AppState::ChapterCatalog;
         app
     }
 
@@ -2330,14 +2479,54 @@ impl App {
         self.state = AppState::Browsing;
     }
 
-    /// 载入当前选中的文件，成功后开始新跟打。
+    /// 载入当前选中的文件，成功后开始新跟打或进入章节目录。
     fn load_selected(&mut self) {
         let Some(path) = self.browse_files.get(self.browse_selection).cloned() else {
             return;
         };
+        let canonical = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        if let Ok(content) = fs::read_to_string(&canonical) {
+            let file_name = canonical
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if let Some(catalog) = detect_and_parse_book(content, &file_name) {
+                let progress = if let Ok(db) = StatsDb::with_default_path() {
+                    db.get_chapter_progress(&canonical.to_string_lossy())
+                        .ok()
+                        .flatten()
+                } else {
+                    None
+                };
+                let initial_selected = if let Some(ref p) = progress {
+                    p.chapter_index.min(catalog.len().saturating_sub(1))
+                } else if catalog.len() > 1 && catalog.chapters[0].title == "前言与简介" {
+                    1
+                } else {
+                    0
+                };
+                let chapter_state = ChapterCatalogState {
+                    book: catalog,
+                    file_path: canonical,
+                    selected_index: initial_selected,
+                    scroll_offset: if initial_selected > 10 {
+                        initial_selected.saturating_sub(5)
+                    } else {
+                        0
+                    },
+                    search_query: String::new(),
+                    is_searching: false,
+                    last_progress: progress,
+                };
+                self.chapter_state = Some(chapter_state);
+                self.state = AppState::ChapterCatalog;
+                return;
+            }
+        }
         match load_text_from_file(&path) {
             Ok(text) => {
                 self.text = text;
+                self.chapter_state = None;
                 self.enter_countdown(CountdownSource::Browsing);
             }
             Err(err) => {
@@ -2583,6 +2772,58 @@ impl App {
             self.last_saved_completed = cg;
             self.group_start_accumulated_elapsed = self.current_elapsed();
         }
+    }
+
+    /// 保存当前分章赛文的跟打断点进度。
+    fn save_current_chapter_progress(&mut self) {
+        let Some(ref mut state) = self.chapter_state else {
+            return;
+        };
+        if let TextSource::ChapteredFile { chapter_index } = self.text.source {
+            let char_offset = self.session.input_chars().len();
+            let total_chars = self.session.original_len();
+            let progress = ChapterProgress {
+                file_path: state.file_path.to_string_lossy().into_owned(),
+                chapter_index,
+                char_offset,
+                total_chars,
+                updated_at: today_ymd(),
+            };
+            if let Ok(mut db) = StatsDb::with_default_path() {
+                let _ = db.save_chapter_progress(&progress);
+            }
+            state.last_progress = Some(progress);
+        }
+    }
+
+    /// 载入分章赛文的指定章节开始跟打。
+    fn load_chapter(&mut self, index: usize, resume_offset: bool) {
+        let Some(ref mut state) = self.chapter_state else {
+            return;
+        };
+        let file_path = state.file_path.clone();
+        let Ok(text) = state.book.chapter_text(index, &file_path, &LoadOptions::default()) else {
+            return;
+        };
+        state.selected_index = index;
+        self.text = text;
+        self.session = Session::new(&self.text.content);
+
+        // 如果启用断点续打，且存档指示该章节有偏移量
+        if resume_offset && let Some(ref p) = state.last_progress {
+            if p.chapter_index == index && p.char_offset > 0 && p.char_offset < self.session.original_len() {
+                self.session.set_resumed_chars(p.char_offset);
+            }
+        }
+
+        self.start = Instant::now();
+        self.accumulated_elapsed = Duration::ZERO;
+        self.group_start_accumulated_elapsed = Duration::ZERO;
+        self.target_failure_notice = None;
+        self.active_start = None;
+        self.paused = false;
+        self.live_keyboard.clear();
+        self.state = AppState::Typing;
     }
 
     /// 按比赛类型下载在线赛文并进入跟打。
@@ -2836,6 +3077,30 @@ fn main() {
         return;
     };
 
+    let path_obj = Path::new(path);
+    let canonical = fs::canonicalize(path_obj).unwrap_or_else(|_| path_obj.to_path_buf());
+    if let Ok(raw_content) = fs::read_to_string(&canonical) {
+        let file_name = canonical
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if let Some(catalog) = detect_and_parse_book(raw_content, &file_name) {
+            let progress = if let Ok(db) = StatsDb::with_default_path() {
+                db.get_chapter_progress(&canonical.to_string_lossy())
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
+            let app = App::new_chaptered(catalog, canonical, progress);
+            if let Err(e) = run_tui(app) {
+                eprintln!("错误: {e}");
+                std::process::exit(1);
+            }
+            return;
+        }
+    }
+
     let text = match load_text_from_file(Path::new(path)) {
         Ok(text) => text,
         Err(err) => {
@@ -2931,6 +3196,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
         match event_to_process {
             Event::Key(key) => {
                 if is_quit(key) {
+                    app.save_current_chapter_progress();
                     return Ok(());
                 }
                 // 登录模态框打开时优先处理其按键。
@@ -3093,6 +3359,13 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                                 || key.code == KeyCode::Char('I')
                             {
                                 app.enter_resume_countdown();
+                                continue;
+                            }
+                            if (key.code == KeyCode::Char('c') || key.code == KeyCode::Char('C'))
+                                && app.chapter_state.is_some()
+                            {
+                                app.save_current_chapter_progress();
+                                app.state = AppState::ChapterCatalog;
                                 continue;
                             }
                             if is_early_finish(key) {
@@ -3356,6 +3629,88 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                                 app.toggle_sidebar_via_tab(key);
                             }
                             _ => {}
+                        }
+                    }
+                    AppState::ChapterCatalog => {
+                        let mut action = None;
+                        if let Some(ref mut state) = app.chapter_state {
+                            if state.is_searching {
+                                match key.code {
+                                    KeyCode::Esc => {
+                                        state.is_searching = false;
+                                        state.search_query.clear();
+                                    }
+                                    KeyCode::Enter => {
+                                        state.is_searching = false;
+                                    }
+                                    KeyCode::Backspace => {
+                                        state.search_query.pop();
+                                        let filtered = state.filtered_indices();
+                                        if !filtered.contains(&state.selected_index) {
+                                            if let Some(&first) = filtered.first() {
+                                                state.selected_index = first;
+                                            }
+                                        }
+                                    }
+                                    KeyCode::Char(c) => {
+                                        state.search_query.push(c);
+                                        let filtered = state.filtered_indices();
+                                        if !filtered.contains(&state.selected_index) {
+                                            if let Some(&first) = filtered.first() {
+                                                state.selected_index = first;
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            } else {
+                                match key.code {
+                                    KeyCode::Char('/') => {
+                                        state.is_searching = true;
+                                        state.search_query.clear();
+                                    }
+                                    KeyCode::Up | KeyCode::Char('k') => {
+                                        state.move_up();
+                                    }
+                                    KeyCode::Down | KeyCode::Char('j') => {
+                                        state.move_down();
+                                    }
+                                    KeyCode::PageUp | KeyCode::Char('u') => {
+                                        state.page_up(15);
+                                    }
+                                    KeyCode::PageDown | KeyCode::Char('d') => {
+                                        state.page_down(15);
+                                    }
+                                    KeyCode::Home | KeyCode::Char('g') => {
+                                        state.first();
+                                    }
+                                    KeyCode::End | KeyCode::Char('G') => {
+                                        state.last();
+                                    }
+                                    KeyCode::Enter => {
+                                        action = Some((state.selected_index, true));
+                                    }
+                                    KeyCode::Char('r') | KeyCode::Char('R') => {
+                                        action = Some((state.selected_index, false));
+                                    }
+                                    KeyCode::Esc | KeyCode::Char('q') => {
+                                        action = Some((usize::MAX, false));
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        if let Some((idx, resume)) = action {
+                            if idx == usize::MAX {
+                                if app.session.is_empty() {
+                                    app.save_current_chapter_progress();
+                                    return Ok(());
+                                } else {
+                                    app.state = AppState::Typing;
+                                }
+                            } else {
+                                app.load_chapter(idx, resume);
+                            }
                         }
                     }
                     AppState::Settings => match key.code {
@@ -4378,10 +4733,66 @@ fn handle_finished_key(app: &mut App, key: KeyEvent) -> bool {
             if app.text.is_online() {
                 app.text = load_builtin_text(BUILTIN_SETS[0]);
             }
+            if matches!(app.text.source, TextSource::ChapteredFile { .. }) && app.chapter_state.is_some() {
+                app.state = AppState::ChapterCatalog;
+                return true;
+            }
             app.restart();
             true
         }
+        KeyCode::Char('c') | KeyCode::Char('C') => {
+            if matches!(app.text.source, TextSource::ChapteredFile { .. }) && app.chapter_state.is_some() {
+                app.state = AppState::ChapterCatalog;
+                return true;
+            }
+            false
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') => {
+            if let TextSource::ChapteredFile { chapter_index } = app.text.source {
+                if let Some(ref state) = app.chapter_state {
+                    let next = chapter_index + 1;
+                    if next < state.book.len() {
+                        let progress = ChapterProgress {
+                            file_path: state.file_path.to_string_lossy().into_owned(),
+                            chapter_index: next,
+                            char_offset: 0,
+                            total_chars: state.book.chapters[next].char_count,
+                            updated_at: today_ymd(),
+                        };
+                        if let Ok(mut db) = StatsDb::with_default_path() {
+                            let _ = db.save_chapter_progress(&progress);
+                        }
+                        app.load_chapter(next, false);
+                        return true;
+                    }
+                }
+            }
+            false
+        }
         KeyCode::Enter | KeyCode::Char('r') | KeyCode::Char('R') => {
+            if let TextSource::ChapteredFile { chapter_index } = app.text.source {
+                if key.code == KeyCode::Enter {
+                    if let Some(ref state) = app.chapter_state {
+                        let next = chapter_index + 1;
+                        if next < state.book.len() {
+                            let progress = ChapterProgress {
+                                file_path: state.file_path.to_string_lossy().into_owned(),
+                                chapter_index: next,
+                                char_offset: 0,
+                                total_chars: state.book.chapters[next].char_count,
+                                updated_at: today_ymd(),
+                            };
+                            if let Ok(mut db) = StatsDb::with_default_path() {
+                                let _ = db.save_chapter_progress(&progress);
+                            }
+                            app.load_chapter(next, false);
+                            return true;
+                        }
+                    }
+                }
+                app.load_chapter(chapter_index, false);
+                return true;
+            }
             if !app.text.is_online() {
                 app.restart();
             }
@@ -4483,6 +4894,7 @@ fn copies_stats_to_clipboard(source: TextSource) -> bool {
         source,
         TextSource::Custom
             | TextSource::File
+            | TextSource::ChapteredFile { .. }
             | TextSource::Builtin { .. }
             | TextSource::Online { .. }
             | TextSource::Clipboard
@@ -5024,6 +5436,12 @@ fn ui(frame: &mut Frame, app: &App) {
             render_rank_column_modal(frame, app, &palette);
         }
         return;
+    }
+    if matches!(app.state, AppState::ChapterCatalog) {
+        if let Some(ref state) = app.chapter_state {
+            render_chapter_catalog(frame, app, state);
+            return;
+        }
     }
     let palette = app.palette();
     // 渲染全屏底色，确保终端背景无论亮暗均统一呈现主题色彩与高对比度
@@ -6168,6 +6586,148 @@ fn render_preview(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             .wrap(Wrap { trim: false }),
         area,
     );
+}
+
+/// 分章赛文目录全屏视图：展示全书章节、搜索过滤、进度标记与快捷键。
+fn render_chapter_catalog(frame: &mut Frame, app: &App, state: &ChapterCatalogState) {
+    let palette = app.palette();
+    let area = frame.area();
+
+    // 绘制全屏背景
+    frame.render_widget(
+        Block::default().style(Style::default().bg(palette.bg).fg(palette.fg)),
+        area,
+    );
+
+    let title_text = format!(" 《{}》章节目录 (共 {} 章) ", state.book.book_title, state.book.len());
+    let outer = themed_block(&palette, true).title(Line::from(vec![Span::styled(
+        title_text,
+        Style::default().fg(palette.accent).add_modifier(Modifier::BOLD),
+    )]));
+    let inner = outer.inner(area);
+    frame.render_widget(outer, area);
+
+    // 垂直布局：元信息/搜索栏(2行) + 章节列表区(Min(0)) + 底部快捷键(3行)
+    let [header_area, list_area, hint_area] = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Min(0),
+        Constraint::Length(3),
+    ])
+    .areas(inner);
+
+    // 1. Header: 作者、状态、搜索栏
+    let mut header_spans = vec![];
+    if let Some(ref author) = state.book.author {
+        header_spans.push(Span::styled(format!("作者：{}  ", author), Style::default().fg(palette.fg)));
+    }
+    if let Some(ref p) = state.last_progress {
+        let last_title = state.book.chapter(p.chapter_index).map(|c| c.title.as_str()).unwrap_or("未知");
+        let pct = if p.total_chars > 0 {
+            (p.char_offset as f64 / p.total_chars as f64 * 100.0).min(100.0) as u32
+        } else {
+            0
+        };
+        header_spans.push(Span::styled(
+            format!("上次跟打：{} ({}%)  ", last_title, pct),
+            Style::default().fg(palette.accent).bold(),
+        ));
+    }
+    header_spans.push(Span::styled("│ 搜索：", Style::default().fg(palette.selection)));
+    if state.is_searching {
+        header_spans.push(Span::styled(
+            format!("{}_", state.search_query),
+            Style::default().fg(palette.accent).bold(),
+        ));
+        header_spans.push(Span::styled(" (输入中，Enter 确认，Esc 取消)", Style::default().fg(palette.fg)));
+    } else if !state.search_query.is_empty() {
+        header_spans.push(Span::styled(
+            format!("\"{}\" ", state.search_query),
+            Style::default().fg(palette.accent).bold(),
+        ));
+        header_spans.push(Span::styled("(按 / 搜索，Esc 清空)", Style::default().fg(palette.fg)));
+    } else {
+        header_spans.push(Span::styled("按 / 搜索过滤", Style::default().fg(palette.fg)));
+    }
+
+    let header_widget = Paragraph::new(Line::from(header_spans));
+    frame.render_widget(header_widget, header_area);
+
+    // 2. 章节列表
+    let visible_rows = list_area.height as usize;
+    let filtered = state.filtered_indices();
+    let current_pos = state.filtered_pos();
+
+    // 滚动计算
+    let mut state_scroll = state.scroll_offset;
+    if current_pos < state_scroll {
+        state_scroll = current_pos;
+    } else if visible_rows > 0 && current_pos >= state_scroll + visible_rows {
+        state_scroll = current_pos.saturating_sub(visible_rows.saturating_sub(1));
+    }
+
+    let mut list_lines = Vec::new();
+    let end_idx = (state_scroll + visible_rows).min(filtered.len());
+    let slice = if state_scroll < filtered.len() {
+        &filtered[state_scroll..end_idx]
+    } else {
+        &[]
+    };
+
+    for &ch_idx in slice {
+        let ch = &state.book.chapters[ch_idx];
+        let is_selected = ch_idx == state.selected_index;
+        let is_last = state
+            .last_progress
+            .as_ref()
+            .is_some_and(|p| p.chapter_index == ch_idx);
+
+        let prefix = if is_selected { "▶ " } else { "  " };
+        let num_str = format!("{:03}. ", ch_idx + 1);
+
+        let title_display = format!("{:<32}", ch.title);
+        let count_display = format!("{:>7}字", ch.char_count);
+
+        let progress_tag = if let Some(ref p) = state.last_progress && p.chapter_index == ch_idx {
+            let pct = if p.total_chars > 0 {
+                (p.char_offset as f64 / p.total_chars as f64 * 100.0).min(100.0) as u32
+            } else {
+                0
+            };
+            if pct >= 100 {
+                "  [ 已完成 ]  ← 上次跟打".to_string()
+            } else {
+                format!("  [ {:>2}% ]  ← 上次跟打", pct)
+            }
+        } else {
+            "  [ 未开始 ]".to_string()
+        };
+
+        let style = if is_selected {
+            Style::default().fg(palette.bg).bg(palette.accent).bold()
+        } else if is_last {
+            Style::default().fg(palette.accent).bold()
+        } else {
+            Style::default().fg(palette.fg)
+        };
+
+        let line_text = format!("{}{}{}{}{}", prefix, num_str, title_display, count_display, progress_tag);
+        list_lines.push(Line::from(Span::styled(line_text, style)));
+    }
+
+    if list_lines.is_empty() {
+        list_lines.push(Line::from(Span::styled(
+            "  （未找到匹配的章节）",
+            Style::default().fg(palette.fg),
+        )));
+    }
+
+    let list_widget = Paragraph::new(list_lines);
+    frame.render_widget(list_widget, list_area);
+
+    // 3. 底部快捷键提示栏
+    let hint_str = " ↑/↓/k/j: 移动 | PgUp/PgDn: 翻页 | /: 搜索 | Enter: 载文跟打 | r: 章首重打 | q/Esc: 退出 ";
+    let hint_line = hint_bar_line(hint_str, &palette);
+    frame.render_widget(Paragraph::new(hint_line), hint_area);
 }
 
 /// 词组赛文预览：取前 `group_size` 个词，词间加空格。
@@ -8045,6 +8605,8 @@ fn render_result_view(
         } else {
             " Esc/q 返回 | s 统计 | f 载文 | b 内置 | i 自由发文 | p 剪贴板 | o 设置 | Ctrl-Q 退出"
         }
+    } else if matches!(app.text.source, TextSource::ChapteredFile { .. }) {
+        " n/Enter 下一章 | r 重打本章 | c 章节目录 | Esc/q 目录 | s 统计 | o 设置 | Ctrl-Q 退出"
     } else {
         " Esc/q 返回 | Enter/r 重打 | s 统计 | f 载文 | b 内置 | i 自由发文 | p 剪贴板 | o 设置 | Ctrl-Q 退出"
     };
@@ -11828,6 +12390,8 @@ mod tests {
             "提示行与带格宽对照行总宽度必须绝对一致"
         );
     }
+
+
 
     #[test]
     fn code_hint_overlay_hides_typed_word_and_reveals_on_backspace() {
@@ -18392,6 +18956,100 @@ mod dot_matrix_tests {
             })
         });
         assert!(has_braille, "UI 跟打区应渲染 Unicode 盲文大字");
+    }
+
+    #[test]
+    fn test_chapter_catalog_state_navigation_and_filtering() {
+        use dazitui_core::Chapter;
+        use std::path::PathBuf;
+
+        let chapters = vec![
+            Chapter {
+                title: "前言与简介".to_string(),
+                byte_start: 0,
+                byte_end: 50,
+                char_count: 30,
+            },
+            Chapter {
+                title: "第一章 师傅".to_string(),
+                byte_start: 50,
+                byte_end: 200,
+                char_count: 100,
+            },
+            Chapter {
+                title: "第二章 迷惘".to_string(),
+                byte_start: 200,
+                byte_end: 400,
+                char_count: 120,
+            },
+            Chapter {
+                title: "第三章 幻觉".to_string(),
+                byte_start: 400,
+                byte_end: 600,
+                char_count: 110,
+            },
+        ];
+        let book = BookCatalog {
+            book_title: "道诡异仙".to_string(),
+            author: Some("狐尾的笔".to_string()),
+            description: None,
+            chapters,
+            raw_content: String::new(),
+        };
+
+        let mut state = ChapterCatalogState {
+            book,
+            file_path: PathBuf::from("/path/to/novel.txt"),
+            selected_index: 1,
+            scroll_offset: 0,
+            search_query: String::new(),
+            is_searching: false,
+            last_progress: None,
+        };
+
+        // 默认选中第一章
+        assert_eq!(state.selected_index, 1);
+        state.move_down();
+        assert_eq!(state.selected_index, 2);
+        state.move_up();
+        assert_eq!(state.selected_index, 1);
+
+        // 搜索过滤匹配标题关键字
+        state.search_query = "幻觉".to_string();
+        let filtered = state.filtered_indices();
+        assert_eq!(filtered, vec![3]);
+
+        // 跳转至最后和最前
+        state.search_query.clear();
+        state.last();
+        assert_eq!(state.selected_index, 3);
+        state.first();
+        assert_eq!(state.selected_index, 0);
+    }
+
+    #[test]
+    fn test_quote_typing_in_chapter_text_renders_correct() {
+        let text = Text {
+            title: "第二章".to_string(),
+            content: "“呼，终于回来了。”松了一口气。".to_string(),
+            source: TextSource::ChapteredFile { chapter_index: 2 },
+            word_boundaries: None,
+            shuffled: false,
+        };
+        let mut session = Session::new(&text.content);
+        // 模拟用户输入：开双引号触发成对“”自动解包、后接正文、闭引号使用半角双引号"
+        session.type_text("“”呼，终于回来了。\"松了一口气。");
+        let statuses = session.original_status();
+        assert!(statuses.iter().all(|(_, s)| *s == Some(CharStatus::Correct)));
+
+        // 验证 original_line 渲染结果全为 Correct 样式，不包含 Wrong 错字高亮
+        let theme = Theme::preset(ThemePreset::Cyberpunk);
+        let lines = original_line(&session, &text, theme, false, None);
+        for line in &lines.lines {
+            for span in &line.spans {
+                assert_ne!(span.style.fg, Some(color(theme.wrong)), "不应出现错字标红: {:?}", span);
+            }
+        }
     }
 }
 

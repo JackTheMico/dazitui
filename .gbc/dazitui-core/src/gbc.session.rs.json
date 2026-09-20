@@ -77,6 +77,17 @@
                 "dazitui/src/main.rs"
             ],
             "disabled": false
+        },
+        "Session::type_char.matches_quote_variants": {
+            "desc": "双引号与单引号在不同输入法变体中等价匹配",
+            "test": "session::tests::test_quote_variants_match",
+            "executor": "cargo-dazitui",
+            "timeout_override": -1,
+            "heavy": 0,
+            "dependents": [
+                "dazitui/src/main.rs"
+            ],
+            "disabled": false
         }
     },
     "depends_on": []

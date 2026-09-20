@@ -32,6 +32,41 @@ pub enum ErrorType {
     Backspace { deleted: char },
 }
 
+/// 判断输入的字符与期望的字符在跟打比对中是否视为匹配。
+///
+/// 中文输入中，标点符号在不同输入法、键盘布局或状态下常有等价变体：
+/// - 双引号：中文左双引号 `“` (\u{201c})、中文右双引号 `”` (\u{201d})、ASCII 双引号 `"` (\u{0022})、全角双引号 `＂` (\u{ff02}) 互为等价。
+/// - 单引号：中文左单引号 `‘` (\u{2018})、中文右单引号 `’` (\u{2019})、ASCII 单引号 `'` (\u{0027})、全角单引号 `＇` (\u{ff07}) 互为等价。
+pub fn chars_match(typed: char, expected: char) -> bool {
+    if typed == expected {
+        return true;
+    }
+    match expected {
+        '“' | '”' | '"' | '＂' => matches!(typed, '“' | '”' | '"' | '＂'),
+        '‘' | '’' | '\'' | '＇' => matches!(typed, '‘' | '’' | '\'' | '＇'),
+        _ => false,
+    }
+}
+
+/// 检查两个字符是否构成常见的成对引号或括号。
+pub fn is_paired_punctuation(open: char, close: char) -> bool {
+    matches!(
+        (open, close),
+        ('“', '”')
+            | ('"', '"')
+            | ('‘', '’')
+            | ('\'', '\'')
+            | ('（', '）')
+            | ('(', ')')
+            | ('【', '】')
+            | ('[', ']')
+            | ('《', '》')
+            | ('<', '>')
+            | ('「', '」')
+            | ('『', '』')
+    )
+}
+
 /// 打错点信息（发生时间 + 当时即时 WPM + 错误类型）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ErrorPoint {
@@ -481,8 +516,23 @@ impl Session {
         strokes: u32,
         elapsed: Duration,
     ) -> TypeResult {
-        let chars: Vec<char> = committed.chars().collect();
+        let mut chars: Vec<char> = committed.chars().collect();
         let start = self.input.len();
+
+        // 针对输入法/终端自动成对符号上屏（如按 " 自动上屏 “” 并把光标移至中间，但终端只收到 “” 两个字符）：
+        // 若输入前缀是 2 字符的成对标点，且当前待打位置期望开符号、而原文紧随其后的下一个位置并非闭符号，
+        // 则自动剥离冗余的闭符号，防止多录入字符导致后续正文全部错位标红。
+        if chars.len() >= 2 && is_paired_punctuation(chars[0], chars[1]) {
+            if let Some(&expected_char) = self.original.get(start) {
+                if chars_match(chars[0], expected_char) {
+                    let next_expected = self.original.get(start + 1).copied();
+                    if next_expected.map_or(true, |ne| !chars_match(chars[1], ne)) {
+                        chars.remove(1);
+                    }
+                }
+            }
+        }
+
         let accept_len = if self.group_gated {
             let (_, group_end) = self.current_group_bounds();
             group_end.saturating_sub(self.input.len()).min(chars.len())
@@ -547,8 +597,8 @@ impl Session {
             let (group_start, group_end) = self.current_group_bounds();
             if self.input.len() >= group_end && group_end > group_start {
                 let is_single_char = self.group_bounds.is_empty();
-                let all_correct =
-                    (group_start..group_end).all(|i| self.input.get(i) == Some(&self.original[i]));
+                let all_correct = (group_start..group_end)
+                    .all(|i| self.input.get(i).is_some_and(|&ic| chars_match(ic, self.original[i])));
 
                 if self.retry_shuffle && is_single_char {
                     let initial_edits = self.group_snapshot.as_ref().map(|s| s.edits).unwrap_or(0);
@@ -883,7 +933,7 @@ impl Session {
             .enumerate()
             .map(|(i, &c)| {
                 let status = self.input.get(i).map(|&ic| {
-                    if ic == c {
+                    if chars_match(ic, c) {
                         CharStatus::Correct
                     } else {
                         CharStatus::Wrong
@@ -976,6 +1026,24 @@ impl Session {
         self.resumed_chars = self.input.len();
     }
 
+    /// 从指定字符偏移量续打（用于分章赛文或长文精确断点续打）。
+    ///
+    /// 将 `offset` 之前的字符预填为正确原文，使光标直接停在 `offset` 处接续输入；
+    /// `resumed_chars` 记录为该偏移量，后续打字成绩（WPM、准确率、用时）从断点后开始计算。
+    pub fn set_resumed_chars(&mut self, offset: usize) {
+        let offset = offset.min(self.original.len());
+        self.input.clear();
+        self.group_start_elapsed = None;
+        self.group_snapshot = None;
+        self.last_target_failure = None;
+        if offset == 0 {
+            self.resumed_chars = 0;
+            return;
+        }
+        self.input.extend_from_slice(&self.original[..offset]);
+        self.resumed_chars = self.input.len();
+    }
+
     /// 总组数。
     pub fn total_groups(&self) -> usize {
         if !self.group_bounds.is_empty() {
@@ -1014,7 +1082,7 @@ impl Session {
         let mut dp = vec![vec![0usize; n + 1]; m + 1];
         for i in 1..=m {
             for j in 1..=n {
-                dp[i][j] = if self.input[i - 1] == self.original[j - 1] {
+                dp[i][j] = if chars_match(self.input[i - 1], self.original[j - 1]) {
                     dp[i - 1][j - 1] + 1
                 } else {
                     dp[i - 1][j].max(dp[i][j - 1])
@@ -1026,7 +1094,7 @@ impl Session {
         let mut statuses = vec![CharStatus::Wrong; m];
         let (mut i, mut j) = (m, n);
         while i > 0 && j > 0 {
-            if self.input[i - 1] == self.original[j - 1] {
+            if chars_match(self.input[i - 1], self.original[j - 1]) {
                 statuses[i - 1] = CharStatus::Correct;
                 i -= 1;
                 j -= 1;
@@ -1955,6 +2023,79 @@ mod tests {
         assert!(session.take_target_failure().is_some());
         let round3_target = session.current_group_target_chars();
         assert_ne!(round2_target, round3_target);
+    }
+
+    #[test]
+    fn test_set_resumed_chars() {
+        let text = "白日依山尽，黄河入海流。欲穷千里目，更上一层楼。";
+        let mut session = Session::new(text);
+        assert_eq!(session.resumed_chars(), 0);
+
+        session.set_resumed_chars(6);
+        assert_eq!(session.resumed_chars(), 6);
+        assert_eq!(session.input_chars().len(), 6);
+        assert_eq!(session.input_chars(), &['白', '日', '依', '山', '尽', '，']);
+
+        // 接续输入正确的下一个字符
+        session.type_text("黄");
+        assert_eq!(session.input_chars().len(), 7);
+        let stats = session.finish(Duration::from_secs(1));
+        // 新击键字符为 1 个
+        assert_eq!(stats.typed_chars, 1);
+        assert_eq!(stats.correct_chars, 1);
+    }
+
+    #[test]
+    fn test_quote_variants_match() {
+        assert!(chars_match('“', '“'));
+        assert!(chars_match('”', '“'));
+        assert!(chars_match('"', '“'));
+        assert!(chars_match('＂', '“'));
+        assert!(chars_match('“', '”'));
+        assert!(chars_match('"', '”'));
+
+        assert!(chars_match('‘', '‘'));
+        assert!(chars_match('’', '‘'));
+        assert!(chars_match('\'', '‘'));
+        assert!(chars_match('＇', '‘'));
+        assert!(chars_match('‘', '’'));
+        assert!(chars_match('\'', '’'));
+
+        assert!(!chars_match('“', '‘'));
+        assert!(!chars_match('a', '“'));
+    }
+
+    #[test]
+    fn test_paired_quotes_auto_unpair() {
+        let mut session = Session::new("“你好”");
+        // 输入法按 " 输出成对 “”
+        let res = session.type_text("“”");
+        // 应自动剔除多余的闭引号，只接受开引号
+        assert_eq!(res.statuses, vec![CharStatus::Correct]);
+        assert_eq!(session.input_chars(), &['“']);
+
+        // 输入正文
+        let res2 = session.type_text("你好");
+        assert_eq!(res2.statuses, vec![CharStatus::Correct, CharStatus::Correct]);
+
+        // 输入闭引号时输入法再次输出成对 “”
+        let res3 = session.type_text("“”");
+        assert_eq!(res3.statuses, vec![CharStatus::Correct]);
+        assert_eq!(session.input_chars(), &['“', '你', '好', '“']);
+        assert!(session.is_complete());
+    }
+
+    #[test]
+    fn test_quotes_in_full_dialogue_typing() {
+        let text = "“呼，终于回来了。”松了一口气。";
+        let mut session = Session::new(text);
+
+        // 模拟输入法使用 ASCII 双引号 " 输入开闭引号
+        session.type_text("\"呼，终于回来了。\"松了一口气。");
+        assert_eq!(session.input_chars().len(), text.chars().count());
+        let statuses = session.original_status();
+        assert!(statuses.iter().all(|(_, s)| *s == Some(CharStatus::Correct)));
+        assert!(session.is_complete());
     }
 }
 
