@@ -62,6 +62,12 @@ pub use online::tigercup::{
     TigerUploadResponse, build_tiger_payload, format_tiger_share_text,
     parse_tiger_article_response, parse_tiger_leaderboard_response,
 };
+#[cfg(feature = "online")]
+pub use online::oxcup::{
+    OX_CUP_ARTICLE_BASE_URL, OX_CUP_SCORE_BASE_URL, OxCupArticle, OxCupClient, OxCupScoreEntry,
+    calculate_ox_proof, format_ox_share_text, parse_ox_cup_article_response,
+    parse_ox_cup_leaderboard_response,
+};
 
 /// 赛文：练习/比赛用的文字内容，来自本地文件或 52dazi.cn。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,6 +131,8 @@ pub enum TextSource {
     Online { competition_type: CompetitionType },
     /// 虎码杯（race.tiger-code.com）在线赛文。
     TigerCup,
+    /// 牛杯（ox-cup）在线群赛文。
+    OxCup,
     /// 分章赛文（带章节索引）。
     ChapteredFile { chapter_index: usize },
 }
@@ -633,6 +641,7 @@ pub fn format_stats_share_text(
         TextSource::Builtin { set } => set.name(),
         TextSource::Online { competition_type } => competition_type.name(),
         TextSource::TigerCup => "虎码杯",
+        TextSource::OxCup => "牛杯",
         TextSource::ChapteredFile { .. } => "分章赛文",
     };
     let rank_part = rank.map(|r| format!(" 第{r}名")).unwrap_or_default();

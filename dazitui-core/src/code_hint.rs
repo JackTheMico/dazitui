@@ -24,9 +24,12 @@ pub enum HintHand {
 }
 
 /// 提示区一个词单元的渲染单元：已按词格宽居中/留空的可视文本，与其手区归属（用于配色）。
+/// 支持存储多手区分段文本（如多字词一击字词提「好人」包含左手 h 与右手 r 各自分段）。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HintCell {
     pub text: String,
     pub hand: HintHand,
+    pub segments: Vec<(String, HintHand)>,
 }
 
 /// 由编码推断其手区归属（用于提示区左右手/双手并击配色）。
@@ -1014,24 +1017,108 @@ pub fn layout_code_hint_line(
             let target = widths.get(i).copied().unwrap_or_else(|| display_width(w));
             let typed = typed_mask.get(i).copied().unwrap_or(false);
             if typed {
+                let text = " ".repeat(target);
                 return HintCell {
-                    text: " ".repeat(target),
+                    text: text.clone(),
                     hand: HintHand::None,
+                    segments: vec![(text, HintHand::None)],
                 };
             }
             match hints.get(i) {
-                Some(h) => {
+                Some(h) if !h.is_oov && !h.code.is_empty() => {
+                    // 检查是否为一击字词提（如多字词全由一击字组成或单字一击字）
+                    let chars: Vec<char> = w.chars().collect();
+                    let hit_info: Option<Vec<(&'static str, HintHand)>> = if !chars.is_empty() {
+                        chars.iter().map(|&c| kongming_1hit_hint(c)).collect()
+                    } else {
+                        None
+                    };
+                    if let Some(hits) = hit_info {
+                        let expected = hits.iter().map(|(c, _)| *c).collect::<Vec<_>>().join(" ");
+                        let clean_code = h.code.strip_prefix('%').unwrap_or(&h.code);
+                        let clean_code = clean_code.strip_suffix('=').unwrap_or(clean_code);
+                        if h.code == expected || clean_code == expected {
+                            let code_w = display_width(&expected);
+                            let cell_text = format_hint_cell(&expected, target);
+                            let overall_hand = if hits.iter().all(|(_, hd)| *hd == hits[0].1) {
+                                hits[0].1
+                            } else {
+                                HintHand::TwoHand
+                            };
+                            let segs = if target > code_w {
+                                let pad = target - code_w;
+                                let left_pad = pad / 2;
+                                let right_pad = pad - left_pad;
+                                let mut segs = Vec::new();
+                                if left_pad > 0 {
+                                    segs.push((" ".repeat(left_pad), HintHand::None));
+                                }
+                                for (idx, (chord, hand)) in hits.iter().enumerate() {
+                                    if idx > 0 {
+                                        segs.push((" ".to_string(), HintHand::None));
+                                    }
+                                    segs.push((chord.to_string(), *hand));
+                                }
+                                if right_pad > 0 {
+                                    segs.push((" ".repeat(right_pad), HintHand::None));
+                                }
+                                segs
+                            } else if target == code_w {
+                                let mut segs = Vec::new();
+                                for (idx, (chord, hand)) in hits.iter().enumerate() {
+                                    if idx > 0 {
+                                        segs.push((" ".to_string(), HintHand::None));
+                                    }
+                                    segs.push((chord.to_string(), *hand));
+                                }
+                                segs
+                            } else {
+                                vec![(cell_text.clone(), overall_hand)]
+                            };
+                            return HintCell {
+                                text: cell_text,
+                                hand: overall_hand,
+                                segments: segs,
+                            };
+                        }
+                    }
+
                     let hand = hand_of_code(&h.code);
                     let code = hint_display_text(&h.code);
+                    let code_w = display_width(&code);
+                    let cell_text = format_hint_cell(&code, target);
+                    let segs = if target > code_w {
+                        let pad = target - code_w;
+                        let left_pad = pad / 2;
+                        let right_pad = pad - left_pad;
+                        let mut segs = Vec::new();
+                        if left_pad > 0 {
+                            segs.push((" ".repeat(left_pad), HintHand::None));
+                        }
+                        segs.push((code.clone(), hand));
+                        if right_pad > 0 {
+                            segs.push((" ".repeat(right_pad), HintHand::None));
+                        }
+                        segs
+                    } else if target == code_w {
+                        vec![(code.clone(), hand)]
+                    } else {
+                        vec![(cell_text.clone(), hand)]
+                    };
                     HintCell {
-                        text: format_hint_cell(&code, target),
+                        text: cell_text,
                         hand,
+                        segments: segs,
                     }
                 }
-                None => HintCell {
-                    text: " ".repeat(target),
-                    hand: HintHand::None,
-                },
+                _ => {
+                    let text = " ".repeat(target);
+                    HintCell {
+                        text: text.clone(),
+                        hand: HintHand::None,
+                        segments: vec![(text, HintHand::None)],
+                    }
+                }
             }
         })
         .collect()
@@ -1453,6 +1540,80 @@ mod tests {
         assert_eq!(cells[0].hand, HintHand::Left); // 是 → _w 左手
         assert_eq!(cells[1].hand, HintHand::Right); // 有 → +e 右手
         assert_eq!(cells[2].hand, HintHand::TwoHand); // 中 → wCs 双手并击无前缀 → TwoHand 单独配色
+    }
+
+    #[test]
+    fn test_kongming_multi_char_hint_cell_colors_left_and_right() {
+        // 空明码一击字词提：好人（好=左手 h，人=右手 r）应拆解为左手分段与右手分段，中间空格与补白为 None。
+        let words = vec!["好人".to_string()];
+        let hints = vec![hint("h r")];
+        let cells = layout_code_hint_line(&words, &hints, &[]);
+        assert_eq!(cells.len(), 1);
+        let cell = &cells[0];
+        // 词宽为 4，编码宽为 3（h r），居中填充 1 格在右侧 -> "h r "
+        assert_eq!(cell.text, "h r ");
+        assert_eq!(
+            cell.segments,
+            vec![
+                ("h".to_string(), HintHand::Left),
+                (" ".to_string(), HintHand::None),
+                ("r".to_string(), HintHand::Right),
+                (" ".to_string(), HintHand::None),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_kongming_single_char_hint_cell_colors_left_and_pads_none() {
+        // 单字一击字在打词/常规排版流中：单字「中」对应左手 f，居中补白为 None，字本身为 Left（粉色）。
+        // 且兼容编码串带 % 前缀或 = 词典后缀的情形。
+        let words = vec!["中".to_string(), "的".to_string()];
+        let hints = vec![hint("f="), hint("d")];
+        let cells = layout_code_hint_line(&words, &hints, &[]);
+        assert_eq!(cells.len(), 2);
+
+        // 「中」字宽 2，码宽 1，居中补充 1 个空格在右侧 -> "f "
+        assert_eq!(cells[0].text, "f ");
+        assert_eq!(cells[0].hand, HintHand::Left);
+        assert_eq!(
+            cells[0].segments,
+            vec![
+                ("f".to_string(), HintHand::Left),
+                (" ".to_string(), HintHand::None),
+            ]
+        );
+
+        // 「的」字宽 2，码宽 1，右手 d
+        assert_eq!(cells[1].text, "d ");
+        assert_eq!(cells[1].hand, HintHand::Right);
+        assert_eq!(
+            cells[1].segments,
+            vec![
+                ("d".to_string(), HintHand::Right),
+                (" ".to_string(), HintHand::None),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_hint_cell_fallback_padding_spaces_have_none_hand() {
+        // 常规单手简码或词提：补白空格绝不染色，只有实际按键有手区色。
+        let words = vec!["测试".to_string()];
+        let hints = vec![hint("_ab")];
+        let cells = layout_code_hint_line(&words, &hints, &[]);
+        assert_eq!(cells.len(), 1);
+        let cell = &cells[0];
+        // 词宽 4，码 "ab" 宽 2，左右各补 1 空格 -> " ab "
+        assert_eq!(cell.text, " ab ");
+        assert_eq!(cell.hand, HintHand::Left);
+        assert_eq!(
+            cell.segments,
+            vec![
+                (" ".to_string(), HintHand::None),
+                ("ab".to_string(), HintHand::Left),
+                (" ".to_string(), HintHand::None),
+            ]
+        );
     }
 
     #[test]

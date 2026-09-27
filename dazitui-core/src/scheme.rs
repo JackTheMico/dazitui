@@ -657,13 +657,15 @@ impl SchemeDict {
             let schema_doc = resolver.load_doc(path).ok().cloned();
             let schema_stem = file_name.strip_suffix(".schema.yaml").unwrap_or(file_name);
             // 定长形码判定不依赖词典内容，先行算出：据此决定是否收集编码反查索引，
-            // 避免为并击/双拼等大型词库白建一份用不到的索引（ADR 0013）。
+            let is_pure_chord = algebra.is_some() && rules_have_long_code_cap(&rules);
+            // 定长形码与纯并击方案均需要反查索引判定首选与选重（ADR 0013 / ADR 0018）。
             let four_auto_commit = Self::detect_four_auto_commit(
                 schema_doc.as_ref(),
                 schema_name.as_deref(),
                 schema_stem,
                 algebra.is_some(),
             );
+            let need_index = four_auto_commit || is_pure_chord;
             let dict_names = Self::extract_schema_dictionary_candidates(schema_doc.as_ref(), schema_stem);
 
             let mut candidate_dicts = Vec::new();
@@ -676,7 +678,7 @@ impl SchemeDict {
             let mut dict = if let Some(dict_path) = candidate_dicts.into_iter().find(|p| p.exists())
             {
                 let mut visited = HashSet::new();
-                Self::load_dict_with_imports(&dict_path, &mut visited, four_auto_commit)?
+                Self::load_dict_with_imports(&dict_path, &mut visited, need_index)?
             } else {
                 Self::default()
             };
@@ -684,7 +686,7 @@ impl SchemeDict {
             // 记录 schema 自身路径（热监控闭包的一部分）
             dict.source_paths.push(canonicalize_path(path));
 
-            dict.pure_chord = algebra.is_some() && rules_have_long_code_cap(&rules);
+            dict.pure_chord = is_pure_chord;
             dict.four_auto_commit = four_auto_commit;
             // 变长整句方案（虎整句）走 ADR 0014 的连续码模型，优先级高于定长形码。
             dict.sentence_mode = Self::detect_sentence_mode(
@@ -697,8 +699,8 @@ impl SchemeDict {
             dict.select_apostrophe = apo;
             if dict.four_auto_commit {
                 dict.prefix_commit_codes.clear();
-            } else {
-                // 反查索引只服务于定长形码的首选判定（ADR 0013），其余方案释放内存。
+            } else if !dict.pure_chord {
+                // 反查索引服务于定长形码与纯并击方案的首选/选重判定（ADR 0013 / ADR 0018），其余方案释放内存。
                 dict.clear_code_index();
             }
             if let Some(alg) = algebra {
@@ -777,10 +779,12 @@ impl SchemeDict {
             );
             dict.sentence_mode = Self::detect_sentence_mode(None, dict.name.as_deref(), stem);
         }
-        if dict.four_auto_commit {
-            dict.prefix_commit_codes.clear();
-            // 预判定失误（如方案名含「虎」而文件名不含关键词）时补建索引。
-            if !guess_four {
+        if dict.four_auto_commit || dict.pure_chord {
+            if dict.four_auto_commit {
+                dict.prefix_commit_codes.clear();
+            }
+            // 预判定未收集索引时补建索引。
+            if !dict.collect_index {
                 dict.ensure_code_index(path);
             }
         } else {
@@ -991,11 +995,31 @@ impl SchemeDict {
             if code.starts_with('%') {
                 return 1;
             }
-            let clean_len = code
+            // 空格分隔的多段一击字词提（如 "h r"、"h␣ r"）
+            if code.contains(' ') {
+                let parts: Vec<&str> = code.split_whitespace().collect();
+                return parts.len() as u32;
+            }
+            // 检查末尾是否带有非首选选重键（如 oc2、bGCw2）
+            let (base_code, has_select_digit) = if let Some(last) = code.chars().last() {
+                if last.is_ascii_digit() && last != '0' && last != '1' {
+                    (&code[..code.len() - last.len_utf8()], true)
+                } else {
+                    (code, false)
+                }
+            } else {
+                (code, false)
+            };
+            let clean_len = base_code
                 .chars()
                 .filter(|&c| c != '_' && c != '+' && c != '-' && !c.is_whitespace())
                 .count();
-            return (clean_len as u32).div_ceil(2).max(1);
+            let base_strokes = (clean_len as u32).div_ceil(2).max(1);
+            return if has_select_digit {
+                base_strokes + 1
+            } else {
+                base_strokes
+            };
         }
         if self.four_auto_commit {
             let clean_len = code
@@ -1094,6 +1118,10 @@ impl SchemeDict {
         // 定长形码（万象虎等）走 ADR 0013 的「确定性优先」择优，与其他方案的击数模型不同。
         if self.four_auto_commit {
             return self.build_hint_for_word_four(word);
+        }
+        // 空明码纯并击方案走 ADR 0018 的「一击词优先与一击字转译」模型
+        if self.pure_chord {
+            return self.build_hint_for_word_pure_chord(word);
         }
         let word_best = self.best_code(word);
         // 逐字分解使用各字「词组语境」的最优编码（无手区前缀的双手形式），
@@ -1211,6 +1239,13 @@ impl SchemeDict {
                     self.get_primary_code(text)
                         .map(|c| (c.to_string(), self.code_strokes(c)))
                 })
+        } else if self.pure_chord {
+            let hint = self.build_hint_for_word_pure_chord(text);
+            if hint.is_oov {
+                None
+            } else {
+                Some((hint.code, hint.strokes))
+            }
         } else {
             self.get_primary_code(text)
                 .map(|c| (c.to_string(), self.code_strokes(c)))
@@ -1490,6 +1525,154 @@ impl SchemeDict {
             None
         } else {
             Some(out)
+        }
+    }
+
+    /// 空明码纯并击方案下单个词组单位的编码提示（ADR 0018）。
+    ///
+    /// 1. 一击词最高优先：词库已收录 1 击多字并击词（如「中国」Uz、「可以」k'）时，保留一击词提示；若非首选加选重键；
+    ///    若词库未命中，回退查标准一击词表（`kongming_1hit_word_hint`）；
+    /// 2. 一击字转译：若非一击词，且词的所有字符均属于 204 个一击字（KONGMING_1HIT_CHORDS），
+    ///    当 `一击字总击数 <= 词码击数` 时，转为以空格分隔的一击字词提（如「好人」-> "h r"，单字「中」-> "f"）；
+    /// 3. 词库整词编码：采用词库最优整词码；非首选时在码尾追加选重数字（如 2 选为 oc2、bGCw2），击数 +1；
+    /// 4. 逐字全码回退：未收录词回退到逐字拼接。
+    fn build_hint_for_word_pure_chord(&self, word: &str) -> CodeHint {
+        struct Candidate {
+            raw_code: String,
+            disp_code: String,
+            base_strokes: u32,
+            strokes: u32,
+            rank: u8,
+        }
+
+        let mut best_word: Option<Candidate> = None;
+        if let Some(codes) = self.word_to_codes.get(word) {
+            for c in codes {
+                let (rank, _) = self.code_rank(c, word).unwrap_or((1, 1));
+                let base_s = self.code_strokes(c);
+                let strokes = base_s + if rank > 1 { 1 } else { 0 };
+                let disp_code = if rank > 1 {
+                    format!("{c}{rank}")
+                } else {
+                    c.clone()
+                };
+                let cand = Candidate {
+                    raw_code: c.clone(),
+                    disp_code,
+                    base_strokes: base_s,
+                    strokes,
+                    rank,
+                };
+                let better = match &best_word {
+                    None => true,
+                    Some(cur) => {
+                        (cand.strokes, cand.rank, cand.raw_code.len())
+                            < (cur.strokes, cur.rank, cur.raw_code.len())
+                    }
+                };
+                if better {
+                    best_word = Some(cand);
+                }
+            }
+        }
+
+        let chars: Vec<char> = word.chars().collect();
+
+        // T1 · 一击词最高优先：
+        // (a) 检查词库是否命中了 1 击多字并击词（词长 > 1 且 base_strokes == 1）
+        if chars.len() > 1 {
+            if let Some(ref cand) = best_word {
+                if cand.base_strokes == 1 {
+                    return CodeHint {
+                        word: word.to_string(),
+                        code: cand.disp_code.clone(),
+                        strokes: cand.strokes,
+                        is_oov: false,
+                        rank: cand.rank,
+                    };
+                }
+            }
+        }
+        // (b) 检查是否为标准一击词表所收录词条（保障小词库下的一击词识别）
+        if let Some((chord, _)) = crate::code_hint::kongming_1hit_word_hint(word) {
+            let (rank, _) = self.code_rank(chord, word).unwrap_or((1, 1));
+            let strokes = 1 + if rank > 1 { 1 } else { 0 };
+            let code = if rank > 1 {
+                format!("{chord}{rank}")
+            } else {
+                chord.to_string()
+            };
+            return CodeHint {
+                word: word.to_string(),
+                code,
+                strokes,
+                is_oov: false,
+                rank,
+            };
+        }
+
+        // T2 · 一击字转译：非一击词，检查是否所有字都是一击字（包含单字与多字）
+        let all_1hit = !chars.is_empty()
+            && chars
+                .iter()
+                .all(|&c| crate::code_hint::kongming_1hit_hint(c).is_some());
+        if all_1hit {
+            let char_strokes = chars.len() as u32;
+            let word_strokes = best_word.as_ref().map(|b| b.strokes).unwrap_or(u32::MAX);
+            if char_strokes <= word_strokes {
+                let chords: Vec<&str> = chars
+                    .iter()
+                    .map(|&c| crate::code_hint::kongming_1hit_hint(c).unwrap().0)
+                    .collect();
+                return CodeHint {
+                    word: word.to_string(),
+                    code: chords.join(" "),
+                    strokes: char_strokes,
+                    is_oov: false,
+                    rank: 1,
+                };
+            }
+        }
+
+        // T3 · 词库整词编码
+        if let Some(cand) = best_word {
+            return CodeHint {
+                word: word.to_string(),
+                code: cand.disp_code,
+                strokes: cand.strokes,
+                is_oov: false,
+                rank: cand.rank,
+            };
+        }
+
+        // T4 · 逐字全码回退
+        let char_parts: Vec<Option<(String, u32)>> = word
+            .chars()
+            .map(|c| self.best_composition_code(&c.to_string()))
+            .collect();
+        if char_parts.iter().any(|p| p.is_none()) {
+            return CodeHint {
+                word: word.to_string(),
+                code: String::new(),
+                strokes: 0,
+                is_oov: true,
+                rank: 1,
+            };
+        }
+        let code: String = char_parts
+            .iter()
+            .map(|p| p.as_ref().map(|(c, _)| c.as_str()).unwrap_or(""))
+            .collect();
+        let strokes: u32 = char_parts
+            .iter()
+            .map(|p| p.as_ref().map(|(_, s)| *s).unwrap_or(0))
+            .sum();
+        CodeHint {
+            word: word.to_string(),
+            code,
+            strokes,
+            is_oov: false,
+            rank: 1,
         }
     }
 
@@ -3012,6 +3195,123 @@ algebra:
         assert_eq!(stats.total_strokes, 4, "总击数应为 4 击（1+1+2）");
         assert_eq!(stats.key_length, 1.0, "打词场景下空明码码长应稳定在 1.0 左右");
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_kongming_pure_chord_preserves_rank_and_appends_number() {
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!("dazitui_km_rank_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let schema = dir.join("km.schema.yaml");
+        let dict = dir.join("km.dict.yaml");
+        let schema_content = "schema:\n  name: 空明码测试\n  schema_id: km\ntranslator:\n  dictionary: km\nchord_composer:\n  algebra:\n    - xform|a|b|\n    - xform|^\\S{3,}$||\n";
+        fs::write(&schema, schema_content).unwrap();
+        // 重码组：测试(首选，权重1000) 与 侧视(次选/2选，权重900)，编码均为 oc (1并击)
+        // 佳人(2选，编码 YJyY，2并击)
+        fs::write(
+            &dict,
+            "测试\toc\t1000\n侧视\toc\t900\n雨夜\tYJyY\t1000\n佳人\tYJyY\t800\n",
+        )
+        .unwrap();
+
+        let loaded = SchemeDict::load_from_file(&schema).expect("加载空明码测试方案");
+        assert!(loaded.pure_chord, "应为纯并击方案");
+
+        // 首选词：rank=1，无后缀数字，strokes=1
+        let hints = loaded.build_code_hints(&["测试".to_string(), "侧视".to_string(), "佳人".to_string()]);
+        assert_eq!(hints[0].word, "测试");
+        assert_eq!(hints[0].code, "oc");
+        assert_eq!(hints[0].rank, 1);
+        assert_eq!(hints[0].strokes, 1);
+
+        // 次选词（侧视）：rank=2，追加 2，strokes = 1 + 1 = 2 击（物理并击 1 击 + 数字键 1 击）
+        assert_eq!(hints[1].word, "侧视");
+        assert_eq!(hints[1].code, "oc2");
+        assert_eq!(hints[1].rank, 2);
+        assert_eq!(hints[1].strokes, 2);
+
+        // 次选词（佳人）：rank=2，追加 2，strokes = 2 + 1 = 3 击（物理并击 2 击 + 数字键 1 击）
+        assert_eq!(hints[2].word, "佳人");
+        assert_eq!(hints[2].code, "YJyY2");
+        assert_eq!(hints[2].rank, 2);
+        assert_eq!(hints[2].strokes, 3);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_kongming_1hit_word_preferred_over_1hit_chars() {
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!("dazitui_km_1hit_pref_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let schema = dir.join("km.schema.yaml");
+        let dict = dir.join("km.dict.yaml");
+        let schema_content = "schema:\n  name: 空明码测试\n  schema_id: km\ntranslator:\n  dictionary: km\nchord_composer:\n  algebra:\n    - xform|a|b|\n    - xform|^\\S{3,}$||\n";
+        fs::write(&schema, schema_content).unwrap();
+        // 词库含「中国」(Uz, 1击) 与单字「中」(f)、「国」(g)。
+        // 虽然「中」和「国」各自都是一击字，但「中国」本身是一击词(1击)，绝不能降级为 f g (2击)。
+        fs::write(&dict, "中国\tUz\t1000\n中\tf=\t5000\n国\tg=\t4000\n").unwrap();
+
+        let loaded = SchemeDict::load_from_file(&schema).expect("加载空明码测试方案");
+        let hints = loaded.build_code_hints(&["中国".to_string()]);
+        assert_eq!(hints[0].word, "中国");
+        assert_eq!(hints[0].code, "Uz", "一击词应绝对优先于逐字一击字提示");
+        assert_eq!(hints[0].strokes, 1, "一击词应为 1 击");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_kongming_all_1hit_chars_converts_to_spaced_hint() {
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!("dazitui_km_all_1hit_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let schema = dir.join("km.schema.yaml");
+        let dict = dir.join("km.dict.yaml");
+        let schema_content = "schema:\n  name: 空明码测试\n  schema_id: km\ntranslator:\n  dictionary: km\nchord_composer:\n  algebra:\n    - xform|a|b|\n    - xform|^\\S{3,}$||\n";
+        fs::write(&schema, schema_content).unwrap();
+        // 词库中「好人」为 4 字母双手并击码 HRHR (2击)；
+        // 「好」(左手 h) 与「人」(右手 r) 均为一击字。
+        // 因为 2 击 <= 2 击，应转换为一击字词提 "h r"！
+        // 「等人」：等(a␣) 与 人(r) 均为一击字，且非一击词，应转换为 "a␣ r"！
+        // 「中」：单字一击字，词库中若为 "f="，应转为标准一击字词提 "f"（1击）。
+        fs::write(&dict, "好人\tHRHR\t500\n等人\tDNRN\t500\n中\tf=\t500\n").unwrap();
+
+        let loaded = SchemeDict::load_from_file(&schema).expect("加载空明码测试方案");
+        let hints = loaded.build_code_hints(&["好人".to_string(), "等人".to_string(), "中".to_string()]);
+        assert_eq!(hints[0].word, "好人");
+        assert_eq!(hints[0].code, "h r", "全一击字词应以空格分隔展示一击字词提");
+        assert_eq!(hints[0].strokes, 2, "两字一击字词提应为 2 击");
+
+        assert_eq!(hints[1].word, "等人");
+        assert_eq!(hints[1].code, "a␣ r", "含空格并击字的一击字词提应正确保留 ␣ 标记");
+        assert_eq!(hints[1].strokes, 2);
+
+        assert_eq!(hints[2].word, "中");
+        assert_eq!(hints[2].code, "f", "单字一击字词提应转译为标准一击字指法");
+        assert_eq!(hints[2].strokes, 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_kongming_four_char_idiom_retains_two_stroke_word_code() {
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!("dazitui_km_idiom_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let schema = dir.join("km.schema.yaml");
+        let dict = dir.join("km.dict.yaml");
+        let schema_content = "schema:\n  name: 空明码测试\n  schema_id: km\ntranslator:\n  dictionary: km\nchord_composer:\n  algebra:\n    - xform|a|b|\n    - xform|^\\S{3,}$||\n";
+        fs::write(&schema, schema_content).unwrap();
+        // 假定四字成语「大地上部」在词库中为 4 字符并击码 ddsg (2击)；
+        // 虽然「大」(d)、「地」(a)、「上」(s)、「部」(b) 全是一击字(4击)，
+        // 但 4 击 > 2 击，不满足 一击字击数 <= 词码击数，应保留词库整词码 ddsg！
+        fs::write(&dict, "大地上部\tddsg\t500\n").unwrap();
+
+        let loaded = SchemeDict::load_from_file(&schema).expect("加载空明码测试方案");
+        let hints = loaded.build_code_hints(&["大地上部".to_string()]);
+        assert_eq!(hints[0].word, "大地上部");
+        assert_eq!(hints[0].code, "ddsg", "4 击一击字劣于 2 击词码，应保留 2 击词库码");
+        assert_eq!(hints[0].strokes, 2);
         let _ = fs::remove_dir_all(&dir);
     }
 

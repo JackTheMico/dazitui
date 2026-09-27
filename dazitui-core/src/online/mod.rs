@@ -5,6 +5,7 @@
 
 pub mod auth;
 pub mod client;
+pub mod oxcup;
 pub mod protocol;
 pub mod share;
 pub mod tigercup;

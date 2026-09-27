@@ -22,7 +22,8 @@ use dazitui_core::{
     load_text_from_string, lttb_downsample, normalize_scheme_to_id, osc52_clipboard,
     pack_words_by_width, prewarm_segmenter, resolve_scheme_path_via_discovery, save_text_to_file,
     today_ymd, word_ratio_pct, TigerCupClient, TigerDraft, TigerDraftStore, TigerLeaderboardEntry,
-    build_tiger_payload, format_tiger_share_text,
+    build_tiger_payload, format_tiger_share_text, OxCupClient, OxCupScoreEntry,
+    format_ox_share_text,
 };
 use dazitui_core::font16::{glyph_for_char_or_fallback, render_glyph_braille};
 
@@ -242,21 +243,23 @@ struct RankBoard {
     viewport_rows: Cell<usize>,
 }
 
-/// 在线排行榜支持的比赛 Tab（极速杯 / 锦标赛 / 键神杯 / 虎码杯）。
+/// 在线排行榜支持的比赛 Tab（极速杯 / 锦标赛 / 键神杯 / 虎码杯 / 牛杯）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum RankTab {
     Jisu,
     Jinbiao,
     Jianshen,
     TigerCup,
+    OxCup,
 }
 
 impl RankTab {
-    const ALL: [RankTab; 4] = [
+    const ALL: [RankTab; 5] = [
         RankTab::Jisu,
         RankTab::Jinbiao,
         RankTab::Jianshen,
         RankTab::TigerCup,
+        RankTab::OxCup,
     ];
 
     fn name(&self) -> &'static str {
@@ -265,6 +268,7 @@ impl RankTab {
             Self::Jinbiao => "锦标赛",
             Self::Jianshen => "键神杯",
             Self::TigerCup => "虎码杯",
+            Self::OxCup => "牛杯",
         }
     }
 
@@ -704,6 +708,7 @@ enum SidebarMenuItem {
     OnlineJinbiao,
     OnlineJianshen,
     OnlineTigerCup,
+    OnlineOxCup,
     OnlineRank,
     Stats,
     Settings,
@@ -721,6 +726,7 @@ const SIDEBAR_MENU_ITEMS: &[SidebarMenuItem] = &[
     SidebarMenuItem::OnlineJinbiao,
     SidebarMenuItem::OnlineJianshen,
     SidebarMenuItem::OnlineTigerCup,
+    SidebarMenuItem::OnlineOxCup,
     SidebarMenuItem::OnlineRank,
     SidebarMenuItem::Stats,
     SidebarMenuItem::Settings,
@@ -1048,6 +1054,12 @@ struct App {
     tiger_loading: bool,
     /// 虎码杯载文错误提示。
     tiger_error: Option<String>,
+    /// 牛杯客户端。
+    ox_api: OxCupClient,
+    /// 牛杯赛文加载中。
+    ox_loading: bool,
+    /// 牛杯载文错误提示。
+    ox_error: Option<String>,
     /// 外观设置。
     settings: Settings,
     /// 设置持久化存储。
@@ -1213,6 +1225,52 @@ fn tiger_entries_to_rank(
     }
 }
 
+/// 将牛杯排行榜条目映射为通用的 CompetitionRank 结构（支持群组展示与统一渲染）。
+fn ox_entries_to_rank(
+    entries: Vec<OxCupScoreEntry>,
+    my_username: Option<&str>,
+    date: &str,
+) -> CompetitionRank {
+    let mut my_rank_result = Vec::new();
+    let rows: Vec<CompetitionRankRow> = entries
+        .into_iter()
+        .map(|e| {
+            let row = CompetitionRankRow {
+                rank: e.rank,
+                username: e.user_name.clone(),
+                speed: e.speed,
+                input_method: e.group_name.clone(),
+                keystrokes: e.hit_rate,
+                ma_chang: e.kpw,
+                jian_zhun: format!("{:.2}%", e.accuracy),
+                jian_shu: 0,
+                hui_gai: e.corrections,
+                da_ci: e
+                    .word_ratio
+                    .map(|r| format!("{:.2}%", r))
+                    .unwrap_or_else(|| "--".to_string()),
+                typing_time: e.time.unwrap_or_else(|| "--".to_string()),
+                from: "小稽/QQ群".to_string(),
+                sect_name: e.group_name,
+            };
+            if let Some(uname) = my_username {
+                if row.username == uname {
+                    my_rank_result.push(row.clone());
+                }
+            }
+            row
+        })
+        .collect();
+    let total = rows.len() as u32;
+    CompetitionRank {
+        rank_result: rows,
+        my_rank_result,
+        total,
+        text_title: format!("{date} 牛杯赛文"),
+        text_length: 0,
+    }
+}
+
 /// 异步排行榜加载器：派生后台线程调用客户端并回传结果，主循环每帧 `poll_rank_loader` 消费。
 struct RankLoader {
     sender: mpsc::Sender<RankLoadResult>,
@@ -1240,6 +1298,7 @@ impl RankLoader {
         &self,
         client: ApiClient,
         tiger_client: TigerCupClient,
+        ox_client: OxCupClient,
         tab: RankTab,
         date: String,
         my_username: Option<String>,
@@ -1253,6 +1312,11 @@ impl RankLoader {
                 RankTab::TigerCup => {
                     tiger_client.get_leaderboard(&date, 50).map(|entries| {
                         tiger_entries_to_rank(entries, my_username.as_deref(), &date)
+                    })
+                }
+                RankTab::OxCup => {
+                    ox_client.get_leaderboard(&date).map(|entries| {
+                        ox_entries_to_rank(entries, my_username.as_deref(), &date)
                     })
                 }
             };
@@ -1475,6 +1539,9 @@ impl App {
             tiger_draft_store: TigerDraftStore::with_default_path(),
             tiger_loading: false,
             tiger_error: None,
+            ox_api: OxCupClient::new(),
+            ox_loading: false,
+            ox_error: None,
             settings,
             settings_store,
             settings_focus: FOCUS_THEME,
@@ -1788,9 +1855,11 @@ impl App {
         }
         let client = self.api.clone();
         let tiger_client = self.tiger_api.clone();
+        let ox_client = self.ox_api.clone();
         let my_username = self.tiger_api.current_credentials().map(|c| c.username);
         let date = date.to_string();
-        self.rank_loader.request(client, tiger_client, tab, date, my_username);
+        self.rank_loader
+            .request(client, tiger_client, ox_client, tab, date, my_username);
     }
 
     /// 切换排行榜当前 Tab 并拉取对应榜单（封装对 `app.state` 的可变借用，避免与 `fetch_rank` 冲突）。
@@ -2450,13 +2519,17 @@ impl App {
             Some((stats, elapsed))
         } else {
             let copied_stats = if copies_stats_to_clipboard(self.text.source) {
-                let share = format_stats_share_text(
-                    &self.text,
-                    &stats,
-                    elapsed,
-                    self.effective_upload_input_method(),
-                    None,
-                );
+                let share = if matches!(self.text.source, TextSource::OxCup) {
+                    format_ox_share_text(&self.text, &stats, elapsed)
+                } else {
+                    format_stats_share_text(
+                        &self.text,
+                        &stats,
+                        elapsed,
+                        self.effective_upload_input_method(),
+                        None,
+                    )
+                };
                 write_clipboard(&share);
                 Some(share)
             } else {
@@ -2914,6 +2987,36 @@ impl App {
         }
     }
 
+    /// 牛杯下载当日赛文并进入跟打。
+    fn download_oxcup(&mut self) {
+        self.ox_loading = true;
+        match self.ox_api.get_today_article() {
+            Ok(comp) => {
+                let content = normalize_online_content(&comp.content);
+                if content.is_empty() {
+                    self.ox_loading = false;
+                    self.ox_error = Some("牛杯赛文内容为空".to_string());
+                    return;
+                }
+                self.text = Text {
+                    title: comp.title,
+                    content,
+                    source: TextSource::OxCup,
+                    word_boundaries: None,
+                    shuffled: false,
+                };
+                self.ox_loading = false;
+                self.ox_error = None;
+                self.enter_countdown(CountdownSource::Online);
+            }
+            Err(e) => {
+                self.ox_loading = false;
+                self.ox_error = Some(api_error_text(&e));
+                self.sidebar_notice = Some(api_error_text(&e));
+            }
+        }
+    }
+
     /// 虎码杯执行上传：调用 TigerCupClient 上传成绩并复制分享文本。
     fn perform_tiger_upload(&self, stats: &Stats, elapsed: Duration) -> UploadState {
         let payload = build_tiger_payload(
@@ -2960,6 +3063,13 @@ impl App {
         let upload = match self.text.source {
             TextSource::TigerCup => self.perform_tiger_upload(stats, elapsed),
             TextSource::Online { .. } => self.perform_upload(stats, elapsed),
+            TextSource::OxCup => {
+                let share = format_ox_share_text(&self.text, stats, elapsed);
+                write_clipboard(&share);
+                UploadState::NotApplicable {
+                    copied_stats: Some(share),
+                }
+            }
             _ => UploadState::NotApplicable {
                 copied_stats: None,
             },
@@ -3447,6 +3557,10 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                         }
                         if is_open_tigercup(key) {
                             trigger_tigercup_competition(&mut app, terminal)?;
+                            continue;
+                        }
+                        if is_open_oxcup(key) {
+                            trigger_oxcup_competition(&mut app, terminal)?;
                             continue;
                         }
 
@@ -4112,6 +4226,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                         KeyCode::Char('2') => app.switch_rank_tab(RankTab::Jinbiao),
                         KeyCode::Char('3') => app.switch_rank_tab(RankTab::Jianshen),
                         KeyCode::Char('4') => app.switch_rank_tab(RankTab::TigerCup),
+                        KeyCode::Char('5') => app.switch_rank_tab(RankTab::OxCup),
                         KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
                             let next = if let AppState::OnlineRank(s) = &app.state {
                                 s.active_tab.next()
@@ -4259,6 +4374,19 @@ fn trigger_tigercup_competition<B: ratatui::backend::Backend>(
     Ok(())
 }
 
+/// 触发牛杯比赛赛文载入（无需登录，免登录即开即打）。
+fn trigger_oxcup_competition<B: ratatui::backend::Backend>(
+    app: &mut App,
+    terminal: &mut ratatui::Terminal<B>,
+) -> io::Result<()> {
+    app.ox_loading = true;
+    terminal
+        .draw(|frame| ui(frame, app))
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    app.download_oxcup();
+    Ok(())
+}
+
 /// 激活功能栏选中的菜单项。
 fn activate_sidebar_menu_item<B: ratatui::backend::Backend>(
     app: &mut App,
@@ -4284,6 +4412,9 @@ fn activate_sidebar_menu_item<B: ratatui::backend::Backend>(
         }
         SidebarMenuItem::OnlineTigerCup => {
             trigger_tigercup_competition(app, terminal)?;
+        }
+        SidebarMenuItem::OnlineOxCup => {
+            trigger_oxcup_competition(app, terminal)?;
         }
         SidebarMenuItem::OnlineRank => {
             app.open_online_rank()?;
@@ -4849,6 +4980,11 @@ fn is_open_tigercup(key: KeyEvent) -> bool {
     key.modifiers.is_empty() && (key.code == KeyCode::Char('t') || key.code == KeyCode::Char('T'))
 }
 
+/// 打开牛杯比赛快捷键：n / N（oX cup / 牛杯）。
+fn is_open_oxcup(key: KeyEvent) -> bool {
+    key.modifiers.is_empty() && (key.code == KeyCode::Char('n') || key.code == KeyCode::Char('N'))
+}
+
 /// 打开虎码杯登录快捷键：g / G（tiGer login）。
 fn is_open_tiger_login(key: KeyEvent) -> bool {
     key.modifiers.is_empty() && (key.code == KeyCode::Char('g') || key.code == KeyCode::Char('G'))
@@ -4898,6 +5034,7 @@ fn copies_stats_to_clipboard(source: TextSource) -> bool {
             | TextSource::Builtin { .. }
             | TextSource::Online { .. }
             | TextSource::Clipboard
+            | TextSource::OxCup
     )
 }
 
@@ -5173,9 +5310,10 @@ fn render_online_rank_view(frame: &mut Frame, app: &App, rank_state: &OnlineRank
                     render_rank_note(frame, body_area, "暂无数据（今日该比赛尚未产生成绩）", palette.muted);
                 }
                 Some(data) => {
-                    // 名次条：登录态下展示「我第 N 名 / 共 M 人」；未登录降级为公开榜提示。
+                    // 名次条：登录态下展示「我第 N 名 / 共 M 人」；未登录降级为公开榜提示；牛杯展示小稽机器人汇总提示。
                     let is_logged_in_current_tab = match rank_state.active_tab {
                         RankTab::TigerCup => app.tiger_api.is_logged_in(),
+                        RankTab::OxCup => false,
                         _ => app.logged_in,
                     };
                     let my_rank = data.my_rank_result.first().map(|r| r.rank);
@@ -5183,6 +5321,10 @@ fn render_online_rank_view(frame: &mut Frame, app: &App, rank_state: &OnlineRank
                         Some(r) => Line::from(Span::styled(
                             format!("我第 {} 名 / 共 {} 人", r, data.total),
                             Style::default().fg(palette.accent).bold(),
+                        )),
+                        None if rank_state.active_tab == RankTab::OxCup => Line::from(Span::styled(
+                            format!("牛杯打榜：各大打字群小稽机器人录入（共 {} 人）", data.total),
+                            Style::default().fg(palette.accent),
                         )),
                         None if !is_logged_in_current_tab => Line::from(Span::styled(
                             "未登录：登录后可见个人名次（当前为公开榜）",
@@ -5215,7 +5357,7 @@ fn render_online_rank_view(frame: &mut Frame, app: &App, rank_state: &OnlineRank
     }
 
     // 底部快捷键提示栏（圆角边框 + 结构化标题），与统计视图一致。
-    let hint = " 1/2/3/4 比赛 | Tab/←→ 切换 | jk 滚动 | c 列定制 | R 刷新 | Esc/q 返回 ";
+    let hint = " 1-5 比赛 | Tab/←→ 切换 | jk 滚动 | c 列定制 | R 刷新 | Esc/q 返回 ";
 
     let hint_title = Line::from(vec![Span::styled(
         " 快捷键 ",
@@ -6407,6 +6549,7 @@ fn render_sidebar(
                 SidebarMenuItem::OnlineJinbiao => ("2", "锦标赛", false, false),
                 SidebarMenuItem::OnlineJianshen => ("3", "键神杯", false, false),
                 SidebarMenuItem::OnlineTigerCup => ("t", "虎码杯", false, false),
+                SidebarMenuItem::OnlineOxCup => ("n", "牛杯", false, false),
                 SidebarMenuItem::OnlineRank => ("4", "排行榜", false, false),
                 SidebarMenuItem::Stats => ("s", "数据统计", false, false),
                 SidebarMenuItem::Settings => ("o", "设置", false, false),
@@ -6494,10 +6637,16 @@ fn render_sidebar(
     if app.tiger_loading {
         lines.push(Line::from(" 正在载入虎码杯...").fg(palette.accent));
     }
+    if app.ox_loading {
+        lines.push(Line::from(" 正在载入牛杯...").fg(palette.accent));
+    }
     if let Some(err) = &app.online_error {
         lines.push(Line::from(format!(" {err}")).fg(palette.error));
     }
     if let Some(err) = &app.tiger_error {
+        lines.push(Line::from(format!(" {err}")).fg(palette.error));
+    }
+    if let Some(err) = &app.ox_error {
         lines.push(Line::from(format!(" {err}")).fg(palette.error));
     }
 
@@ -9150,7 +9299,11 @@ fn single_char_hint(
         let words = [c.to_string()];
         let hints = dict.build_code_hints(&words);
         if let Some(h) = hints.first().filter(|h| !h.is_oov && !h.code.is_empty()) {
-            let hand = hand_of_code(&h.code);
+            let hand = if dict.is_pure_chord() {
+                kongming_1hit_hint(c).map(|(_, h)| h).unwrap_or_else(|| hand_of_code(&h.code))
+            } else {
+                hand_of_code(&h.code)
+            };
             let raw_code = h.code.strip_prefix('%').unwrap_or(&h.code);
             let clean = raw_code.strip_prefix(['_', '+', '-']).unwrap_or(raw_code);
             return Some((clean.to_string(), hand));
@@ -9708,28 +9861,32 @@ fn code_hint_overlay_line(
             words.push(word);
             typed_mask.push(all_correct);
         }
-        let hints: Vec<CodeHint> = words
-            .iter()
-            .map(|w| {
-                if let Some((chord, _hand)) = kongming_1hit_word_hint(w) {
-                    CodeHint {
-                        word: w.clone(),
-                        code: chord.to_string(),
-                        strokes: 1,
-                        is_oov: false,
-                        rank: 1,
+        let hints: Vec<CodeHint> = if let Some(dict) = scheme_dict.filter(|d| d.is_pure_chord()) {
+            dict.build_code_hints(&words)
+        } else {
+            words
+                .iter()
+                .map(|w| {
+                    if let Some((chord, _hand)) = kongming_1hit_word_hint(w) {
+                        CodeHint {
+                            word: w.clone(),
+                            code: chord.to_string(),
+                            strokes: 1,
+                            is_oov: false,
+                            rank: 1,
+                        }
+                    } else {
+                        CodeHint {
+                            word: w.clone(),
+                            code: String::new(),
+                            strokes: 0,
+                            is_oov: true,
+                            rank: 1,
+                        }
                     }
-                } else {
-                    CodeHint {
-                        word: w.clone(),
-                        code: String::new(),
-                        strokes: 0,
-                        is_oov: true,
-                        rank: 1,
-                    }
-                }
-            })
-            .collect();
+                })
+                .collect()
+        };
         let cells = layout_code_hint_line(&words, &hints, &typed_mask);
         return Some(code_hint_line_from_cells(&cells, theme));
     }
@@ -9909,28 +10066,32 @@ fn builtin_cell_widths(
             .iter()
             .map(|&(ws, we)| statuses[ws..we].iter().map(|(c, _)| *c).collect())
             .collect();
-        let hints: Vec<CodeHint> = words
-            .iter()
-            .map(|w| {
-                if let Some((chord, _hand)) = kongming_1hit_word_hint(w) {
-                    CodeHint {
-                        word: w.clone(),
-                        code: chord.to_string(),
-                        strokes: 1,
-                        is_oov: false,
-                        rank: 1,
+        let hints: Vec<CodeHint> = if let Some(dict) = scheme_dict.filter(|d| d.is_pure_chord()) {
+            dict.build_code_hints(&words)
+        } else {
+            words
+                .iter()
+                .map(|w| {
+                    if let Some((chord, _hand)) = kongming_1hit_word_hint(w) {
+                        CodeHint {
+                            word: w.clone(),
+                            code: chord.to_string(),
+                            strokes: 1,
+                            is_oov: false,
+                            rank: 1,
+                        }
+                    } else {
+                        CodeHint {
+                            word: w.clone(),
+                            code: String::new(),
+                            strokes: 0,
+                            is_oov: true,
+                            rank: 1,
+                        }
                     }
-                } else {
-                    CodeHint {
-                        word: w.clone(),
-                        code: String::new(),
-                        strokes: 0,
-                        is_oov: true,
-                        rank: 1,
-                    }
-                }
-            })
-            .collect();
+                })
+                .collect()
+        };
         return Some(hint_cell_widths(&words, &hints));
     }
     // 内置单字赛文（常用单字前/中/后五百）：逐字以方案词典反查编码的宽度，
@@ -9983,18 +10144,27 @@ fn builtin_words_cell_widths(
     builtin_cell_widths(session, text, scheme_dict)
 }
 
-/// 将提示单元（已去皮手区前缀、携手区归属）拼为带色 `Line`：
-/// 左手粉、右手黄，其余（双手并击/已打/未登录）用 muted。
+/// 将提示单元（已去皮手区前缀、携手区归属与分段）拼为带色 `Line`：
+/// 左手粉、右手黄，其余（双手并击/已打/未登录/空格）用 muted。
 fn code_hint_line_from_cells(cells: &[HintCell], theme: Theme) -> Line<'static> {
-    let mut spans: Vec<Span<'static>> = Vec::with_capacity(cells.len() * 2);
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(cells.len() * 4);
     for (i, cell) in cells.iter().enumerate() {
         if i > 0 {
             spans.push(Span::raw(" "));
         }
-        spans.push(Span::styled(
-            cell.text.clone(),
-            code_hint_hand_style(cell.hand, theme),
-        ));
+        if cell.segments.is_empty() {
+            spans.push(Span::styled(
+                cell.text.clone(),
+                code_hint_hand_style(cell.hand, theme),
+            ));
+        } else {
+            for (seg_text, seg_hand) in &cell.segments {
+                spans.push(Span::styled(
+                    seg_text.clone(),
+                    code_hint_hand_style(*seg_hand, theme),
+                ));
+            }
+        }
     }
     Line::from(spans)
 }
@@ -12530,6 +12700,71 @@ mod tests {
         assert_eq!(widths.len(), 10);
     }
 
+    #[test]
+    fn test_kongming_multi_hand_color_and_rank_in_grid() {
+        use std::fs;
+        let theme = Theme::preset(ThemePreset::CatppuccinMocha);
+        let dir = std::env::temp_dir().join(format!("dazitui_km_render_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let schema = dir.join("km.schema.yaml");
+        let dict = dir.join("km.dict.yaml");
+        let schema_content = "schema:\n  name: 空明码测试\n  schema_id: km\ntranslator:\n  dictionary: km\nchord_composer:\n  algebra:\n    - xform|a|b|\n    - xform|^\\S{3,}$||\n";
+        fs::write(&schema, schema_content).unwrap();
+        // 词库配置：
+        // 1. 好人 -> HRHR (2击)，但「好」(左手 h) 与「人」(右手 r) 均为一击字，转为 "h r"，左右手分色！
+        // 2. 测试 / 侧视 -> 重码 oc (1并击)，侧视 为 2 选 -> "oc2"
+        // 3. 中 -> 词库中为 "f="，应转为 "f"，单字一击字分色为左手粉色！
+        fs::write(
+            &dict,
+            "好人\tHRHR\t500\n测试\toc\t1000\n侧视\toc\t900\n中\tf=\t500\n",
+        )
+        .unwrap();
+
+        let loaded = SchemeDict::load_from_file(&schema).expect("加载空明码测试方案");
+        assert!(loaded.is_pure_chord());
+
+        // 离线赛文测试双行词格渲染
+        let text = file_text("好人 侧视 中");
+        let session = Session::new(&text.content);
+        let (text_lines, _) = code_hint_grid_text(&session, &text, Some(&loaded), theme, false, 80)
+            .expect("应生成双行词格");
+
+        // 提示行在第 0 行
+        let hint_line = &text_lines.lines[0];
+        // 验证「好人」词格中包含粉色的 h 与黄色的 r
+        let h_span = hint_line
+            .spans
+            .iter()
+            .find(|s| s.content == "h")
+            .expect("提示行应包含 h span");
+        assert_eq!(h_span.style.fg, Some(color(theme.hand_left)), "好(h)应为左手粉色");
+
+        let r_span = hint_line
+            .spans
+            .iter()
+            .find(|s| s.content == "r")
+            .expect("提示行应包含 r span");
+        assert_eq!(r_span.style.fg, Some(color(theme.hand_right)), "人(r)应为右手黄色");
+
+        // 验证「侧视」包含 2 选选重提示 oc2
+        let oc2_span = hint_line
+            .spans
+            .iter()
+            .find(|s| s.content.contains("oc2"))
+            .expect("提示行应包含 oc2 span");
+        assert!(oc2_span.content.contains("oc2"), "侧视应提示 oc2");
+
+        // 验证单字一击字「中」在打词/常规排版流中为左手粉色
+        let f_span = hint_line
+            .spans
+            .iter()
+            .find(|s| s.content == "f")
+            .expect("提示行应包含单字中对应的一击字 f span");
+        assert_eq!(f_span.style.fg, Some(color(theme.hand_left)), "中(f)应为左手粉色");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
 
     #[test]
     fn code_hint_overlay_hides_typed_word_and_reveals_on_backspace() {
@@ -13036,6 +13271,76 @@ mod tests {
     }
 
     #[test]
+    fn is_open_oxcup_maps_n_key() {
+        assert!(is_open_oxcup(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)));
+        assert!(is_open_oxcup(KeyEvent::new(KeyCode::Char('N'), KeyModifiers::NONE)));
+        assert!(!is_open_oxcup(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL)));
+        assert!(!is_open_oxcup(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)));
+    }
+
+    #[test]
+    fn test_rank_tab_cycle_and_oxcup() {
+        assert_eq!(RankTab::ALL.len(), 5);
+        assert_eq!(RankTab::OxCup.name(), "牛杯");
+        assert_eq!(RankTab::TigerCup.next(), RankTab::OxCup);
+        assert_eq!(RankTab::OxCup.next(), RankTab::Jisu);
+        assert_eq!(RankTab::OxCup.prev(), RankTab::TigerCup);
+        assert_eq!(RankTab::Jisu.prev(), RankTab::OxCup);
+    }
+
+    #[test]
+    fn test_ox_entries_to_rank_conversion() {
+        let entries = vec![
+            OxCupScoreEntry {
+                rank: 1,
+                user_id: "10001".to_string(),
+                user_name: "高手A".to_string(),
+                speed: 210.5,
+                hit_rate: 8.2,
+                kpw: 2.1,
+                accuracy: 99.5,
+                corrections: 1,
+                word_ratio: Some(65.0),
+                time: Some("00:45.123".to_string()),
+                group_name: "魔然".to_string(),
+                group_id: Some("123456".to_string()),
+                timestamp: Some("2026-09-24T12:00:00Z".to_string()),
+            },
+            OxCupScoreEntry {
+                rank: 2,
+                user_id: "10002".to_string(),
+                user_name: "我".to_string(),
+                speed: 180.0,
+                hit_rate: 7.0,
+                kpw: 2.3,
+                accuracy: 98.0,
+                corrections: 3,
+                word_ratio: None,
+                time: None,
+                group_name: "聚贤阁".to_string(),
+                group_id: None,
+                timestamp: Some("2026-09-24T12:01:00Z".to_string()),
+            },
+        ];
+
+        let rank = ox_entries_to_rank(entries, Some("我"), "2026-09-24");
+        assert_eq!(rank.total, 2);
+        assert_eq!(rank.rank_result.len(), 2);
+        assert_eq!(rank.rank_result[0].username, "高手A");
+        assert_eq!(rank.rank_result[0].input_method, "魔然");
+        assert_eq!(rank.rank_result[0].sect_name, "魔然");
+        assert_eq!(rank.rank_result[0].jian_zhun, "99.50%");
+        assert_eq!(rank.rank_result[0].da_ci, "65.00%");
+        assert_eq!(rank.rank_result[0].typing_time, "00:45.123");
+
+        assert_eq!(rank.my_rank_result.len(), 1);
+        assert_eq!(rank.my_rank_result[0].rank, 2);
+        assert_eq!(rank.my_rank_result[0].username, "我");
+        assert_eq!(rank.my_rank_result[0].da_ci, "--");
+        assert_eq!(rank.my_rank_result[0].typing_time, "--");
+    }
+
+    #[test]
     fn rank_loader_fetches_in_background_and_reports_result() {
         use std::io::{Read, Write};
         use std::net::TcpListener;
@@ -13065,6 +13370,7 @@ mod tests {
         loader.request(
             client,
             TigerCupClient::new(),
+            OxCupClient::new(),
             RankTab::Jisu,
             "2026-08-30".to_string(),
             None,
@@ -13382,6 +13688,23 @@ mod tests {
                 ..
             }
         ));
+        // 牛杯：进入成绩视图（无需上传），复制 QQ 机器人打卡格式（以第666段开头）。
+        let mut app = test_app(Text {
+            title: "牛杯".into(),
+            content: "你好".into(),
+            source: TextSource::OxCup,
+            word_boundaries: None,
+            shuffled: false,
+        });
+        app.session.type_text("你好");
+        assert!(app.finish_typing().is_none());
+        assert!(matches!(
+            &app.state,
+            AppState::Finished {
+                upload: UploadState::NotApplicable { copied_stats: Some(s) },
+                ..
+            } if s.starts_with("第666段") && s.contains("dazitui")
+        ));
     }
 
     #[test]
@@ -13395,6 +13718,7 @@ mod tests {
         assert!(copies_stats_to_clipboard(TextSource::Online {
             competition_type: CompetitionType::Jisu
         }));
+        assert!(copies_stats_to_clipboard(TextSource::OxCup));
     }
 
     // ---- T9 成绩上传可靠性：token 校验 + 自动重登 ----
