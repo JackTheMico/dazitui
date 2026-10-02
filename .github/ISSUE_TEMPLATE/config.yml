@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: "💬 使用问题 / 一般讨论"
+    url: "https://github.com/JackTheMico/dazitui/discussions"
+    about: "不确定是不是 bug、或想讨论用法时，欢迎到 Discussions 交流"
