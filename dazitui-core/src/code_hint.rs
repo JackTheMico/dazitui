@@ -5,7 +5,7 @@ use unicode_width::UnicodeWidthChar;
 use crate::scheme::CodeHint;
 
 /// 空格并击简词在提示区附加的空格键标记（U+2423 OPEN BOX），宽度 1、跨终端可读。
-const SPACE_CHORD_MARK: char = '␣';
+pub(crate) const SPACE_CHORD_MARK: char = '␣';
 
 /// 简码/并击码的手区归属，用于提示区配色（左手粉、右手黄、双手并击青）。
 ///

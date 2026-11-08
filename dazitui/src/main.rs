@@ -15,8 +15,8 @@ use dazitui_core::{
     CompetitionType, DbTask, DbWorker, ErrorRecordItem, ErrorType, HeatmapLayout,
     HintCell, HintHand, KeyboardMode, KeypressRecordItem, LoadError, LoadOptions, RankColumnConfig,
     RankColumnId, Rgb, SchemeDict, SchemeInfo, Session, SessionRecord, Settings, SettingsStore, Stats,
-    StatsDb, Text, TextSource, Theme, TokenStore, default_rime_data_dir, detect_and_parse_book,
-    discover_schemes, env_credentials, format_stats_share_text, format_time, hand_of_code,
+    StatsDb, Text, TextSource, Theme, TokenStore, detect_and_parse_book,
+    discover_schemes_default, env_credentials, format_stats_share_text, format_time, hand_of_code,
     hint_cell_widths, is_auth_failure, key_accuracy_pct, kongming_1hit_hint, kongming_1hit_word_hint, layout_code_hint_line,
     load_builtin_text, load_builtin_text_shuffled, load_text_from_clipboard, load_text_from_file,
     load_text_from_string, lttb_downsample, normalize_scheme_to_id, osc52_clipboard,
@@ -1470,8 +1470,8 @@ impl App {
         let mut settings = settings_store.load();
         // 规范化为 schema_id（向后兼容旧版写入路径的配置文件）。
         settings.scheme = normalize_scheme_to_id(&settings.scheme);
-        // 自动发现 fcitx5 部署目录中的真方案。
-        let discovered = discover_schemes(&default_rime_data_dir());
+        // 自动发现方案（XSIME 激活方案包优先，其次旧 fcitx5-rime 部署目录）。
+        let discovered = discover_schemes_default();
         // 首启零配置：scheme 为空时自动选第一个发现的真方案并持久化。
         if settings.scheme.is_empty() {
             if let Some(first) = discovered.first() {
@@ -1670,11 +1670,11 @@ impl App {
         }
     }
 
-    /// 进入设置视图：刷新「已发现方案」列表（按当前 fcitx5 部署目录），再切到 Settings 状态。
+    /// 进入设置视图：刷新「已发现方案」列表（XSIME 激活方案包优先），再切到 Settings 状态。
     ///
     /// 满足 spec #82 Out-of-Scope「打开设置时按当时目录刷新」——新部署的方案立即可见。
     fn enter_settings(&mut self) {
-        self.discovered = discover_schemes(&default_rime_data_dir());
+        self.discovered = discover_schemes_default();
         self.state = AppState::Settings;
     }
 

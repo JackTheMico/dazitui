@@ -66,6 +66,12 @@ pub struct SchemeDict {
     select_semicolon: bool,
     /// `speller/alphabet` 含 `'`：第 3 候选以 `'` 选重（虎整句）。
     select_apostrophe: bool,
+    /// 纯并击方案下可用于选重的最大候选位次。
+    ///
+    /// 并击方案的 `chord_composer.alphabet` 会占用部分数字键为码元（如空明码占用 7/8/9/0），
+    /// 这些数字按下时会被并击采集器当作编码，无法用于选重；故可选重位次上限由「未被并击
+    /// 字母表占用的最大数字」推导（0 表示未推导，按 9 处理）。
+    max_select_rank: u8,
 }
 
 /// 规范路径：解析软链到真实文件，失败则回退原路径（与 watcher canonicalize 策略一致）。
@@ -563,6 +569,25 @@ impl SchemeDict {
         (alphabet.contains(';'), alphabet.contains('\''))
     }
 
+    /// 纯并击方案下可用的最大选重位次：取未被 `chord_composer.alphabet` 占用的最大数字。
+    ///
+    /// 空明码等并击方案的字母表包含 `7`/`8`/`9`/`0`，这些数字会先被并击采集器当作编码，
+    /// 无法用于选重；`1`–`6` 则可正常选重。无并击字母表时按 9 处理。
+    fn read_max_select_rank(doc: Option<&YamlValue>) -> u8 {
+        let Some(alphabet) = doc
+            .and_then(|d| d.get("chord_composer/alphabet"))
+            .and_then(|v| v.as_str())
+        else {
+            return 9;
+        };
+        ('2'..='9')
+            .rev()
+            .find(|c| !alphabet.contains(*c))
+            .and_then(|c| c.to_digit(10))
+            .map(|d| d as u8)
+            .unwrap_or(1)
+    }
+
     /// 从 .schema.yaml 文档中提取所有声明的词典名称，按优先级（`initial_quality` 降序）返回。
     fn extract_schema_dictionary_candidates(
         doc: Option<&YamlValue>,
@@ -697,6 +722,7 @@ impl SchemeDict {
             let (semi, apo) = Self::read_select_keys(schema_doc.as_ref());
             dict.select_semicolon = semi;
             dict.select_apostrophe = apo;
+            dict.max_select_rank = Self::read_max_select_rank(schema_doc.as_ref());
             if dict.four_auto_commit {
                 dict.prefix_commit_codes.clear();
             } else if !dict.pure_chord {
@@ -767,6 +793,7 @@ impl SchemeDict {
             let (semi, apo) = Self::read_select_keys(doc.as_ref());
             dict.select_semicolon = semi;
             dict.select_apostrophe = apo;
+            dict.max_select_rank = Self::read_max_select_rank(doc.as_ref());
             if let Some(name) = name {
                 dict.set_name(name);
             }
@@ -810,7 +837,10 @@ impl SchemeDict {
             reloaded.set_chord_algebra(alg);
         }
         reloaded.pure_chord = self.pure_chord;
-        reloaded.four_auto_commit = true;
+        reloaded.four_auto_commit = self.four_auto_commit;
+        reloaded.select_semicolon = self.select_semicolon;
+        reloaded.select_apostrophe = self.select_apostrophe;
+        reloaded.max_select_rank = self.max_select_rank;
         *self = reloaded;
     }
 
@@ -849,6 +879,12 @@ impl SchemeDict {
         let config_home = crate::paths::config_dir();
         let data_home = crate::paths::data_dir();
         let home_dir = crate::paths::user_home_dir();
+
+        // XSIME 当前激活方案包：正在生效的方案与词库，优先于 `dazitui/schemes`
+        // （后者常是指向旧 fcitx5-rime 目录的软链，词库可能落后于 XSIME 部署版本）。
+        if let Some(pkg) = xsime_active_package_dir(&xsime_data_dir()) {
+            search_dirs.push(pkg);
+        }
 
         // dazitui 自带目录
         search_dirs.push(crate::paths::dazitui_config_dir().join("schemes"));
@@ -1528,12 +1564,124 @@ impl SchemeDict {
         }
     }
 
+    /// 原始词库码的基础击数（不含附加的选重键）。
+    ///
+    /// 与 `code_strokes` 不同：本函数只接收**词库原始码**（如 `S7`、`Y0`、`f=`），
+    /// 不会把末尾数字误判为选重键；空明码的码元本身可含 `7/8/9/0`。
+    fn raw_pure_strokes(&self, code: &str) -> u32 {
+        if code.is_empty() {
+            return 0;
+        }
+        if code.starts_with('%') {
+            return 1;
+        }
+        let clean_len = code
+            .chars()
+            .filter(|&c| c != '_' && c != '+' && c != '-' && !c.is_whitespace())
+            .count();
+        (clean_len as u32).div_ceil(2).max(1)
+    }
+
+    /// 某候选位次是否需要按数字键选重（并击字母表占用的数字键不可用）。
+    fn pure_rank_selectable(&self, rank: u8) -> bool {
+        if rank <= 1 {
+            return true;
+        }
+        let max = if self.max_select_rank == 0 {
+            9
+        } else {
+            self.max_select_rank
+        };
+        rank <= max
+    }
+
+    /// 单字一击码的「实际按键」展示形式（`f=` / `=d` / `a_=` / `=_a` → `f` / `d` / `a␣` / `a␣`）。
+    ///
+    /// 词库保存的是并击代数展开后的逻辑码，`=` 只是手区标记而非按键；提示区按静态一击字表的
+    /// 记法展示，用户只需按实际键。
+    fn pure_single_chord_display(code: &str) -> Option<String> {
+        let mark = crate::code_hint::SPACE_CHORD_MARK;
+        Some(match code.chars().collect::<Vec<_>>().as_slice() {
+            [c] if c.is_ascii_alphabetic() => c.to_string(),
+            [c, '='] if c.is_ascii_alphabetic() => c.to_string(),
+            ['=', c] if c.is_ascii_alphabetic() => c.to_string(),
+            [c, '_', '='] if c.is_ascii_alphabetic() => format!("{c}{mark}"),
+            ['=', '_', c] if c.is_ascii_alphabetic() => format!("{c}{mark}"),
+            _ => return None,
+        })
+    }
+
+    /// 静态一击字表的指法 → 词库逻辑码（用于查选重位次）。
+    fn table_chord_logical_code(chord: &str, hand: crate::code_hint::HintHand) -> Option<String> {
+        use crate::code_hint::HintHand;
+        let base: Vec<char> = chord
+            .chars()
+            .filter(|&c| c != crate::code_hint::SPACE_CHORD_MARK)
+            .collect();
+        let [c] = base.as_slice() else {
+            return None;
+        };
+        let space = chord.contains(crate::code_hint::SPACE_CHORD_MARK);
+        Some(match (hand, space) {
+            (HintHand::Left, false) => format!("{c}="),
+            (HintHand::Left, true) => format!("{c}_="),
+            (HintHand::Right, false) => format!("={c}"),
+            (HintHand::Right, true) => format!("=_{c}"),
+            _ => return None,
+        })
+    }
+
+    /// 纯并击下某单字的最优「一击」指法（静态一击字表为主，词库 1 击码补足并按击数择优）。
+    fn pure_char_hint(&self, ch: char) -> Option<(String, u32, u8)> {
+        // 排序键：(选重位次, 总击数, 展示宽度, 原始码长)。完全持平时保留静态表记法（原始码长记为 0）。
+        let mut best: Option<(String, u32, u8, (u8, u32, usize, usize))> = None;
+
+        // 1. 静态一击字表：沿用其简洁记法（如 `f`、`a␣`），位次以当前词库为准。
+        if let Some((chord, hand)) = crate::code_hint::kongming_1hit_hint(ch) {
+            let key = ch.to_string();
+            let (rank, _) = Self::table_chord_logical_code(chord, hand)
+                .and_then(|logical| self.code_rank(&logical, &key))
+                .unwrap_or((1, 1));
+            if self.pure_rank_selectable(rank) {
+                let disp = if rank > 1 {
+                    format!("{chord}{rank}")
+                } else {
+                    chord.to_string()
+                };
+                let strokes = 1 + u32::from(rank > 1);
+                best = Some((disp, strokes, rank, (rank, strokes, chord.chars().count(), 0)));
+            }
+        }
+
+        // 2. 词库补充一击字：204 表之外或表内记法之外，词库确有一击码且更省击/更短时采用。
+        let key = ch.to_string();
+        if let Some(codes) = self.word_to_codes.get(&key) {
+            for c in codes {
+                let (rank, _) = self.code_rank(c, &key).unwrap_or((1, 1));
+                if !self.pure_rank_selectable(rank) || self.raw_pure_strokes(c) != 1 {
+                    continue;
+                }
+                let disp = Self::pure_single_chord_display(c).unwrap_or_else(|| c.clone());
+                let strokes = 1 + u32::from(rank > 1);
+                let cand_key = (rank, strokes, disp.chars().count(), c.chars().count());
+                let better = match &best {
+                    None => true,
+                    Some((_, _, _, cur_key)) => cand_key < *cur_key,
+                };
+                if better {
+                    best = Some((disp, strokes, rank, cand_key));
+                }
+            }
+        }
+        best.map(|(disp, strokes, rank, _)| (disp, strokes, rank))
+    }
+
     /// 空明码纯并击方案下单个词组单位的编码提示（ADR 0018）。
     ///
     /// 1. 一击词最高优先：词库已收录 1 击多字并击词（如「中国」Uz、「可以」k'）时，保留一击词提示；若非首选加选重键；
-    ///    若词库未命中，回退查标准一击词表（`kongming_1hit_word_hint`）；
-    /// 2. 一击字转译：若非一击词，且词的所有字符均属于 204 个一击字（KONGMING_1HIT_CHORDS），
-    ///    当 `一击字总击数 <= 词码击数` 时，转为以空格分隔的一击字词提（如「好人」-> "h r"，单字「中」-> "f"）；
+    ///    若词库未命中，回退查标准一击词表（`kongming_1hit_word_hint`），但该码必须确属此词，避免把重码给别的词；
+    /// 2. 一击字转译：若非一击词，且词的每个字符都有一击指法（204 静态表 + 词库 1 击码），
+    ///    当 `一击字总击数（含各类选重键） <= 词码击数` 时，转为以空格分隔的一击字词提（如「好人」-> "h r"）；
     /// 3. 词库整词编码：采用词库最优整词码；非首选时在码尾追加选重数字（如 2 选为 oc2、bGCw2），击数 +1；
     /// 4. 逐字全码回退：未收录词回退到逐字拼接。
     fn build_hint_for_word_pure_chord(&self, word: &str) -> CodeHint {
@@ -1549,7 +1697,10 @@ impl SchemeDict {
         if let Some(codes) = self.word_to_codes.get(word) {
             for c in codes {
                 let (rank, _) = self.code_rank(c, word).unwrap_or((1, 1));
-                let base_s = self.code_strokes(c);
+                if !self.pure_rank_selectable(rank) {
+                    continue;
+                }
+                let base_s = self.raw_pure_strokes(c);
                 let strokes = base_s + if rank > 1 { 1 } else { 0 };
                 let disp_code = if rank > 1 {
                     format!("{c}{rank}")
@@ -1593,43 +1744,51 @@ impl SchemeDict {
                 }
             }
         }
-        // (b) 检查是否为标准一击词表所收录词条（保障小词库下的一击词识别）
+        // (b) 标准一击词表兜底（用于小词库）：仅当该码确属此词（或词库未建索引）时才采用，
+        //     避免表内过时条目把重码错记到别的词（例如旧表中的「看到 ;K」已被「之后 ;K」取代）。
         if let Some((chord, _)) = crate::code_hint::kongming_1hit_word_hint(word) {
-            let (rank, _) = self.code_rank(chord, word).unwrap_or((1, 1));
-            let strokes = 1 + if rank > 1 { 1 } else { 0 };
-            let code = if rank > 1 {
-                format!("{chord}{rank}")
-            } else {
-                chord.to_string()
-            };
-            return CodeHint {
-                word: word.to_string(),
-                code,
-                strokes,
-                is_oov: false,
-                rank,
-            };
+            let confirmed = self.code_index.is_empty() || self.code_rank(chord, word).is_some();
+            if confirmed {
+                let (rank, _) = self.code_rank(chord, word).unwrap_or((1, 1));
+                if self.pure_rank_selectable(rank) {
+                    let strokes = 1 + u32::from(rank > 1);
+                    let code = if rank > 1 {
+                        format!("{chord}{rank}")
+                    } else {
+                        chord.to_string()
+                    };
+                    return CodeHint {
+                        word: word.to_string(),
+                        code,
+                        strokes,
+                        is_oov: false,
+                        rank,
+                    };
+                }
+            }
         }
 
-        // T2 · 一击字转译：非一击词，检查是否所有字都是一击字（包含单字与多字）
-        let all_1hit = !chars.is_empty()
-            && chars
-                .iter()
-                .all(|&c| crate::code_hint::kongming_1hit_hint(c).is_some());
-        if all_1hit {
-            let char_strokes = chars.len() as u32;
+        // T2 · 一击字转译：非一击词，逐字取最优一击指法（204 静态表优先，词库 1 击码兜底）；
+        // 各字选重键计入总击数后再与整词码比较，避免把需要选重的逐字组合误判为更省键。
+        let char_hits: Vec<Option<(String, u32, u8)>> =
+            chars.iter().map(|&c| self.pure_char_hint(c)).collect();
+        if !chars.is_empty() && char_hits.iter().all(|h| h.is_some()) {
+            let hits: Vec<&(String, u32, u8)> =
+                char_hits.iter().filter_map(|h| h.as_ref()).collect();
+            let char_strokes: u32 = hits.iter().map(|(_, s, _)| *s).sum();
             let word_strokes = best_word.as_ref().map(|b| b.strokes).unwrap_or(u32::MAX);
             if char_strokes <= word_strokes {
-                let chords: Vec<&str> = chars
+                let code = hits
                     .iter()
-                    .map(|&c| crate::code_hint::kongming_1hit_hint(c).unwrap().0)
-                    .collect();
+                    .map(|(d, _, _)| d.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ");
                 return CodeHint {
                     word: word.to_string(),
-                    code: chords.join(" "),
+                    code,
                     strokes: char_strokes,
                     is_oov: false,
-                    rank: 1,
+                    rank: hits.iter().map(|(_, _, r)| *r).max().unwrap_or(1),
                 };
             }
         }
@@ -2480,6 +2639,76 @@ pub fn discover_schemes(data_dir: &Path) -> Vec<SchemeInfo> {
     out
 }
 
+/// XSIME（犀术 IME）用户数据根目录：`RIMES_USER_DIR` 优先，否则 `$XDG_DATA_HOME/rimes`。
+pub fn xsime_data_dir() -> PathBuf {
+    match std::env::var_os("RIMES_USER_DIR") {
+        Some(v) if !v.is_empty() => PathBuf::from(v),
+        _ => crate::paths::data_dir().join("rimes"),
+    }
+}
+
+/// XSIME 当前激活方案包目录：解析 `schemes/active.yaml` 的 `package:` 字段。
+fn xsime_active_package_dir(root: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(root.join("schemes").join("active.yaml")).ok()?;
+    let package = text.lines().find_map(|line| line.strip_prefix("package:"))?;
+    let package = package.trim().trim_matches(['"', '\'']);
+    if package.is_empty() {
+        return None;
+    }
+    let dir = root.join("schemes").join("packages").join(package);
+    dir.is_dir().then_some(dir)
+}
+
+/// 默认方案搜索目录（按优先级）：
+/// 1. XSIME 当前激活方案包（正在生效的方案与词库）；
+/// 2. `schemes/packages/*` 其余已安装方案包；
+/// 3. 传统 `fcitx5-rime` 目录。
+pub fn default_scheme_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let root = xsime_data_dir();
+    if let Some(pkg) = xsime_active_package_dir(&root) {
+        dirs.push(pkg);
+    }
+    let packages = root.join("schemes").join("packages");
+    if let Ok(entries) = std::fs::read_dir(&packages) {
+        let mut rest: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        rest.sort();
+        for p in rest {
+            if !dirs.contains(&p) {
+                dirs.push(p);
+            }
+        }
+    }
+    let legacy = default_rime_data_dir();
+    if !dirs.contains(&legacy) {
+        dirs.push(legacy);
+    }
+    dirs
+}
+
+/// 跨多个目录发现方案：同 `id` 以先出现的目录为准（XSIME 激活包优先于旧 fcitx5 目录）。
+pub fn discover_schemes_multi(dirs: &[PathBuf]) -> Vec<SchemeInfo> {
+    let mut out: Vec<SchemeInfo> = Vec::new();
+    for dir in dirs {
+        for info in discover_schemes(dir) {
+            if !out.iter().any(|x| x.id == info.id) {
+                out.push(info);
+            }
+        }
+    }
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out
+}
+
+/// 按默认搜索目录（XSIME 优先）发现方案。
+pub fn discover_schemes_default() -> Vec<SchemeInfo> {
+    discover_schemes_multi(&default_scheme_dirs())
+}
+
 /// 默认 Rime 用户数据目录：
 /// - Windows / 小狼毫 (Weasel)：优先 `%APPDATA%\Rime`；
 /// - macOS / 鼠须管 (Squirrel)：`~/Library/Rime`；
@@ -3313,6 +3542,110 @@ algebra:
         assert_eq!(hints[0].code, "ddsg", "4 击一击字劣于 2 击词码，应保留 2 击词库码");
         assert_eq!(hints[0].strokes, 2);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_kongming_digit_ending_code_counts_one_chord() {
+        // 空明码码元本身含 7/8/9/0，不能把码尾数字误判为选重键；报复 S7 应为 1 击而非 2 击。
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!("dazitui_km_digit_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let schema = dir.join("km.schema.yaml");
+        let dict = dir.join("km.dict.yaml");
+        let schema_content = "schema:\n  name: 空明码测试\n  schema_id: km\ntranslator:\n  dictionary: km\nchord_composer:\n  algebra:\n    - xform|a|b|\n    - xform|^\\S{3,}$||\n";
+        fs::write(&schema, schema_content).unwrap();
+        fs::write(&dict, "报复\tS7\t500\n").unwrap();
+
+        let loaded = SchemeDict::load_from_file(&schema).expect("加载空明码测试方案");
+        let hints = loaded.build_code_hints(&["报复".to_string()]);
+        assert_eq!(hints[0].code, "S7");
+        assert_eq!(hints[0].strokes, 1, "码尾 7 是码元，S7 应计 1 击");
+        assert_eq!(hints[0].rank, 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_kongming_unselectable_rank_skipped() {
+        // 并击字母表占用 7/8/9/0 后，位次 8 无法用数字键选重；应跳过该码改用次优可行码。
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!("dazitui_km_rank7_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let schema = dir.join("km.schema.yaml");
+        let dict = dir.join("km.dict.yaml");
+        let schema_content = "schema:\n  name: 空明码测试\n  schema_id: km\ntranslator:\n  dictionary: km\nchord_composer:\n  alphabet: \"abcdefghijklmnopqrstuvwxyz7890\"\n  algebra:\n    - xform|a|b|\n    - xform|^\\S{3,}$||\n";
+        fs::write(&schema, schema_content).unwrap();
+        // 8 个词共用 oc：target 权重最低，位次 8（不可选）；另有 2 击码 YJyY 为首选。
+        fs::write(
+            &dict,
+            "甲一\toc\t1000\n乙二\toc\t900\n丙三\toc\t800\n丁四\toc\t700\n\
+             戊五\toc\t600\n己六\toc\t500\n庚七\toc\t400\n测试\toc\t300\n测试\tYJyY\t300\n",
+        )
+        .unwrap();
+
+        let loaded = SchemeDict::load_from_file(&schema).expect("加载空明码测试方案");
+        assert_eq!(loaded.max_select_rank, 6, "7/8/9/0 被并击占用后最大可选位次为 6");
+        let hints = loaded.build_code_hints(&["测试".to_string()]);
+        assert_eq!(hints[0].code, "YJyY", "位次 8 不可选时应改用可行的整词码");
+        assert_eq!(hints[0].strokes, 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_kongming_dict_1hit_char_outside_static_table() {
+        // 204 表外的字只要词库确有一击码，也应参与一击字转译；逻辑码 f= / =d 应展示为实际按键。
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!("dazitui_km_extra1hit_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let schema = dir.join("km.schema.yaml");
+        let dict = dir.join("km.dict.yaml");
+        let schema_content = "schema:\n  name: 空明码测试\n  schema_id: km\ntranslator:\n  dictionary: km\nchord_composer:\n  algebra:\n    - xform|a|b|\n    - xform|^\\S{3,}$||\n";
+        fs::write(&schema, schema_content).unwrap();
+        // 「龘」不在 204 一击字表，但词库给出一击码 Zg；「好」在表中为 h。
+        // 整词码 QJvW 为 2 击，与逐字一击 2 击持平，按 ADR 0018 选逐字词提。
+        fs::write(&dict, "龘好\tQJvW\t500\n龘\tZg\t500\n").unwrap();
+
+        let loaded = SchemeDict::load_from_file(&schema).expect("加载空明码测试方案");
+        let hints = loaded.build_code_hints(&["龘好".to_string()]);
+        assert_eq!(hints[0].code, "Zg h", "表外一击字应使用词库一击码");
+        assert_eq!(hints[0].strokes, 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_kongming_stale_static_word_chord_requires_ownership() {
+        // 静态一击词表可能过时（如「看到 ;K」已被「之后 ;K」取代）；重码不属此词时不得采用。
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!("dazitui_km_stale_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let schema = dir.join("km.schema.yaml");
+        let dict = dir.join("km.dict.yaml");
+        let schema_content = "schema:\n  name: 空明码测试\n  schema_id: km\ntranslator:\n  dictionary: km\nchord_composer:\n  algebra:\n    - xform|a|b|\n    - xform|^\\S{3,}$||\n";
+        fs::write(&schema, schema_content).unwrap();
+        fs::write(&dict, "之后\t;K\t500\n看到\tYHDh\t500\n").unwrap();
+
+        let loaded = SchemeDict::load_from_file(&schema).expect("加载空明码测试方案");
+        let hints = loaded.build_code_hints(&["看到".to_string()]);
+        // 两字均为静态一击字（看 k、到 e），逐字 2 击与整词 2 击持平，按 ADR 0018 取逐字；
+        // 关键是不能采用旧表已易主的「;K」。
+        assert_eq!(hints[0].code, "k e", "过时的静态一击词码不得提示给别的词");
+        assert_eq!(hints[0].strokes, 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn discover_schemes_multi_prefers_first_dir() {
+        use std::fs;
+        let base = std::env::temp_dir().join(format!("dazitui_multi_{}", std::process::id()));
+        let a = base.join("a");
+        let b = base.join("b");
+        let _ = fs::create_dir_all(&a);
+        let _ = fs::create_dir_all(&b);
+        fs::write(a.join("km.schema.yaml"), "schema:\n  name: A\n  schema_id: km\n").unwrap();
+        fs::write(b.join("km.schema.yaml"), "schema:\n  name: B\n  schema_id: km\n").unwrap();
+        let found = discover_schemes_multi(&[a.clone(), b.clone()]);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].path, a.join("km.schema.yaml"), "同 id 应以先出现的目录为准");
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]

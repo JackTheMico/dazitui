@@ -29,7 +29,8 @@ pub use db::{
 pub use lttb::lttb_downsample;
 pub use scheme::{
     ChordAlgebra, CodeHint, RimeSchemaResolver, SchemeDict, SchemeInfo, YamlValue,
-    default_rime_data_dir, discover_schemes, parse_rime_yaml, resolve_scheme_path_via_discovery,
+    default_rime_data_dir, default_scheme_dirs, discover_schemes, discover_schemes_default,
+    discover_schemes_multi, parse_rime_yaml, resolve_scheme_path_via_discovery, xsime_data_dir,
 };
 pub use segmenter::{WordIndex, WordToken, prewarm_segmenter};
 pub use session::{
