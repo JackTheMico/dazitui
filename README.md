@@ -25,12 +25,12 @@
 
 | 操作系统 | 架构 / 平台 | 预编译包下载 | 说明 |
 | :--- | :--- | :--- | :--- |
-| 🐧 **Linux** | x86_64 (glibc) | [dazitui-v1.0.21-x86_64-unknown-linux-gnu.tar.gz](https://github.com/JackTheMico/dazitui/releases/latest) | 推荐 Ubuntu / Debian / Fedora / Arch |
-| 🐧 **Linux** | x86_64 (musl 静态编译) | [dazitui-v1.0.21-x86_64-unknown-linux-musl.tar.gz](https://github.com/JackTheMico/dazitui/releases/latest) | 零动态库依赖，全发行版及 Alpine 通用 |
-| 🐧 **Linux** | ARM64 / aarch64 | [dazitui-v1.0.21-aarch64-unknown-linux-gnu.tar.gz](https://github.com/JackTheMico/dazitui/releases/latest) | 树莓派 / ARM 架构 Linux 设备 |
-| 🍎 **macOS** | Apple Silicon (M1/M2/M3/M4) | [dazitui-v1.0.21-aarch64-apple-darwin.tar.gz](https://github.com/JackTheMico/dazitui/releases/latest) | 原生 ARM64 极致性能 |
-| 🍎 **macOS** | Intel x86_64 | [dazitui-v1.0.21-x86_64-apple-darwin.tar.gz](https://github.com/JackTheMico/dazitui/releases/latest) | 兼容 Intel 处理器 Mac |
-| 🪟 **Windows** | x86_64 (MSVC) | [dazitui-v1.0.21-x86_64-pc-windows-msvc.zip](https://github.com/JackTheMico/dazitui/releases/latest) | 解压即用 `dazitui.exe`（推荐 Windows Terminal） |
+| 🐧 **Linux** | x86_64 (glibc) | [dazitui-v1.0.22-x86_64-unknown-linux-gnu.tar.gz](https://github.com/JackTheMico/dazitui/releases/latest) | 推荐 Ubuntu / Debian / Fedora / Arch |
+| 🐧 **Linux** | x86_64 (musl 静态编译) | [dazitui-v1.0.22-x86_64-unknown-linux-musl.tar.gz](https://github.com/JackTheMico/dazitui/releases/latest) | 零动态库依赖，全发行版及 Alpine 通用 |
+| 🐧 **Linux** | ARM64 / aarch64 | [dazitui-v1.0.22-aarch64-unknown-linux-gnu.tar.gz](https://github.com/JackTheMico/dazitui/releases/latest) | 树莓派 / ARM 架构 Linux 设备 |
+| 🍎 **macOS** | Apple Silicon (M1/M2/M3/M4) | [dazitui-v1.0.22-aarch64-apple-darwin.tar.gz](https://github.com/JackTheMico/dazitui/releases/latest) | 原生 ARM64 极致性能 |
+| 🍎 **macOS** | Intel x86_64 | [dazitui-v1.0.22-x86_64-apple-darwin.tar.gz](https://github.com/JackTheMico/dazitui/releases/latest) | 兼容 Intel 处理器 Mac |
+| 🪟 **Windows** | x86_64 (MSVC) | [dazitui-v1.0.22-x86_64-pc-windows-msvc.zip](https://github.com/JackTheMico/dazitui/releases/latest) | 解压即用 `dazitui.exe`（推荐 Windows Terminal） |
 
 ### ⚡ Linux & macOS 一键快速下载运行
 
@@ -79,7 +79,7 @@ cargo build --release --bin dazitui
 
 ### 📚 2. 全方位赛文载入系统
 - **📁 本地文件载入**：支持命令行直接传参（`dazitui article.txt`）或在 TUI 内使用交互式文件浏览器（按 `f`）浏览载入。
-- **📖 8 套精选内置赛文**：编译期嵌入「常用单字前/中/后五百」与「常用词组前/中/后五百」，并新增空明码「一击字（455 字）」与「一击词（765 词）」专项练习，支持顺序练习与随机乱序模式（按 `s` 打乱）。
+- **📖 9 套精选内置赛文**：编译期嵌入「常用单字前/中/后五百」与「常用词组前/中/后五百」，并新增空明码「一击字（455 字）」、「一击词（765 常用词）」与「全库一击词（1678 词）」专项练习，支持顺序练习与随机乱序模式（按 `s` 打乱）。
 - **🚪 智能组边界门槛**：内置赛文每 10 字/词为一组，当前组全对后方可自动推进到下一组，强化学员单组盲打准确率。
 - **🎯 单字目标门槛（击键 / 速度）**：内置单字赛文可设目标门槛，每组按「`KPS ≥ 目标击键` **或** `WPM ≥ 目标速度`」判定（二者取或），未达标即时提示并可直接重打本组。支持任意数值自定义（如 `4.3` 击/秒、`115.5` WPM），`0` 表示关闭该门槛。词组赛文不设门槛。
 - **✍️ 自由发文**：内置多行文本编辑弹窗（按 `i`），支持自由输入、修改标题与正文，并可一键持久化保存到本地文件。

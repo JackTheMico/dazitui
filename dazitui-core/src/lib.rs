@@ -18,9 +18,10 @@ mod online;
 pub use chapter::{BookCatalog, Chapter, detect_and_parse_book};
 
 pub use code_hint::{
-    HandPrefixStyle, HintCell, HintHand, KONGMING_1HIT_CHORDS, KONGMING_1HIT_WORDS, display_width,
-    hand_of_code, hand_of_code_with, hint_cell_widths, hint_cell_widths_with, kongming_1hit_hint,
-    kongming_1hit_word_hint, layout_code_hint_grid, layout_code_hint_grid_with,
+    HandPrefixStyle, HintCell, HintHand, KONGMING_1HIT_CHORDS, KONGMING_1HIT_WORDS,
+    KONGMING_ALL_1HIT_WORDS, display_width, hand_of_code, hand_of_code_with, hint_cell_widths,
+    hint_cell_widths_with, kongming_1hit_hint, kongming_1hit_word_hint,
+    kongming_all_1hit_word_hint, layout_code_hint_grid, layout_code_hint_grid_with,
     layout_code_hint_line, layout_code_hint_line_with, pack_words_by_width,
 };
 pub use db::{
@@ -178,6 +179,9 @@ pub enum BuiltinSet {
     /// 判定口径：方案当前词库中存在「一次并击可达且该词为词库首候选」的码
     /// （含一击上屏 445 词、一击后按空格 320 词），由 `km_chord_model` 计算。
     KongmingOneHitWords,
+    /// 空明码全库一击词：方案全词库中一次并击可达且为首候选的多字纯中文词条（1678 词）。
+    /// 按方案词频排序，与 765 常用子集并存，便于全量覆盖练习。
+    KongmingAllOneHitWords,
     /// 空明码一击字：前 1500 常用字中「一击上屏」的单字（455 字，按词频排序）。
     /// 编码与手区取方案当前词库 + `km_chord_model` 的一次并击反推结果，排除需按空格的字。
     KongmingOneHitChars,
@@ -194,6 +198,7 @@ impl BuiltinSet {
             Self::CommonWordsZhong => "常用词组中五百",
             Self::CommonWordsHou => "常用词组后五百",
             Self::KongmingOneHitWords => "空明码一击词",
+            Self::KongmingAllOneHitWords => "空明码全库一击词",
             Self::KongmingOneHitChars => "空明码一击字",
         }
     }
@@ -206,6 +211,7 @@ impl BuiltinSet {
                 | Self::CommonWordsZhong
                 | Self::CommonWordsHou
                 | Self::KongmingOneHitWords
+                | Self::KongmingAllOneHitWords
         )
     }
 
@@ -228,6 +234,7 @@ impl BuiltinSet {
             Self::CommonWordsZhong => include_str!("../data/common-words-zhong.txt"),
             Self::CommonWordsHou => include_str!("../data/common-words-hou.txt"),
             Self::KongmingOneHitWords => include_str!("../data/kongming-1hit-words.txt"),
+            Self::KongmingAllOneHitWords => include_str!("../data/kongming-all-1hit-words.txt"),
             Self::KongmingOneHitChars => include_str!("../data/kongming-1hit-chars.txt"),
         }
     }
@@ -277,7 +284,7 @@ impl BuiltinSet {
 }
 
 /// 所有内置赛文，按功能栏展示顺序。
-pub const BUILTIN_SETS: [BuiltinSet; 8] = [
+pub const BUILTIN_SETS: [BuiltinSet; 9] = [
     BuiltinSet::CommonCharsQian,
     BuiltinSet::CommonCharsZhong,
     BuiltinSet::CommonCharsHou,
@@ -285,6 +292,7 @@ pub const BUILTIN_SETS: [BuiltinSet; 8] = [
     BuiltinSet::CommonWordsZhong,
     BuiltinSet::CommonWordsHou,
     BuiltinSet::KongmingOneHitWords,
+    BuiltinSet::KongmingAllOneHitWords,
     BuiltinSet::KongmingOneHitChars,
 ];
 
@@ -877,6 +885,7 @@ mod tests {
             BuiltinSet::CommonWordsZhong,
             BuiltinSet::CommonWordsHou,
             BuiltinSet::KongmingOneHitWords,
+            BuiltinSet::KongmingAllOneHitWords,
         ] {
             let text = load_builtin_text(set);
             assert!(
@@ -943,6 +952,7 @@ mod tests {
                     | BuiltinSet::CommonWordsZhong
                     | BuiltinSet::CommonWordsHou
                     | BuiltinSet::KongmingOneHitWords
+                    | BuiltinSet::KongmingAllOneHitWords
             );
             assert_eq!(set.is_words(), expected, "{} is_words 不正确", set.name());
         }
@@ -971,6 +981,32 @@ mod tests {
         }
         assert_eq!(words[0], "可以", "首词应为词频最高的「可以」");
         assert_eq!(set.name(), "空明码一击词");
+        assert!(set.is_words());
+    }
+
+    #[test]
+    fn kongming_all_one_hit_words_content_shape() {
+        // 空明码全库一击词：1678 词、无重复、均为多字纯中文词、按方案词频排序首词「就是」。
+        let set = BuiltinSet::KongmingAllOneHitWords;
+        let words: Vec<&str> = set
+            .content()
+            .trim_end_matches(['\n', '\r'])
+            .split('，')
+            .collect();
+        assert_eq!(words.len(), 1678, "空明码全库一击词应为 1678 词");
+        let mut sorted = words.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), words.len(), "空明码全库一击词不应有重复");
+        for w in &words {
+            assert!(
+                w.chars().count() >= 2 && !w.chars().any(|c| c.is_ascii_alphanumeric()),
+                "空明码全库一击词含非法条目: {}",
+                w
+            );
+        }
+        assert_eq!(words[0], "就是", "首词应为方案词频最高的「就是」");
+        assert_eq!(set.name(), "空明码全库一击词");
         assert!(set.is_words());
     }
 

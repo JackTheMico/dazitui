@@ -20,8 +20,9 @@ use dazitui_core::{
     build_tiger_payload, detect_and_parse_book, discover_schemes_default, env_credentials,
     format_ox_share_text, format_stats_share_text, format_tiger_share_text, format_time,
     hand_of_code_with, hint_cell_widths, hint_cell_widths_with, is_auth_failure, key_accuracy_pct,
-    kongming_1hit_hint, kongming_1hit_word_hint, layout_code_hint_line, layout_code_hint_line_with,
-    load_builtin_text, load_builtin_text_shuffled, load_text_from_clipboard, load_text_from_file,
+    kongming_1hit_hint, kongming_1hit_word_hint, kongming_all_1hit_word_hint,
+    layout_code_hint_line, layout_code_hint_line_with, load_builtin_text,
+    load_builtin_text_shuffled, load_text_from_clipboard, load_text_from_file,
     load_text_from_string, lttb_downsample, normalize_scheme_to_id, osc52_clipboard,
     pack_words_by_width, prewarm_segmenter, resolve_scheme_path_via_discovery, save_text_to_file,
     today_ymd, utc_days_now, utc_ymd_from_days, word_ratio_pct,
@@ -6002,7 +6003,9 @@ fn ui(frame: &mut Frame, app: &App) {
         let is_kongming_1hit = matches!(
             app.text.source,
             TextSource::Builtin {
-                set: BuiltinSet::KongmingOneHitChars | BuiltinSet::KongmingOneHitWords
+                set: BuiltinSet::KongmingOneHitChars
+                    | BuiltinSet::KongmingOneHitWords
+                    | BuiltinSet::KongmingAllOneHitWords
             }
         );
         let dict_ok = code_hint_dict_usable(app.scheme_dict.as_ref());
@@ -10482,7 +10485,10 @@ fn code_hint_overlay_line(
         let cells = layout_code_hint_line(&words, &hints, &typed_mask);
         return Some(code_hint_line_from_cells(&cells, theme));
     }
-    if set == BuiltinSet::KongmingOneHitWords {
+    if matches!(
+        set,
+        BuiltinSet::KongmingOneHitWords | BuiltinSet::KongmingAllOneHitWords
+    ) {
         let boundaries: Vec<(usize, usize)> = match &text.word_boundaries {
             Some(b) if !b.is_empty() => b.clone(),
             _ => set.word_boundaries(),
@@ -10504,13 +10510,20 @@ fn code_hint_overlay_line(
             words.push(word);
             typed_mask.push(all_correct);
         }
+        let hint_lookup = |w: &str| {
+            if set == BuiltinSet::KongmingOneHitWords {
+                kongming_1hit_word_hint(w)
+            } else {
+                kongming_all_1hit_word_hint(w)
+            }
+        };
         let hints: Vec<CodeHint> = if let Some(dict) = scheme_dict.filter(|d| d.is_pure_chord()) {
             dict.build_code_hints(&words)
         } else {
             words
                 .iter()
                 .map(|w| {
-                    if let Some((chord, _hand)) = kongming_1hit_word_hint(w) {
+                    if let Some((chord, _hand)) = hint_lookup(w) {
                         CodeHint {
                             word: w.clone(),
                             code: chord.to_string(),
@@ -10726,7 +10739,10 @@ fn builtin_cell_widths(
             .collect();
         return Some(hint_cell_widths(&words, &hints));
     }
-    if set == BuiltinSet::KongmingOneHitWords {
+    if matches!(
+        set,
+        BuiltinSet::KongmingOneHitWords | BuiltinSet::KongmingAllOneHitWords
+    ) {
         let owned_boundaries;
         let boundaries: &[(usize, usize)] = match &text.word_boundaries {
             Some(b) if !b.is_empty() => b,
@@ -10745,13 +10761,20 @@ fn builtin_cell_widths(
             .iter()
             .map(|&(ws, we)| statuses[ws..we].iter().map(|(c, _)| *c).collect())
             .collect();
+        let hint_lookup = |w: &str| {
+            if set == BuiltinSet::KongmingOneHitWords {
+                kongming_1hit_word_hint(w)
+            } else {
+                kongming_all_1hit_word_hint(w)
+            }
+        };
         let hints: Vec<CodeHint> = if let Some(dict) = scheme_dict.filter(|d| d.is_pure_chord()) {
             dict.build_code_hints(&words)
         } else {
             words
                 .iter()
                 .map(|w| {
-                    if let Some((chord, _hand)) = kongming_1hit_word_hint(w) {
+                    if let Some((chord, _hand)) = hint_lookup(w) {
                         CodeHint {
                             word: w.clone(),
                             code: chord.to_string(),
@@ -11702,7 +11725,7 @@ mod tests {
 
     #[test]
     fn builtin_sets_in_order() {
-        assert_eq!(BUILTIN_SETS.len(), 8);
+        assert_eq!(BUILTIN_SETS.len(), 9);
         assert_eq!(BUILTIN_SETS[0].name(), "常用单字前五百");
         assert_eq!(BUILTIN_SETS[1].name(), "常用单字中五百");
         assert_eq!(BUILTIN_SETS[2].name(), "常用单字后五百");
@@ -11710,7 +11733,8 @@ mod tests {
         assert_eq!(BUILTIN_SETS[4].name(), "常用词组中五百");
         assert_eq!(BUILTIN_SETS[5].name(), "常用词组后五百");
         assert_eq!(BUILTIN_SETS[6].name(), "空明码一击词");
-        assert_eq!(BUILTIN_SETS[7].name(), "空明码一击字");
+        assert_eq!(BUILTIN_SETS[7].name(), "空明码全库一击词");
+        assert_eq!(BUILTIN_SETS[8].name(), "空明码一击字");
     }
 
     #[test]
@@ -13429,6 +13453,28 @@ mod tests {
 
         // 4. 列宽计算应返回 10 个词格宽
         let widths = builtin_cell_widths(&session, &text, None).expect("空明码一击词应有词格列宽");
+        assert_eq!(widths.len(), 10);
+    }
+
+    #[test]
+    fn code_hint_overlay_shows_chord_for_kongming_all_one_hit_words() {
+        let theme = Theme::preset(ThemePreset::CatppuccinMocha);
+        let set = BuiltinSet::KongmingAllOneHitWords;
+        let text = load_builtin_text(set);
+        let boundaries = set.word_boundaries();
+        let session = Session::new_gated_with_words_and_size(&text.content, true, &boundaries, 10);
+
+        let line = code_hint_overlay_line(&session, &text, None, theme)
+            .expect("空明码全库一击词即便无词典也应生成提示行");
+        let first_hint_span = line
+            .spans
+            .iter()
+            .find(|s| s.content.contains("T~"))
+            .expect("首格应含 T~ 提示");
+        assert_eq!(first_hint_span.style.fg, Some(color(theme.hand_two)));
+
+        let widths =
+            builtin_cell_widths(&session, &text, None).expect("空明码全库一击词应有词格列宽");
         assert_eq!(widths.len(), 10);
     }
 

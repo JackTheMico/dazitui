@@ -9,11 +9,14 @@
 - 一击字：前 1500 常用字中「一击上屏」的字（一次并击、唯一候选、无延伸），按词频排序；
 - 一击词：dazitui 自有 1500 常用词中，存在「一次并击可达且该词为词库首候选」的码的词，
   按词频排序；同等条件优先无需空格的自动上屏码。
+- 全库一击词：方案全词库中「一次并击可达且该词为首候选」的多字纯中文词条，
+  按方案 essay 词频排序，作为独立内置练习集，不替换上面的常用子集。
 
 同时重写：
     dazitui-core/data/kongming-1hit-chars.txt
     dazitui-core/data/kongming-1hit-words.txt
-    dazitui-core/src/code_hint.rs 中两张静态表
+    dazitui-core/data/kongming-all-1hit-words.txt
+    dazitui-core/src/code_hint.rs 中三张静态表
 """
 import collections
 import importlib.util
@@ -95,14 +98,35 @@ for w in common:
         hits.sort(key=lambda c: (0 if charmod.tier(c, codes, prefix) == 'auto' else 1, len(c), c))
         words.append((w, hits[0]))
 
-if not chars or not words:
+# 全库一击词：每个一次并击可达码的首候选，仅保留多字纯中文词条。
+# 同一词有多个一击码时按 auto > 短码 > 字典序择优；排序用方案 essay 词频。
+all_candidates = {}
+for code in one:
+    if code not in codes:
+        continue
+    word = codes[code][0]
+    all_candidates.setdefault(word, []).append(code)
+all_words = []
+for word, code_list in all_candidates.items():
+    if len(word) < 2 or not all(charmod.is_cjk(ch) for ch in word):
+        continue
+    code = min(
+        code_list,
+        key=lambda c: (0 if charmod.tier(c, codes, prefix) == 'auto' else 1, len(c), c),
+    )
+    all_words.append((word, code))
+all_words.sort(key=lambda p: (-freq.get(p[0], 0), p[0]))
+
+if not chars or not words or not all_words:
     raise SystemExit('未生成任何一击字/词，请检查方案词库路径')
-print(f'一击字 {len(chars)} 个，一击词 {len(words)} 个')
+print(f'一击字 {len(chars)} 个，一击词 {len(words)} 个，全库一击词 {len(all_words)} 个')
 
 (ROOT / 'dazitui-core/data/kongming-1hit-chars.txt').write_text(
     ''.join(c for c, _ in chars) + '\n', encoding='utf-8')
 (ROOT / 'dazitui-core/data/kongming-1hit-words.txt').write_text(
     '，'.join(w for w, _ in words) + '\n', encoding='utf-8')
+(ROOT / 'dazitui-core/data/kongming-all-1hit-words.txt').write_text(
+    '，'.join(w for w, _ in all_words) + '\n', encoding='utf-8')
 
 path = ROOT / 'dazitui-core/src/code_hint.rs'
 src = path.read_text(encoding='utf-8')
@@ -136,6 +160,25 @@ pub const KONGMING_1HIT_WORDS: &[(&str, &str)] = &[
     for w, code in words
 ) + '];'
 src = src[:word_start] + word_block + src[word_end:]
+
+all_start = src.find('/// 空明码「全库一击词」词条表')
+if all_start >= 0:
+    all_end = src.index('\n];', src.index('pub const KONGMING_ALL_1HIT_WORDS', all_start)) + len('\n];')
+else:
+    all_end = src.index('\n];', src.index('pub const KONGMING_1HIT_WORDS')) + len('\n];')
+all_block = f'''/// 空明码「全库一击词」词条表（词条、方案当前码面），与内置全库一击词赛文同源。
+///
+/// 由 `scripts/generate_kongming_1hit.py` 从方案词库生成。全库一次并击可达码的首候选中，
+/// 多字纯中文词条按方案词频排序；与上面的 1500 常用子集互不影响。
+pub const KONGMING_ALL_1HIT_WORDS: &[(&str, &str)] = &[
+''' + ''.join(
+    f"    ({json.dumps(w, ensure_ascii=False)}, {json.dumps(code, ensure_ascii=False)}),\n"
+    for w, code in all_words
+) + '];'
+if all_start >= 0:
+    src = src[:all_start] + all_block + src[all_end:]
+else:
+    src = src[:all_end] + '\n\n' + all_block + src[all_end:]
 path.write_text(src, encoding='utf-8')
 
 # 字模来自所有 data/*.txt，数据变了必须同步重生成
