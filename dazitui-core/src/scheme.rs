@@ -108,6 +108,20 @@ pub struct CodeHint {
     pub rank: u8,
 }
 
+/// 空明码纯并击下某词条的最优整词候选（`build_hint_for_word_pure_chord` 的内部分解结果）。
+struct PureWordCandidate {
+    /// 展示码：非首选时已追加选重数字。
+    disp_code: String,
+    /// 基础并击数（不含选重键）。
+    base_strokes: u32,
+    /// 总击数（含非首选的选重键）。
+    strokes: u32,
+    /// 候选位次：1 = 首选。
+    rank: u8,
+    /// 词库原始码长度（同分时的稳定择优键）。
+    raw_len: usize,
+}
+
 impl std::str::FromStr for SchemeDict {
     type Err = std::convert::Infallible;
 
@@ -469,6 +483,24 @@ impl SchemeDict {
         self.four_auto_commit
     }
 
+    /// 提示区对编码前导 `_` / `+` / `-` 的解读方式（见 [`HandPrefixStyle`]）。
+    ///
+    /// 判据为 `pure_chord`（纯并击方案），依据是两类方案对这三个字符做了**相反**的事：
+    ///
+    /// - 空明码类（`pure_chord`）：chord algebra 直接把它们当作码元产出，
+    ///   如 `xform/(w-d-f-|j-k-o-)/_/`（`_` = 左手 wdf 或右手 jko 并击）、`xform/(90-)/_/`。
+    ///   它们是必须打出的码元，提示区若剥掉，用户照码就会漏键。
+    /// - yoyo-pure 类（非 `pure_chord`）：algebra 用 `xform|^(单手键序列)$|_$1|` 派生出手区前缀，
+    ///   并在 `chord_composer.prompt_format` 里主动 `xform/[-=_+]//g` 抹掉——方案作者本就不把它
+    ///   当按键展示，提示区应同样剥除。
+    pub fn hand_prefix_style(&self) -> crate::code_hint::HandPrefixStyle {
+        if self.pure_chord {
+            crate::code_hint::HandPrefixStyle::Literal
+        } else {
+            crate::code_hint::HandPrefixStyle::Modifier
+        }
+    }
+
     /// 是否为变长整句方案（虎整句）：连续码输入、每字段长 >= 2、末尾恒定计一次提交键。
     pub fn is_sentence_mode(&self) -> bool {
         self.sentence_mode
@@ -557,16 +589,35 @@ impl SchemeDict {
     /// 读取 `speller/alphabet`，判断 `;` 与 `'` 是否可作为选重键（ADR 0014 D2）。
     ///
     /// 虎整句 alphabet 为 `zyxwvutsrqponmlkjihgfedcba;';0123456789~` → 两者皆可；
-    /// 万象虎为 `...7890;*/\[]` → 仅 `;`（`'` 是其拼音反查前缀，不能选重）；
+    /// 定长形码（万象虎）的 `'` 是**一简字定字后缀**（`u'` 锁定「的」），不是选重键，
+    /// 即便它出现在 alphabet 里也不能按第 3 候选处理——此时以 `key_binder` 的真实绑定为准；
     /// 取不到该配置时退化为数字选号。
-    fn read_select_keys(doc: Option<&YamlValue>) -> (bool, bool) {
+    fn read_select_keys(doc: Option<&YamlValue>, four_auto_commit: bool) -> (bool, bool) {
         let Some(alphabet) = doc
             .and_then(|d| d.get("speller/alphabet"))
             .and_then(|v| v.as_str())
         else {
             return (false, false);
         };
-        (alphabet.contains(';'), alphabet.contains('\''))
+        let apo = if four_auto_commit {
+            Self::key_binder_selects(doc, &["apostrophe", "'"], "3")
+        } else {
+            alphabet.contains('\'')
+        };
+        (alphabet.contains(';'), apo)
+    }
+
+    /// `key_binder/bindings` 中是否存在把 `accept` 映射到指定候选数字的绑定。
+    fn key_binder_selects(doc: Option<&YamlValue>, accepts: &[&str], send: &str) -> bool {
+        let Some(YamlValue::List(bindings)) = doc.and_then(|d| d.get("key_binder/bindings")) else {
+            return false;
+        };
+        bindings.iter().any(|b| {
+            b.get("accept")
+                .and_then(|v| v.as_str())
+                .is_some_and(|a| accepts.contains(&a))
+                && b.get("send").and_then(|v| v.as_str()) == Some(send)
+        })
     }
 
     /// 纯并击方案下可用的最大选重位次：取未被 `chord_composer.alphabet` 占用的最大数字。
@@ -719,7 +770,8 @@ impl SchemeDict {
                 schema_name.as_deref(),
                 schema_stem,
             );
-            let (semi, apo) = Self::read_select_keys(schema_doc.as_ref());
+            let (semi, apo) =
+                Self::read_select_keys(schema_doc.as_ref(), four_auto_commit && !dict.sentence_mode);
             dict.select_semicolon = semi;
             dict.select_apostrophe = apo;
             dict.max_select_rank = Self::read_max_select_rank(schema_doc.as_ref());
@@ -790,7 +842,10 @@ impl SchemeDict {
                 dict.chord_algebra.is_some(),
             );
             dict.sentence_mode = Self::detect_sentence_mode(doc.as_ref(), name.as_deref(), stem);
-            let (semi, apo) = Self::read_select_keys(doc.as_ref());
+            let (semi, apo) = Self::read_select_keys(
+                doc.as_ref(),
+                dict.four_auto_commit && !dict.sentence_mode,
+            );
             dict.select_semicolon = semi;
             dict.select_apostrophe = apo;
             dict.max_select_rank = Self::read_max_select_rank(doc.as_ref());
@@ -1370,19 +1425,63 @@ impl SchemeDict {
 
     /// 评估某词条的一个候选编码：算出真实按键数、位次与是否唯一。
     ///
-    /// 定长形码的上屏规则：
-    /// - 4 码且无重码 → 自动上屏，不额外按键；
-    /// - 其余（短码、长码、有重码）→ 需补一次上屏键（首选按空格，非首选按数字键）。
+    /// 定长形码的整句流上屏规则（ADR 0013 D5 修订）：
+    /// - 4 码段：字母数已达上限，后一字母**必然**属于下一段，右边界无歧义 →
+    ///   首选无需空格即可继续打下一词；仅非首选才需一次选重键；
+    /// - `/` 结尾的引导键简词自带提交，同样无需空格；
+    /// - 1~3 码短码右边界有歧义，首选仍需一次空格终止（`;`/数字选重不算空格）。
+    ///
+    /// 故 `strokes` 只对「首选的 2/3 码短码」额外 +1（空格）。
     fn eval_candidate(&self, word: &str, code: &str) -> CodeCandidate {
-        let (rank, group_len) = self.code_rank(code, word).unwrap_or((1, 1));
+        let (rank, _group_len) = self.code_rank(code, word).unwrap_or((1, 1));
         let len = Self::four_code_len(code);
-        let unique = group_len <= 1;
-        let auto_commit = len == 4 && unique && !code.ends_with('/');
+        // 4 码段与 `/` 引导键的右边界确定，首选可免空格。
+        let boundary_free = len == 4 || code.ends_with('/');
+        let auto_commit = boundary_free && rank <= 1;
         let strokes = if auto_commit { len } else { len + 1 };
         CodeCandidate {
             code: code.to_string(),
             strokes,
             rank,
+        }
+    }
+
+    /// 定长形码整句流下某段需按的空格数：只有「首选的 2/3 码短码」需要空格终止。
+    ///
+    /// 4 码段右边界确定、1 码可用 `'` 定字、`;`/数字选重以及 `/` 引导键都不占空格。
+    fn four_segment_spaces(&self, code: &str, rank: u8) -> u32 {
+        let len = Self::four_code_len(code);
+        if rank > 1 || len == 4 || len == 1 || code.ends_with('/') {
+            0
+        } else {
+            1
+        }
+    }
+
+    /// 定长形码整句流下的逐段渲染：把「是否需要按空格/选重键」写成提示串。
+    ///
+    /// - 4 码首选 → 原样（后续可直接续打下一词，不按空格）；
+    /// - 1 码首选 → 追加 `'` 定字（一简字固定，免空格且右边界确定）；
+    /// - 2/3 码首选 → 追加 `␣`（短码必须空格终止）；
+    /// - 非首选 → 追加 `;`（第 2 位）或位次数字。
+    fn render_four_segment(&self, code: &str, rank: u8) -> String {
+        if code.ends_with('/') {
+            return code.to_string();
+        }
+        if rank > 1 {
+            return match rank {
+                2 if self.select_semicolon => format!("{code};"),
+                3 if self.select_apostrophe => format!("{code}'"),
+                n => format!("{code}{n}"),
+            };
+        }
+        let len = Self::four_code_len(code);
+        if len == 4 {
+            code.to_string()
+        } else if len == 1 {
+            format!("{code}'")
+        } else {
+            format!("{code}\u{2423}")
         }
     }
 
@@ -1420,54 +1519,87 @@ impl SchemeDict {
 
     /// 定长形码下单个词组单位的编码提示（ADR 0013 D1/D2/D5/D6）。
     ///
-    /// - 整词已登录：取「首选且击数最少」的码；4 码唯一则自动上屏，否则在提示里补 `␣`（空格）
-    ///   或由渲染层标注选号位次；
-    /// - 整词未登录：逐字独立上屏，每字取「首选且击数最少」的码，逐字之间以 `␣` 显式分隔，
-    ///   击数为各字按键数之和；
+    /// 在词组单位内做动态规划：切分点可以落在任意子词上，择优键为
+    /// **(总击数, 空格数)** 字典序——先保证总击数最少，再在此前提下尽量少按空格。
+    /// 整句方案（万象虎）下 4 码段与 `x'` 定字段无需空格即可续打，故即便击数相同
+    /// 也优先采用这类右边界确定的切分。
+    /// - 整词已登录且最短：自然退化为整词码；
+    /// - 整词未登录或整词码偏长：继续按词库里存在的更短子词切分（如「麻烦事」→「麻烦」+「事」），
+    ///   而不是一律退到逐字；
     /// - 任一字未登录：提示留空并标记 `is_oov`。
+    ///
+    /// 同击数、同空格数时优先段数少（更接近整词）、其次末段更长，保证结果稳定可复现。
     fn build_hint_for_word_four(&self, word: &str) -> CodeHint {
-        if let Some(cand) = self.best_four_code(word) {
-            return CodeHint {
-                word: word.to_string(),
-                code: self.mark_commit_key(&cand.code, cand.strokes, cand.rank),
-                strokes: cand.strokes,
-                is_oov: false,
-                rank: cand.rank,
-            };
+        let chars: Vec<char> = word.chars().collect();
+        let oov = CodeHint {
+            word: word.to_string(),
+            code: String::new(),
+            strokes: 0,
+            is_oov: true,
+            rank: 1,
+        };
+        if chars.is_empty() {
+            return oov;
         }
 
-        // 整词未登录：逐字独立上屏（D6）。
-        let mut per_char: Vec<CodeCandidate> = Vec::new();
-        for c in word.chars() {
-            match self.best_four_code(&c.to_string()) {
-                Some(cand) => per_char.push(cand),
-                None => {
-                    return CodeHint {
-                        word: word.to_string(),
-                        code: String::new(),
-                        strokes: 0,
-                        is_oov: true,
-                        rank: 1,
-                    };
+        // dp[i] = 前 i 个字的最优切分：(总击数, 空格数, 段数, 末段起点, 末段候选)
+        let mut dp: Vec<Option<(u32, u32, usize, usize, CodeCandidate)>> =
+            vec![None; chars.len() + 1];
+        dp[0] = Some((
+            0,
+            0,
+            0,
+            0,
+            CodeCandidate {
+                code: String::new(),
+                strokes: 0,
+                rank: 1,
+            },
+        ));
+        for i in 1..=chars.len() {
+            for j in 0..i {
+                let Some((cost, spaces, segs, _, _)) = dp[j].clone() else {
+                    continue;
+                };
+                let seg: String = chars[j..i].iter().collect();
+                let Some(cand) = self.best_four_code(&seg) else {
+                    continue;
+                };
+                let total = cost + cand.strokes;
+                let total_spaces = spaces + self.four_segment_spaces(&cand.code, cand.rank);
+                let count = segs + 1;
+                let key = (total, total_spaces, count, j);
+                let better = match &dp[i] {
+                    None => true,
+                    Some((c, sp, s, prev_j, _)) => key < (*c, *sp, *s, *prev_j),
+                };
+                if better {
+                    dp[i] = Some((total, total_spaces, count, j, cand));
                 }
             }
         }
-        if per_char.is_empty() {
-            return CodeHint {
-                word: word.to_string(),
-                code: String::new(),
-                strokes: 0,
-                is_oov: true,
-                rank: 1,
+        let Some((strokes, _, _, _, _)) = dp[chars.len()].clone() else {
+            return oov;
+        };
+
+        // 回溯切分
+        let mut parts: Vec<CodeCandidate> = Vec::new();
+        let mut i = chars.len();
+        while i > 0 {
+            let Some((_, _, _, j, cand)) = dp[i].take() else {
+                return oov;
             };
+            parts.push(cand);
+            i = j;
         }
-        let code: String = per_char
+        parts.reverse();
+
+        let code: String = parts
             .iter()
-            .map(|c| self.mark_commit_key(&c.code, c.strokes, c.rank))
+            .map(|c| self.render_four_segment(&c.code, c.rank))
             .collect();
-        let strokes: u32 = per_char.iter().map(|c| c.strokes).sum();
-        // 逐字打法整体取各字中的最差位次（渲染层据此标注最需要选号的那一字）。
-        let rank = per_char.iter().map(|c| c.rank).max().unwrap_or(1);
+        // 切分打法整体取各段中的最差位次（渲染层据此标注最需要选号的那一段）。
+        let rank = parts.iter().map(|c| c.rank).max().unwrap_or(1);
         CodeHint {
             word: word.to_string(),
             code,
@@ -1612,8 +1744,14 @@ impl SchemeDict {
     }
 
     /// 静态一击字表的指法 → 词库逻辑码（用于查选重位次）。
+    ///
+    /// 单手码沿用简洁记法（`f`/`a␣`），按手区还原 `f=`/`a_=`；
+    /// 双手码（如 `ID`）在表中已是方案逻辑码，原样返回。
     fn table_chord_logical_code(chord: &str, hand: crate::code_hint::HintHand) -> Option<String> {
         use crate::code_hint::HintHand;
+        if hand == HintHand::TwoHand {
+            return (!chord.is_empty()).then(|| chord.to_string());
+        }
         let base: Vec<char> = chord
             .chars()
             .filter(|&c| c != crate::code_hint::SPACE_CHORD_MARK)
@@ -1653,7 +1791,7 @@ impl SchemeDict {
             }
         }
 
-        // 2. 词库补充一击字：204 表之外或表内记法之外，词库确有一击码且更省击/更短时采用。
+        // 2. 词库补充一击字：静态表之外或表内记法之外，词库确有一击码且更省击/更短时采用。
         let key = ch.to_string();
         if let Some(codes) = self.word_to_codes.get(&key) {
             for c in codes {
@@ -1678,133 +1816,101 @@ impl SchemeDict {
 
     /// 空明码纯并击方案下单个词组单位的编码提示（ADR 0018）。
     ///
-    /// 1. 一击词最高优先：词库已收录 1 击多字并击词（如「中国」Uz、「可以」k'）时，保留一击词提示；若非首选加选重键；
-    ///    若词库未命中，回退查标准一击词表（`kongming_1hit_word_hint`），但该码必须确属此词，避免把重码给别的词；
-    /// 2. 一击字转译：若非一击词，且词的每个字符都有一击指法（204 静态表 + 词库 1 击码），
-    ///    当 `一击字总击数（含各类选重键） <= 词码击数` 时，转为以空格分隔的一击字词提（如「好人」-> "h r"）；
-    /// 3. 词库整词编码：采用词库最优整词码；非首选时在码尾追加选重数字（如 2 选为 oc2、bGCw2），击数 +1；
-    /// 4. 逐字全码回退：未收录词回退到逐字拼接。
+    /// 总原则：**按键最少**。2026-11-17 第四次修订起改为**子词动态规划切分**：把词单元切成若干段，
+    /// 每段取「词库整词码（含一击词）」或「单字一击指法」，使总击数最少；击数持平时优先
+    /// 「段数更少、靠前段更长」的切分（先整词、再长词、末单字）。
+    ///
+    /// 段候选：
+    /// 1. 静态一击词表兜底（多字段）：词库未收录时启用，且该码必须确属此词，避免过时条目串码；
+    /// 2. 词库整词码：简码优先、击数最少；非首选时追加选重数字，击数 +1（受并击字母表选重上限约束）；
+    /// 3. 单字一击指法：静态一击字表为主，表外用词库 1 击码补齐。
+    ///
+    /// 由此历史三版规则被统一：一击词（1 击）必然最优；整词码不劣于逐字时因「同分少段」优先整词；
+    /// 逐字一击严格更省时才拆成单字段。新增能力是「部分可打词」——词单元只有前缀可打词时按最少击数切开，
+    /// 如「注意力是」→ `ZCyl s`（注意力 2 击 + 是 1 击 = 3 击），而非四字逐字一击的 4 击。
+    ///
+    /// 若存在字符既无整词码覆盖、又无一击指法（生僻字或 ASCII 混排），回退逐字全码拼接。
     fn build_hint_for_word_pure_chord(&self, word: &str) -> CodeHint {
-        struct Candidate {
-            raw_code: String,
-            disp_code: String,
-            base_strokes: u32,
-            strokes: u32,
-            rank: u8,
-        }
-
-        let mut best_word: Option<Candidate> = None;
-        if let Some(codes) = self.word_to_codes.get(word) {
-            for c in codes {
-                let (rank, _) = self.code_rank(c, word).unwrap_or((1, 1));
-                if !self.pure_rank_selectable(rank) {
-                    continue;
-                }
-                let base_s = self.raw_pure_strokes(c);
-                let strokes = base_s + if rank > 1 { 1 } else { 0 };
-                let disp_code = if rank > 1 {
-                    format!("{c}{rank}")
-                } else {
-                    c.clone()
-                };
-                let cand = Candidate {
-                    raw_code: c.clone(),
-                    disp_code,
-                    base_strokes: base_s,
-                    strokes,
-                    rank,
-                };
-                let better = match &best_word {
-                    None => true,
-                    Some(cur) => {
-                        (cand.strokes, cand.rank, cand.raw_code.len())
-                            < (cur.strokes, cur.rank, cur.raw_code.len())
-                    }
-                };
-                if better {
-                    best_word = Some(cand);
-                }
-            }
-        }
-
         let chars: Vec<char> = word.chars().collect();
-
-        // T1 · 一击词最高优先：
-        // (a) 检查词库是否命中了 1 击多字并击词（词长 > 1 且 base_strokes == 1）
-        if chars.len() > 1 {
-            if let Some(ref cand) = best_word {
-                if cand.base_strokes == 1 {
-                    return CodeHint {
-                        word: word.to_string(),
-                        code: cand.disp_code.clone(),
-                        strokes: cand.strokes,
-                        is_oov: false,
-                        rank: cand.rank,
-                    };
-                }
-            }
-        }
-        // (b) 标准一击词表兜底（用于小词库）：仅当该码确属此词（或词库未建索引）时才采用，
-        //     避免表内过时条目把重码错记到别的词（例如旧表中的「看到 ;K」已被「之后 ;K」取代）。
-        if let Some((chord, _)) = crate::code_hint::kongming_1hit_word_hint(word) {
-            let confirmed = self.code_index.is_empty() || self.code_rank(chord, word).is_some();
-            if confirmed {
-                let (rank, _) = self.code_rank(chord, word).unwrap_or((1, 1));
-                if self.pure_rank_selectable(rank) {
-                    let strokes = 1 + u32::from(rank > 1);
-                    let code = if rank > 1 {
-                        format!("{chord}{rank}")
-                    } else {
-                        chord.to_string()
-                    };
-                    return CodeHint {
-                        word: word.to_string(),
-                        code,
-                        strokes,
-                        is_oov: false,
-                        rank,
-                    };
-                }
-            }
-        }
-
-        // T2 · 一击字转译：非一击词，逐字取最优一击指法（204 静态表优先，词库 1 击码兜底）；
-        // 各字选重键计入总击数后再与整词码比较，避免把需要选重的逐字组合误判为更省键。
-        let char_hits: Vec<Option<(String, u32, u8)>> =
-            chars.iter().map(|&c| self.pure_char_hint(c)).collect();
-        if !chars.is_empty() && char_hits.iter().all(|h| h.is_some()) {
-            let hits: Vec<&(String, u32, u8)> =
-                char_hits.iter().filter_map(|h| h.as_ref()).collect();
-            let char_strokes: u32 = hits.iter().map(|(_, s, _)| *s).sum();
-            let word_strokes = best_word.as_ref().map(|b| b.strokes).unwrap_or(u32::MAX);
-            if char_strokes <= word_strokes {
-                let code = hits
-                    .iter()
-                    .map(|(d, _, _)| d.as_str())
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                return CodeHint {
-                    word: word.to_string(),
-                    code,
-                    strokes: char_strokes,
-                    is_oov: false,
-                    rank: hits.iter().map(|(_, _, r)| *r).max().unwrap_or(1),
-                };
-            }
-        }
-
-        // T3 · 词库整词编码
-        if let Some(cand) = best_word {
+        if chars.is_empty() {
             return CodeHint {
                 word: word.to_string(),
-                code: cand.disp_code,
-                strokes: cand.strokes,
-                is_oov: false,
-                rank: cand.rank,
+                code: String::new(),
+                strokes: 0,
+                is_oov: true,
+                rank: 1,
             };
         }
+        let n = chars.len();
+        // 单字一击指法预计算：DP 内循环与切分重建共用，避免重复查表。
+        let char_hints: Vec<Option<(String, u32, u8)>> =
+            chars.iter().map(|&c| self.pure_char_hint(c)).collect();
 
-        // T4 · 逐字全码回退
+        // dp[i] = (从 i 到词尾的最少总击数, 段数, 本段终点下标)；不可达记为 u32::MAX。
+        let mut dp: Vec<(u32, u32, usize)> = vec![(u32::MAX, u32::MAX, n); n + 1];
+        dp[n] = (0, 0, n);
+        for i in (0..n).rev() {
+            let mut best: Option<(u32, u32, usize)> = None;
+            // 段长由长到短枚举：同分时先命中者（更长、更靠前的段）胜出，即「持平优先整词」。
+            for j in (i + 1..=n).rev() {
+                if dp[j].0 == u32::MAX {
+                    continue;
+                }
+                let seg: String = chars[i..j].iter().collect();
+                let single = if j == i + 1 {
+                    char_hints[i].as_ref()
+                } else {
+                    None
+                };
+                let Some((_, seg_strokes, _)) = self.pure_segment_hint(&seg, single) else {
+                    continue;
+                };
+                let cand = (seg_strokes + dp[j].0, 1 + dp[j].1, j);
+                let better = match best {
+                    None => true,
+                    Some(cur) => (cand.0, cand.1) < (cur.0, cur.1),
+                };
+                if better {
+                    best = Some(cand);
+                }
+            }
+            if let Some(best) = best {
+                dp[i] = best;
+            }
+        }
+
+        if dp[0].0 != u32::MAX {
+            let mut parts: Vec<String> = Vec::new();
+            let mut rank = 1u8;
+            let mut i = 0;
+            while i < n {
+                let j = dp[i].2.max(i + 1).min(n);
+                let seg: String = chars[i..j].iter().collect();
+                let single = if j == i + 1 {
+                    char_hints[i].as_ref()
+                } else {
+                    None
+                };
+                let Some((code, _, seg_rank)) = self.pure_segment_hint(&seg, single) else {
+                    break;
+                };
+                rank = rank.max(seg_rank);
+                parts.push(code);
+                i = j;
+            }
+            // 段间以单空格分隔：与逐字一击词提（如 `h r`）记法一致，空格仅作视觉分隔、无需键入。
+            if i == n && !parts.is_empty() {
+                return CodeHint {
+                    word: word.to_string(),
+                    code: parts.join(" "),
+                    strokes: dp[0].0,
+                    is_oov: false,
+                    rank,
+                };
+            }
+        }
+
+        // 回退：逐字全码拼接（生僻字 / ASCII 混排等无法以一击覆盖的单元）。
         let char_parts: Vec<Option<(String, u32)>> = word
             .chars()
             .map(|c| self.best_composition_code(&c.to_string()))
@@ -1833,6 +1939,75 @@ impl SchemeDict {
             is_oov: false,
             rank: 1,
         }
+    }
+
+    /// 词库中该词条的最优整词候选：简码优先、击数最少，跳过无法用数字键选重的位次。
+    fn pure_word_candidate(&self, word: &str) -> Option<PureWordCandidate> {
+        let codes = self.word_to_codes.get(word)?;
+        let mut best: Option<PureWordCandidate> = None;
+        for c in codes {
+            let (rank, _) = self.code_rank(c, word).unwrap_or((1, 1));
+            if !self.pure_rank_selectable(rank) {
+                continue;
+            }
+            let base_strokes = self.raw_pure_strokes(c);
+            let strokes = base_strokes + u32::from(rank > 1);
+            let disp_code = if rank > 1 {
+                format!("{c}{rank}")
+            } else {
+                c.clone()
+            };
+            let cand = PureWordCandidate {
+                disp_code,
+                base_strokes,
+                strokes,
+                rank,
+                raw_len: c.chars().count(),
+            };
+            // 择优键：总击数 → 基础并击数（简码优先）→ 选重位次 → 码面长度。
+            let better = match &best {
+                None => true,
+                Some(cur) => {
+                    (cand.strokes, cand.base_strokes, cand.rank, cand.raw_len)
+                        < (cur.strokes, cur.base_strokes, cur.rank, cur.raw_len)
+                }
+            };
+            if better {
+                best = Some(cand);
+            }
+        }
+        best
+    }
+
+    /// 单段最优提示：单字用预计算的一击指法；多字取词库整词码，词库未收录时用静态一击词表兜底。
+    fn pure_segment_hint(
+        &self,
+        seg: &str,
+        single: Option<&(String, u32, u8)>,
+    ) -> Option<(String, u32, u8)> {
+        if let Some(hint) = single {
+            return Some(hint.clone());
+        }
+        if let Some(cand) = self.pure_word_candidate(seg) {
+            return Some((cand.disp_code, cand.strokes, cand.rank));
+        }
+        // 小词库兜底：静态一击词表条目必须经词库确认该码确属此词，
+        // 避免过时条目把重码错记到别的词（如旧表「看到 ;K」已被「之后 ;K」取代）。
+        let (chord, _) = crate::code_hint::kongming_1hit_word_hint(seg)?;
+        let confirmed = self.code_index.is_empty() || self.code_rank(chord, seg).is_some();
+        if !confirmed {
+            return None;
+        }
+        let (rank, _) = self.code_rank(chord, seg).unwrap_or((1, 1));
+        if !self.pure_rank_selectable(rank) {
+            return None;
+        }
+        let code = if rank > 1 {
+            format!("{chord}{rank}")
+        } else {
+            chord.to_string()
+        };
+        Some((code, 1 + u32::from(rank > 1), rank))
     }
 
     /// 在提示串尾部补出**实际要按的那个键**（ADR 0014 D2）。
@@ -2790,6 +2965,25 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn hand_prefix_style_follows_pure_chord() {
+        // 提示区对编码前导 `_`/`+` 的解读随方案语义反转，误判会直接导致提示缺键：
+        // - yoyo-pure 类：`_d` 由 algebra `xform|^(单手键序列)$|_$1|` 派生，且被
+        //   `prompt_format: xform/[-=_+]//g` 抹掉 → `_` 是修饰符，提示区剥除。
+        // - 空明码类（pure_chord）：`_` 由 algebra `xform/(w-d-f-|j-k-o-)/_/` 直接产出
+        //   → `_` 是码元，提示区必须原样显示。
+        let mut dict = SchemeDict::parse("同事\t_E\n的\t_d\n");
+        assert_eq!(
+            dict.hand_prefix_style(),
+            crate::code_hint::HandPrefixStyle::Modifier
+        );
+        dict.pure_chord = true;
+        assert_eq!(
+            dict.hand_prefix_style(),
+            crate::code_hint::HandPrefixStyle::Literal
+        );
+    }
+
+    #[test]
     fn test_plain_tsv_dict_parsing() {
         let tsv = "我\tq\n你\twq\n他\tt\n";
         let dict = SchemeDict::parse(tsv);
@@ -3491,7 +3685,7 @@ algebra:
     }
 
     #[test]
-    fn test_kongming_all_1hit_chars_converts_to_spaced_hint() {
+    fn test_kongming_all_1hit_chars_word_uses_spaced_hint() {
         use std::fs;
         let dir = std::env::temp_dir().join(format!("dazitui_km_all_1hit_{}", std::process::id()));
         let _ = fs::create_dir_all(&dir);
@@ -3499,21 +3693,20 @@ algebra:
         let dict = dir.join("km.dict.yaml");
         let schema_content = "schema:\n  name: 空明码测试\n  schema_id: km\ntranslator:\n  dictionary: km\nchord_composer:\n  algebra:\n    - xform|a|b|\n    - xform|^\\S{3,}$||\n";
         fs::write(&schema, schema_content).unwrap();
-        // 词库中「好人」为 4 字母双手并击码 HRHR (2击)；
-        // 「好」(左手 h) 与「人」(右手 r) 均为一击字。
-        // 因为 2 击 <= 2 击，应转换为一击字词提 "h r"！
-        // 「等人」：等(a␣) 与 人(r) 均为一击字，且非一击词，应转换为 "a␣ r"！
-        // 「中」：单字一击字，词库中若为 "f="，应转为标准一击字词提 "f"（1击）。
-        fs::write(&dict, "好人\tHRHR\t500\n等人\tDNRN\t500\n中\tf=\t500\n").unwrap();
+        // 按键最少原则：完全由一击字组成的多字词，若整词码击数不劣于逐字一击（此处持平 2 击），
+        // 优先展示整词码；单字「中」恒展示一击指法 "f"。
+        // 「好人」词库码 HRHR (2击) 与逐字 h r (2击) 持平 → 整词码 "HRHR"；
+        // 「大地」同理 DNRN (2击) 持平逐字 d a (2击) → "DNRN"；「中」→ "f"。
+        fs::write(&dict, "好人\tHRHR\t500\n大地\tDNRN\t500\n中\tf=\t500\n").unwrap();
 
         let loaded = SchemeDict::load_from_file(&schema).expect("加载空明码测试方案");
-        let hints = loaded.build_code_hints(&["好人".to_string(), "等人".to_string(), "中".to_string()]);
+        let hints = loaded.build_code_hints(&["好人".to_string(), "大地".to_string(), "中".to_string()]);
         assert_eq!(hints[0].word, "好人");
-        assert_eq!(hints[0].code, "h r", "全一击字词应以空格分隔展示一击字词提");
-        assert_eq!(hints[0].strokes, 2, "两字一击字词提应为 2 击");
+        assert_eq!(hints[0].code, "HRHR", "全一击字多字词整词码击数不劣时优先整词码");
+        assert_eq!(hints[0].strokes, 2);
 
-        assert_eq!(hints[1].word, "等人");
-        assert_eq!(hints[1].code, "a␣ r", "含空格并击字的一击字词提应正确保留 ␣ 标记");
+        assert_eq!(hints[1].word, "大地");
+        assert_eq!(hints[1].code, "DNRN", "全一击字多字词整词码击数不劣时优先整词码");
         assert_eq!(hints[1].strokes, 2);
 
         assert_eq!(hints[2].word, "中");
@@ -3523,7 +3716,26 @@ algebra:
     }
 
     #[test]
-    fn test_kongming_four_char_idiom_retains_two_stroke_word_code() {
+    fn test_kongming_oov_all_1hit_chars_uses_spaced_hint() {
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!("dazitui_km_oov_1hit_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let schema = dir.join("km.schema.yaml");
+        let dict = dir.join("km.dict.yaml");
+        let schema_content = "schema:\n  name: 空明码测试\n  schema_id: km\ntranslator:\n  dictionary: km\nchord_composer:\n  algebra:\n    - xform|a|b|\n    - xform|^\\S{3,}$||\n";
+        fs::write(&schema, schema_content).unwrap();
+        // 「好人」未收录整词码，但两字均为一击字，回退为空格分隔的一击字词提。
+        fs::write(&dict, "好\tf=\t500\n人\t=r\t500\n").unwrap();
+
+        let loaded = SchemeDict::load_from_file(&schema).expect("加载空明码测试方案");
+        let hints = loaded.build_code_hints(&["好人".to_string()]);
+        assert_eq!(hints[0].code, "h r", "未收录整词码时应回退逐字一击字词提");
+        assert_eq!(hints[0].strokes, 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_kongming_all_1hit_idiom_uses_spaced_hint() {
         use std::fs;
         let dir = std::env::temp_dir().join(format!("dazitui_km_idiom_{}", std::process::id()));
         let _ = fs::create_dir_all(&dir);
@@ -3531,16 +3743,40 @@ algebra:
         let dict = dir.join("km.dict.yaml");
         let schema_content = "schema:\n  name: 空明码测试\n  schema_id: km\ntranslator:\n  dictionary: km\nchord_composer:\n  algebra:\n    - xform|a|b|\n    - xform|^\\S{3,}$||\n";
         fs::write(&schema, schema_content).unwrap();
-        // 假定四字成语「大地上部」在词库中为 4 字符并击码 ddsg (2击)；
-        // 虽然「大」(d)、「地」(a)、「上」(s)、「部」(b) 全是一击字(4击)，
-        // 但 4 击 > 2 击，不满足 一击字击数 <= 词码击数，应保留词库整词码 ddsg！
+        // 四字成语「大地上部」在词库中为 4 字符并击码 ddsg (2击)；
+        // 「大」(d)、「地」(a)、「上」(s)、「部」(b) 全是一击字，逐字 d a s b 需 4 击，
+        // 整词码 ddsg 仅 2 击，更少 → 优先整词码 "ddsg"。
         fs::write(&dict, "大地上部\tddsg\t500\n").unwrap();
 
         let loaded = SchemeDict::load_from_file(&schema).expect("加载空明码测试方案");
         let hints = loaded.build_code_hints(&["大地上部".to_string()]);
         assert_eq!(hints[0].word, "大地上部");
-        assert_eq!(hints[0].code, "ddsg", "4 击一击字劣于 2 击词码，应保留 2 击词库码");
+        assert_eq!(hints[0].code, "ddsg", "四字全一击字词整词码更少时应优先整词码");
         assert_eq!(hints[0].strokes, 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_kongming_per_char_only_when_fewer_than_word_code() {
+        // 按键最少原则：逐字一击码仅在「严格少于整词码击数」时才采用；
+        // 整词码更少或持平时一律优先整词码（多字词优先打词）。
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!("dazitui_km_minstroke_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let schema = dir.join("km.schema.yaml");
+        let dict = dir.join("km.dict.yaml");
+        let schema_content = "schema:\n  name: 空明码测试\n  schema_id: km\ntranslator:\n  dictionary: km\nchord_composer:\n  algebra:\n    - xform|a|b|\n    - xform|^\\S{3,}$||\n";
+        fs::write(&schema, schema_content).unwrap();
+        // 「好人」词库码为超长 6 字符 abcdef（3 击），逐字 h r 仅 2 击 → 逐字更少 → "h r"；
+        // 「大地上部」词库码 ddsg（2 击），逐字 d a s b 需 4 击 → 整词码更少 → "ddsg"。
+        fs::write(&dict, "好人\tabcdef\t500\n大地上部\tddsg\t500\n").unwrap();
+
+        let loaded = SchemeDict::load_from_file(&schema).expect("加载空明码测试方案");
+        let hints = loaded.build_code_hints(&["好人".to_string(), "大地上部".to_string()]);
+        assert_eq!(hints[0].code, "h r", "整词码比逐字一击更长时应回退逐字一击码");
+        assert_eq!(hints[0].strokes, 2);
+        assert_eq!(hints[1].code, "ddsg", "整词码比逐字一击更短时优先整词码");
+        assert_eq!(hints[1].strokes, 2);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -3592,7 +3828,7 @@ algebra:
 
     #[test]
     fn test_kongming_dict_1hit_char_outside_static_table() {
-        // 204 表外的字只要词库确有一击码，也应参与一击字转译；逻辑码 f= / =d 应展示为实际按键。
+        // 静态表外的字只要词库确有一击码，也应参与一击字转译；逻辑码 f= / =d 应展示为实际按键。
         use std::fs;
         let dir = std::env::temp_dir().join(format!("dazitui_km_extra1hit_{}", std::process::id()));
         let _ = fs::create_dir_all(&dir);
@@ -3600,9 +3836,9 @@ algebra:
         let dict = dir.join("km.dict.yaml");
         let schema_content = "schema:\n  name: 空明码测试\n  schema_id: km\ntranslator:\n  dictionary: km\nchord_composer:\n  algebra:\n    - xform|a|b|\n    - xform|^\\S{3,}$||\n";
         fs::write(&schema, schema_content).unwrap();
-        // 「龘」不在 204 一击字表，但词库给出一击码 Zg；「好」在表中为 h。
-        // 整词码 QJvW 为 2 击，与逐字一击 2 击持平，按 ADR 0018 选逐字词提。
-        fs::write(&dict, "龘好\tQJvW\t500\n龘\tZg\t500\n").unwrap();
+        // 「龘」不在静态一击字表，但词库给出一击码 Zg；「好」在表中为 h。
+        // 「龘好」未收录整词码时，回退逐字一击字转译，表外字使用词库一击码。
+        fs::write(&dict, "龘\tZg\t500\n").unwrap();
 
         let loaded = SchemeDict::load_from_file(&schema).expect("加载空明码测试方案");
         let hints = loaded.build_code_hints(&["龘好".to_string()]);
@@ -3612,8 +3848,10 @@ algebra:
     }
 
     #[test]
-    fn test_kongming_stale_static_word_chord_requires_ownership() {
-        // 静态一击词表可能过时（如「看到 ;K」已被「之后 ;K」取代）；重码不属此词时不得采用。
+    fn test_kongming_all_1hit_word_prefers_word_code_on_tie() {
+        // 完全由一击字组成的多字词「看到」= 看(k) + 到(e)，逐字 k e 为 2 击；
+        // 词库整词码 YHDh 同为 2 击，按键最少原则下持平优先整词码 → "YHDh"。
+        // 同时旧静态一击词表「看到 ;K」已易主给「之后」，整词码路径天然规避误用。
         use std::fs;
         let dir = std::env::temp_dir().join(format!("dazitui_km_stale_{}", std::process::id()));
         let _ = fs::create_dir_all(&dir);
@@ -3625,9 +3863,7 @@ algebra:
 
         let loaded = SchemeDict::load_from_file(&schema).expect("加载空明码测试方案");
         let hints = loaded.build_code_hints(&["看到".to_string()]);
-        // 两字均为静态一击字（看 k、到 e），逐字 2 击与整词 2 击持平，按 ADR 0018 取逐字；
-        // 关键是不能采用旧表已易主的「;K」。
-        assert_eq!(hints[0].code, "k e", "过时的静态一击词码不得提示给别的词");
+        assert_eq!(hints[0].code, "YHDh", "全一击字多字词整词码击数不劣时优先整词码");
         assert_eq!(hints[0].strokes, 2);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -3646,6 +3882,70 @@ algebra:
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].path, a.join("km.schema.yaml"), "同 id 应以先出现的目录为准");
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_kongming_subword_dp_splits_word_prefix_and_tail() {
+        // 「注意力是」整词未收录：按最少按键切分为「注意力」(ZCyl，2 击) + 「是」(1 击) = 3 击，
+        // 而非四字逐字一击的 4 击。同时「注意」(!b，1 击) + 「力是」(l,ss，2 击) 亦为 3 击，
+        // 同分时应选「靠前段更长、段数更少」的切分，即 注意力 + 是。
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!("dazitui_km_dp_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let schema = dir.join("km.schema.yaml");
+        let dict = dir.join("km.dict.yaml");
+        let schema_content = "schema:\n  name: 空明码测试\n  schema_id: km\ntranslator:\n  dictionary: km\nchord_composer:\n  algebra:\n    - xform|a|b|\n    - xform|^\\S{3,}$||\n";
+        fs::write(&schema, schema_content).unwrap();
+        fs::write(&dict, "注意力\tZCyl\t1000\n注意\t!b\t1000\n力是\tl,ss\t1000\n").unwrap();
+
+        let loaded = SchemeDict::load_from_file(&schema).expect("加载空明码测试方案");
+        let hints = loaded.build_code_hints(&["注意力是".to_string()]);
+        assert_eq!(
+            hints[0].code, "ZCyl s",
+            "未收录整词时应按最少按键切分为「注意力」+「是」"
+        );
+        assert_eq!(hints[0].strokes, 3, "2 击（注意力）+ 1 击（是）= 3 击");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_kongming_subword_dp_word_plus_char() {
+        // 「没有任何的」：整词未收录，但前缀是 1 击词（没有任何 *'），后缀单字「的」为 1 击字
+        // → 切分为 `*' d`，共 2 击；逐字全码需 5 击以上。
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!("dazitui_km_dp2_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let schema = dir.join("km.schema.yaml");
+        let dict = dir.join("km.dict.yaml");
+        let schema_content = "schema:\n  name: 空明码测试\n  schema_id: km\ntranslator:\n  dictionary: km\nchord_composer:\n  algebra:\n    - xform|a|b|\n    - xform|^\\S{3,}$||\n";
+        fs::write(&schema, schema_content).unwrap();
+        fs::write(&dict, "没有任何\t*'\t1000\n").unwrap();
+
+        let loaded = SchemeDict::load_from_file(&schema).expect("加载空明码测试方案");
+        let hints = loaded.build_code_hints(&["没有任何的".to_string()]);
+        assert_eq!(hints[0].code, "*' d", "1 击词 + 1 击字应切开提示");
+        assert_eq!(hints[0].strokes, 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_kongming_subword_dp_does_not_break_whole_word_priority() {
+        // 回归：整词码与「可切分方案」同击数时仍优先整词（段数更少），不因 DP 反而拆词。
+        // 「注意到」整词码 ZCy!（2 击）与「注意」(!b, 1 击) + 「到」(1 击) 同为 2 击 → 保留整词码。
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!("dazitui_km_dp3_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let schema = dir.join("km.schema.yaml");
+        let dict = dir.join("km.dict.yaml");
+        let schema_content = "schema:\n  name: 空明码测试\n  schema_id: km\ntranslator:\n  dictionary: km\nchord_composer:\n  algebra:\n    - xform|a|b|\n    - xform|^\\S{3,}$||\n";
+        fs::write(&schema, schema_content).unwrap();
+        fs::write(&dict, "注意到\tZCy!\t1000\n注意\t!b\t1000\n").unwrap();
+
+        let loaded = SchemeDict::load_from_file(&schema).expect("加载空明码测试方案");
+        let hints = loaded.build_code_hints(&["注意到".to_string()]);
+        assert_eq!(hints[0].code, "ZCy!", "同击数时优先整词，不应降级为逐段提示");
+        assert_eq!(hints[0].strokes, 2);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -68,10 +68,36 @@ pub struct SessionRecord {
     pub edits: u32,
     pub typed_chars: u32,
     pub text_title: String,
+    pub text_content: String,
     pub input_scheme: String,
     pub kps: f64,
     pub key_length: f64,
     pub total_strokes: u32,
+}
+
+/// 赛文历史列表的排序方式；由 UI 的排序选项映射而来。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SessionHistorySort {
+    #[default]
+    NewestFirst,
+    OldestFirst,
+    WpmDesc,
+    WpmAsc,
+    DurationDesc,
+    DurationAsc,
+}
+
+impl SessionHistorySort {
+    fn order_by_sql(self) -> &'static str {
+        match self {
+            Self::NewestFirst => "created_at DESC, id DESC",
+            Self::OldestFirst => "created_at ASC, id ASC",
+            Self::WpmDesc => "wpm DESC, created_at DESC, id DESC",
+            Self::WpmAsc => "wpm ASC, created_at DESC, id DESC",
+            Self::DurationDesc => "duration_secs DESC, created_at DESC, id DESC",
+            Self::DurationAsc => "duration_secs ASC, created_at DESC, id DESC",
+        }
+    }
 }
 
 impl SessionRecord {
@@ -86,6 +112,7 @@ impl SessionRecord {
         edits: u32,
         typed_chars: u32,
         text_title: impl Into<String>,
+        text_content: impl Into<String>,
         input_scheme: impl Into<String>,
     ) -> Self {
         let kps = if duration_secs > 0.0 {
@@ -105,6 +132,7 @@ impl SessionRecord {
             edits,
             typed_chars,
             text_title: text_title.into(),
+            text_content: text_content.into(),
             input_scheme: input_scheme.into(),
             kps,
             key_length,
@@ -123,6 +151,7 @@ impl SessionRecord {
         edits: u32,
         typed_chars: u32,
         text_title: impl Into<String>,
+        text_content: impl Into<String>,
         input_scheme: impl Into<String>,
         kps: f64,
         key_length: f64,
@@ -139,6 +168,7 @@ impl SessionRecord {
             edits,
             typed_chars,
             text_title: text_title.into(),
+            text_content: text_content.into(),
             input_scheme: input_scheme.into(),
             kps,
             key_length,
@@ -151,6 +181,7 @@ impl SessionRecord {
         stats: &crate::session::Stats,
         elapsed: std::time::Duration,
         text_title: impl Into<String>,
+        text_content: impl Into<String>,
         input_scheme: impl Into<String>,
     ) -> Self {
         let accuracy = if stats.typed_chars == 0 {
@@ -167,6 +198,7 @@ impl SessionRecord {
             stats.edits,
             stats.typed_chars as u32,
             text_title,
+            text_content,
             input_scheme,
             stats.kps,
             stats.key_length,
@@ -334,6 +366,7 @@ impl StatsDb {
                  edits INTEGER NOT NULL,
                  typed_chars INTEGER NOT NULL,
                  text_title TEXT NOT NULL,
+                 text_content TEXT NOT NULL DEFAULT '',
                  input_scheme TEXT NOT NULL,
                  kps REAL NOT NULL DEFAULT 0.0,
                  key_length REAL NOT NULL DEFAULT 0.0,
@@ -388,6 +421,10 @@ impl StatsDb {
             "ALTER TABLE sessions ADD COLUMN total_strokes INTEGER NOT NULL DEFAULT 0",
             [],
         );
+        let _ = self.conn.execute(
+            "ALTER TABLE sessions ADD COLUMN text_content TEXT NOT NULL DEFAULT ''",
+            [],
+        );
 
         // 清理历史异常与极端损坏记录（例如因输入法瞬间上屏导致 duration_secs < 0.5s 或 WPM/KPS 异常爆炸）
         let _ = self.conn.execute(
@@ -416,9 +453,9 @@ impl StatsDb {
         tx.execute(
             "INSERT INTO sessions (
                 id, created_at, duration_secs, wpm, accuracy,
-                correct_chars, wrong_chars, edits, typed_chars, text_title, input_scheme,
+                correct_chars, wrong_chars, edits, typed_chars, text_title, text_content, input_scheme,
                 kps, key_length, total_strokes
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 session.id,
                 session.created_at,
@@ -430,6 +467,7 @@ impl StatsDb {
                 session.edits,
                 session.typed_chars,
                 session.text_title,
+                session.text_content,
                 session.input_scheme,
                 session.kps,
                 session.key_length,
@@ -495,7 +533,7 @@ impl StatsDb {
     pub fn get_all_sessions(&self) -> Result<Vec<SessionRecord>, DbError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, created_at, duration_secs, wpm, accuracy,
-                    correct_chars, wrong_chars, edits, typed_chars, text_title, input_scheme,
+                    correct_chars, wrong_chars, edits, typed_chars, text_title, text_content, input_scheme,
                     kps, key_length, total_strokes
              FROM sessions
              ORDER BY created_at ASC",
@@ -513,10 +551,11 @@ impl StatsDb {
                 edits: row.get(7)?,
                 typed_chars: row.get(8)?,
                 text_title: row.get(9)?,
-                input_scheme: row.get(10)?,
-                kps: row.get(11)?,
-                key_length: row.get(12)?,
-                total_strokes: row.get(13)?,
+                text_content: row.get(10)?,
+                input_scheme: row.get(11)?,
+                kps: row.get(12)?,
+                key_length: row.get(13)?,
+                total_strokes: row.get(14)?,
             })
         })?;
 
@@ -531,7 +570,7 @@ impl StatsDb {
     pub fn get_recent_sessions(&self, limit: usize) -> Result<Vec<SessionRecord>, DbError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, created_at, duration_secs, wpm, accuracy,
-                    correct_chars, wrong_chars, edits, typed_chars, text_title, input_scheme,
+                    correct_chars, wrong_chars, edits, typed_chars, text_title, text_content, input_scheme,
                     kps, key_length, total_strokes
              FROM sessions
              ORDER BY created_at DESC
@@ -550,10 +589,11 @@ impl StatsDb {
                 edits: row.get(7)?,
                 typed_chars: row.get(8)?,
                 text_title: row.get(9)?,
-                input_scheme: row.get(10)?,
-                kps: row.get(11)?,
-                key_length: row.get(12)?,
-                total_strokes: row.get(13)?,
+                text_content: row.get(10)?,
+                input_scheme: row.get(11)?,
+                kps: row.get(12)?,
+                key_length: row.get(13)?,
+                total_strokes: row.get(14)?,
             })
         })?;
 
@@ -656,6 +696,80 @@ impl StatsDb {
             points.push(p?);
         }
         Ok(points)
+    }
+
+    /// 统计落在 UTC 日期区间 `[start_date, end_date)` 内的会话总数。
+    /// 日期串为 `YYYY-MM-DD`；`None` 表示该侧无边界。
+    pub fn count_sessions_between(
+        &self,
+        start_date: Option<&str>,
+        end_date: Option<&str>,
+    ) -> Result<usize, DbError> {
+        let total: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM sessions
+             WHERE (?1 IS NULL OR created_at >= ?1)
+               AND (?2 IS NULL OR created_at < ?2)",
+            params![start_date, end_date],
+            |row| row.get(0),
+        )?;
+        Ok(total as usize)
+    }
+
+    /// 分页查询赛文历史。返回 `(当前页记录, 过滤后总数)`。
+    ///
+    /// `created_at` 是 `YYYY-MM-DD HH:MM:SS` 的 UTC 串，可直接与
+    /// `YYYY-MM-DD` 边界做字典序比较，因此筛选完全在 SQL 侧完成，
+    /// 避免把可能很大的 `text_content` 全量读进内存。
+    pub fn get_session_history_page(
+        &self,
+        start_date: Option<&str>,
+        end_date: Option<&str>,
+        sort: SessionHistorySort,
+        page: usize,
+        page_size: usize,
+    ) -> Result<(Vec<SessionRecord>, usize), DbError> {
+        let total = self.count_sessions_between(start_date, end_date)?;
+        let page_size = page_size.max(1);
+        let offset = page.saturating_mul(page_size).min(total);
+        let sql = format!(
+            "SELECT id, created_at, duration_secs, wpm, accuracy,
+                    correct_chars, wrong_chars, edits, typed_chars, text_title, text_content,
+                    input_scheme, kps, key_length, total_strokes
+             FROM sessions
+             WHERE (?1 IS NULL OR created_at >= ?1)
+               AND (?2 IS NULL OR created_at < ?2)
+             ORDER BY {}
+             LIMIT ?3 OFFSET ?4",
+            sort.order_by_sql()
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(
+            params![start_date, end_date, page_size as i64, offset as i64],
+            |row| {
+                Ok(SessionRecord {
+                    id: row.get(0)?,
+                    created_at: row.get(1)?,
+                    duration_secs: row.get(2)?,
+                    wpm: row.get(3)?,
+                    accuracy: row.get(4)?,
+                    correct_chars: row.get(5)?,
+                    wrong_chars: row.get(6)?,
+                    edits: row.get(7)?,
+                    typed_chars: row.get(8)?,
+                    text_title: row.get(9)?,
+                    text_content: row.get(10)?,
+                    input_scheme: row.get(11)?,
+                    kps: row.get(12)?,
+                    key_length: row.get(13)?,
+                    total_strokes: row.get(14)?,
+                })
+            },
+        )?;
+        let mut sessions = Vec::new();
+        for session in rows {
+            sessions.push(session?);
+        }
+        Ok((sessions, total))
     }
 
     /// 获取全局概览统计。
@@ -998,6 +1112,21 @@ fn generate_unique_id() -> String {
     format!("{:x}-{:08x}", now, rand_val)
 }
 
+/// 当前 UTC 日期距 UNIX 纪元的天数。
+/// 与 `created_at` 的 UTC 口径保持一致（不使用本地时区/东八区）。
+pub fn utc_days_now() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs() / 86400)
+        .unwrap_or(0)
+}
+
+/// 将 UTC 天数转换为 `YYYY-MM-DD`。
+pub fn utc_ymd_from_days(days: u64) -> String {
+    let (year, month, day) = days_to_ymd(days);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
 /// 获取当前 UTC 时间戳字符串 (ISO 8601 格式)。
 fn current_iso_timestamp() -> String {
     let now = SystemTime::now()
@@ -1064,12 +1193,75 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_session_history_page_filters_sorts_and_paginates() {
+        let mut db = StatsDb::open_in_memory().unwrap();
+        for (title, date, wpm, duration) in [
+            ("A", "2026-11-17 10:00:00", 60.0, 30.0),
+            ("B", "2026-11-18 10:00:00", 90.0, 20.0),
+            ("C", "2026-11-19 10:00:00", 75.0, 40.0),
+        ] {
+            let mut session =
+                SessionRecord::new(duration, wpm, 0.98, 30, 0, 0, 30, title, "赛文原文", "全拼");
+            session.created_at = date.to_string();
+            db.insert_session_full(&session, &[], &[]).unwrap();
+        }
+
+        let (first, total) = db
+            .get_session_history_page(
+                Some("2026-11-18"),
+                Some("2026-11-20"),
+                SessionHistorySort::NewestFirst,
+                0,
+                1,
+            )
+            .unwrap();
+        assert_eq!(total, 2, "日期过滤应只命中 B、C");
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].text_title, "C");
+        assert_eq!(first[0].text_content, "赛文原文");
+
+        let (second, _) = db
+            .get_session_history_page(
+                Some("2026-11-18"),
+                Some("2026-11-20"),
+                SessionHistorySort::NewestFirst,
+                1,
+                1,
+            )
+            .unwrap();
+        assert_eq!(second[0].text_title, "B");
+
+        let (fastest, _) = db
+            .get_session_history_page(None, None, SessionHistorySort::WpmDesc, 0, 10)
+            .unwrap();
+        assert_eq!(
+            fastest
+                .iter()
+                .map(|s| s.text_title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["B", "C", "A"]
+        );
+
+        let (out_of_range, total) = db
+            .get_session_history_page(
+                Some("2026-11-18"),
+                Some("2026-11-20"),
+                SessionHistorySort::NewestFirst,
+                99,
+                1,
+            )
+            .unwrap();
+        assert!(out_of_range.is_empty());
+        assert_eq!(total, 2);
+    }
+
+    #[test]
     fn test_stats_db_in_memory_crud() {
         let mut db = StatsDb::open_in_memory().expect("in-memory db create");
         assert_eq!(db.get_session_count().unwrap(), 0);
 
         let session =
-            SessionRecord::new(60.0, 85.5, 0.98, 120, 2, 1, 122, "常用单字前五百", "虎码");
+            SessionRecord::new(60.0, 85.5, 0.98, 120, 2, 1, 122, "常用单字前五百", "世界上下四方叫做'宇'，古往今来叫做'宙'。", "虎码");
         let errors = vec![
             ErrorRecordItem::new(
                 &session.id,
@@ -1141,11 +1333,11 @@ mod tests {
     fn test_stats_db_sanitizes_and_ignores_extreme_outliers() {
         let mut db = StatsDb::open_in_memory().unwrap();
         // 正常记录：60s, 100 WPM
-        let normal = SessionRecord::new(60.0, 100.0, 0.98, 100, 2, 1, 102, "正常练习", "全拼");
+        let normal = SessionRecord::new(60.0, 100.0, 0.98, 100, 2, 1, 102, "正常练习", "这是一段正常的练习内容。", "全拼");
         db.insert_session_full(&normal, &[], &[]).unwrap();
 
         // 异常记录：0.0002s, 579433 WPM
-        let corrupted = SessionRecord::new(0.0002, 579433.0, 1.0, 2, 0, 0, 2, "自由发文", "全拼");
+        let corrupted = SessionRecord::new(0.0002, 579433.0, 1.0, 2, 0, 0, 2, "自由发文", "测试内容。", "全拼");
         db.insert_session_full(&corrupted, &[], &[]).unwrap();
 
         // 验证异常记录被忽略，未写入数据库
@@ -1161,7 +1353,7 @@ mod tests {
         let mut db = StatsDb::open_in_memory().unwrap();
         for i in 1..=5 {
             let mut s =
-                SessionRecord::new(60.0, (i * 10) as f64, 0.99, 100, 0, 0, 100, "test", "全拼");
+                SessionRecord::new(60.0, (i * 10) as f64, 0.99, 100, 0, 0, 100, "test", "测试内容...", "全拼");
             s.created_at = format!("2026-08-24 10:00:0{i}");
             db.insert_session_full(&s, &[], &[]).unwrap();
         }
@@ -1195,6 +1387,7 @@ mod tests {
                 0,
                 100,
                 "test",
+                "测试内容...",
                 "全拼",
                 (i * 2) as f64,
                 1.5,
@@ -1220,7 +1413,7 @@ mod tests {
     #[test]
     fn test_db_worker_async_pipeline() {
         let (worker, shared_db) = DbWorker::start_in_memory().unwrap();
-        let session = SessionRecord::new(50.0, 92.0, 0.99, 100, 1, 0, 101, "异步测试", "虎码");
+        let session = SessionRecord::new(50.0, 92.0, 0.99, 100, 1, 0, 101, "异步测试", "异步测试内容。", "虎码");
         worker
             .send(DbTask::SaveSession {
                 session,
@@ -1241,7 +1434,7 @@ mod tests {
     #[test]
     fn test_delete_mistyped_char_and_word() {
         let mut db = StatsDb::open_in_memory().unwrap();
-        let session = SessionRecord::new(60.0, 80.0, 0.95, 100, 5, 2, 105, "测试文章", "全拼");
+        let session = SessionRecord::new(60.0, 80.0, 0.95, 100, 5, 2, 105, "测试文章", "你好，世界。", "全拼");
         let errors = vec![
             ErrorRecordItem::new(
                 &session.id,
@@ -1301,7 +1494,7 @@ mod tests {
     #[test]
     fn test_mistyped_punctuation_filtering() {
         let mut db = StatsDb::open_in_memory().unwrap();
-        let session = SessionRecord::new(60.0, 80.0, 0.95, 100, 5, 2, 105, "测试文章", "全拼");
+        let session = SessionRecord::new(60.0, 80.0, 0.95, 100, 5, 2, 105, "测试文章", "你好，世界。", "全拼");
         let errors = vec![
             ErrorRecordItem::new(
                 &session.id,

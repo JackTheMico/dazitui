@@ -18,13 +18,15 @@ mod online;
 pub use chapter::{BookCatalog, Chapter, detect_and_parse_book};
 
 pub use code_hint::{
-    HintCell, HintHand, KONGMING_1HIT_CHORDS, KONGMING_1HIT_WORDS, display_width, hand_of_code,
-    hint_cell_widths, kongming_1hit_hint, kongming_1hit_word_hint, layout_code_hint_grid,
-    layout_code_hint_line, pack_words_by_width,
+    HandPrefixStyle, HintCell, HintHand, KONGMING_1HIT_CHORDS, KONGMING_1HIT_WORDS, display_width,
+    hand_of_code, hand_of_code_with, hint_cell_widths, hint_cell_widths_with, kongming_1hit_hint,
+    kongming_1hit_word_hint, layout_code_hint_grid, layout_code_hint_grid_with,
+    layout_code_hint_line, layout_code_hint_line_with, pack_words_by_width,
 };
 pub use db::{
     ChapterProgress, DbError, DbTask, DbWorker, ErrorRecordItem, GlobalStatsSummary,
-    KeypressRecordItem, MistypedCharStat, MistypedWordStat, SessionRecord, StatsDb,
+    KeypressRecordItem, MistypedCharStat, MistypedWordStat, SessionHistorySort, SessionRecord,
+    StatsDb, utc_days_now, utc_ymd_from_days,
 };
 pub use lttb::lttb_downsample;
 pub use scheme::{
@@ -172,11 +174,12 @@ pub enum BuiltinSet {
     CommonWordsZhong,
     /// 常用词组后五百。
     CommonWordsHou,
-    /// 空明码一击词：常用词组中在空明码方案里可单并击输入的词（按词频排序，618 词）。
-    /// 一击判定口径：Rime 词典中存在码长恰为 2 的条目（单并击），数据取自本仓库自有常用词表。
+    /// 空明码一击词：常用词组中可一次并击输入的词（按词频排序，765 词）。
+    /// 判定口径：方案当前词库中存在「一次并击可达且该词为词库首候选」的码
+    /// （含一击上屏 445 词、一击后按空格 320 词），由 `km_chord_model` 计算。
     KongmingOneHitWords,
-    /// 空明码一击字：空明码 208 槽位方案 B（极致速度·Top 100 全覆盖）优化后的一击单字（204 字）。
-    /// 涵盖物理单键、跨键小写、大写码元以及空格并击单字，排除标点。
+    /// 空明码一击字：前 1500 常用字中「一击上屏」的单字（455 字，按词频排序）。
+    /// 编码与手区取方案当前词库 + `km_chord_model` 的一次并击反推结果，排除需按空格的字。
     KongmingOneHitChars,
 }
 
@@ -656,7 +659,7 @@ pub fn format_stats_share_text(
     let word_ratio = word_ratio_pct(text, stats);
     let device_suffix = format!("{}{}", input_method_suffix(input_method), " 🖥️dazitui");
     format!(
-        "{source}{rank_part}《{}》 · 🚀速度 {:.1} · ⌨️击键 {:.1} · 📏码长 {:.1} · ✅正确字数 {}/{} · ❌错字 {} · ↩️回改 {} · 🔢键数 {} · 🎯键准 {:.2}% · 💬打词率 {:.2}% · ⏱️用时 {}{}",
+        "{source}{rank_part}《{}》 · 🚀速度 {:.2} · ⌨️击键 {:.2} · 📏码长 {:.2} · ✅正确字数 {}/{} · ❌错字 {} · ↩️回改 {} · 🔢键数 {} · 🎯键准 {:.2}% · 💬打词率 {:.2}% · ⏱️用时 {}{}",
         text.title,
         stats.wpm,
         stats.kps,
@@ -947,14 +950,14 @@ mod tests {
 
     #[test]
     fn kongming_one_hit_words_content_shape() {
-        // 空明码一击词：618 词、无重复、均为多字纯中文词、按词频排序首词「可以」。
+        // 空明码一击词：765 词、无重复、均为多字纯中文词、按词频排序首词「可以」。
         let set = BuiltinSet::KongmingOneHitWords;
         let words: Vec<&str> = set
             .content()
             .trim_end_matches(['\n', '\r'])
             .split('，')
             .collect();
-        assert_eq!(words.len(), 618, "空明码一击词应为 618 词");
+        assert_eq!(words.len(), 765, "空明码一击词应为 765 词");
         let mut sorted = words.clone();
         sorted.sort_unstable();
         sorted.dedup();
@@ -973,14 +976,14 @@ mod tests {
 
     #[test]
     fn kongming_one_hit_chars_content_shape() {
-        // 空明码一击字：204 字、无重复、均为纯中文字符、首字「中」。
+        // 空明码一击字：455 字、无重复、均为纯中文字符、按词频排序首字「的」。
         let set = BuiltinSet::KongmingOneHitChars;
         let chars: Vec<char> = set
             .content()
             .trim_end_matches(['\n', '\r'])
             .chars()
             .collect();
-        assert_eq!(chars.len(), 204, "空明码一击字应为 204 字");
+        assert_eq!(chars.len(), 455, "空明码一击字应为 455 字");
         let mut sorted = chars.clone();
         sorted.sort_unstable();
         sorted.dedup();
@@ -997,7 +1000,7 @@ mod tests {
                 c
             );
         }
-        assert_eq!(chars[0], '中', "首字应为 Tier 0 左手核心键「中」");
+        assert_eq!(chars[0], '的', "首字应为词频最高的一击上屏字「的」");
         assert_eq!(set.name(), "空明码一击字");
         assert!(!set.is_words());
     }
@@ -1267,7 +1270,7 @@ mod tests {
             format_stats_share_text(&text, &stats, Duration::from_secs_f64(85.23), "虎码", None);
         assert_eq!(
             s,
-            "离线赛文《背影节选》 · 🚀速度 85.2 · ⌨️击键 3.5 · 📏码长 2.8 · ✅正确字数 3/4 · ❌错字 1 · ↩️回改 0 · 🔢键数 140 · 🎯键准 100.00% · 💬打词率 0.00% · ⏱️用时 01:25.230 · 虎码 🖥️dazitui"
+            "离线赛文《背影节选》 · 🚀速度 85.20 · ⌨️击键 3.50 · 📏码长 2.80 · ✅正确字数 3/4 · ❌错字 1 · ↩️回改 0 · 🔢键数 140 · 🎯键准 100.00% · 💬打词率 0.00% · ⏱️用时 01:25.230 · 虎码 🖥️dazitui"
         );
     }
 
@@ -1284,7 +1287,7 @@ mod tests {
         let s = format_stats_share_text(&text, &stats, Duration::from_secs(60), "", None);
         assert_eq!(
             s,
-            "自由发文《日常练习》 · 🚀速度 85.2 · ⌨️击键 3.5 · 📏码长 2.8 · ✅正确字数 3/4 · ❌错字 1 · ↩️回改 0 · 🔢键数 140 · 🎯键准 100.00% · 💬打词率 0.00% · ⏱️用时 01:00.000 🖥️dazitui"
+            "自由发文《日常练习》 · 🚀速度 85.20 · ⌨️击键 3.50 · 📏码长 2.80 · ✅正确字数 3/4 · ❌错字 1 · ↩️回改 0 · 🔢键数 140 · 🎯键准 100.00% · 💬打词率 0.00% · ⏱️用时 01:00.000 🖥️dazitui"
         );
     }
 
@@ -1305,7 +1308,7 @@ mod tests {
         let s = format_stats_share_text(&text, &stats, Duration::from_secs(60), "虎码", Some(5));
         assert_eq!(
             s,
-            "锦标赛 第5名《锦标赛第3279期》 · 🚀速度 85.2 · ⌨️击键 3.5 · 📏码长 2.8 · ✅正确字数 3/4 · ❌错字 1 · ↩️回改 0 · 🔢键数 140 · 🎯键准 100.00% · 💬打词率 0.00% · ⏱️用时 01:00.000 · 虎码 🖥️dazitui"
+            "锦标赛 第5名《锦标赛第3279期》 · 🚀速度 85.20 · ⌨️击键 3.50 · 📏码长 2.80 · ✅正确字数 3/4 · ❌错字 1 · ↩️回改 0 · 🔢键数 140 · 🎯键准 100.00% · 💬打词率 0.00% · ⏱️用时 01:00.000 · 虎码 🖥️dazitui"
         );
         // 与离线格式一致的关键指标必须存在
         assert!(s.contains("🎯键准"), "在线复制结果必须含键准");

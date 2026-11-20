@@ -107,11 +107,11 @@ fn test_tiger_hint_prefers_certain_and_marks_chongma_rank() {
     assert_eq!(jieguo.strokes, 4);
     assert_eq!(jieguo.rank, 1);
 
-    // 2. 4 码有重码但目标词为首选 → 补一次空格上屏，5 击（ADR 0013 D5）。
-    //    `jgjr` 组：个人(36641) / 佳人(1192) / 伟人(630)。
+    // 2. 4 码段字母数已达上限，右边界无歧义 → 首选无需空格即可续打下一词，
+    //    4 击（ADR 0013 D5 修订）。`jgjr` 组：个人(36641) / 佳人(1192) / 伟人(630)。
     let geren = dict.build_code_hints(&["个人".to_string()]).remove(0);
-    assert_eq!(geren.code, "jgjr\u{2423}", "重码首选应补空格键标记");
-    assert_eq!(geren.strokes, 5);
+    assert_eq!(geren.code, "jgjr", "4 码首选应免空格、可直接续打");
+    assert_eq!(geren.strokes, 4);
     assert_eq!(geren.rank, 1);
 
     // 3. 同码非首选 → 提示串尾部直接写出要按的选重键（ADR 0014 D2）：
@@ -125,6 +125,45 @@ fn test_tiger_hint_prefers_certain_and_marks_chongma_rank() {
     assert_eq!(weiren.rank, 3, "伟人应为第三位");
     assert_eq!(weiren.strokes, 5);
     assert_eq!(weiren.code, "jgjr3", "第 3 位无 `'` 选重键时退回数字");
+}
+
+#[test]
+fn test_tiger_hint_minimizes_space_in_stream() {
+    let dir = default_rime_data_dir();
+    let path = dir.join("tiger.schema.yaml");
+    if !path.exists() {
+        eprintln!("skip: tiger.schema.yaml not found in {}", dir.display());
+        return;
+    }
+    let dict = SchemeDict::load_from_file(&path).expect("加载方案失败");
+
+    // 一简字用 `'` 定字：右边界确定、免空格，2 击（`t` + `'`）。
+    let wo = dict.build_code_hints(&["我".to_string()]).remove(0);
+    assert_eq!(wo.code, "t'", "一简字应提示 `'` 定字而非空格上屏");
+    assert_eq!(wo.strokes, 2);
+    assert_eq!(wo.code.matches('\u{2423}').count(), 0, "一简字不应占用空格");
+
+    // 4 码词字母数达上限、右边界无歧义：首选免空格，可无缝续打下一词。
+    for w in ["早餐", "结果"] {
+        let h = dict.build_code_hints(&[w.to_string()]).remove(0);
+        assert_eq!(
+            h.code.matches('\u{2423}').count(),
+            0,
+            "4 码词「{w}」不应补空格：{:?}",
+            h.code
+        );
+        assert_eq!(h.strokes, 4);
+    }
+
+    // 「今天起得早」由 4 码词 + 4 码词 + 2 码字组成：两个 4 码词之间零空格，
+    // 只有末尾那个 2 码字需要一次空格，共 1 个。
+    let long = dict.build_code_hints(&["今天起得早".to_string()]).remove(0);
+    assert_eq!(
+        long.code.matches('\u{2423}').count(),
+        1,
+        "长串应只在必要的短码处占 1 个空格：{:?}",
+        long.code
+    );
 }
 
 #[test]

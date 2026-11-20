@@ -25,12 +25,12 @@
 
 | 操作系统 | 架构 / 平台 | 预编译包下载 | 说明 |
 | :--- | :--- | :--- | :--- |
-| 🐧 **Linux** | x86_64 (glibc) | [dazitui-v1.0.20-x86_64-unknown-linux-gnu.tar.gz](https://github.com/JackTheMico/dazitui/releases/latest) | 推荐 Ubuntu / Debian / Fedora / Arch |
-| 🐧 **Linux** | x86_64 (musl 静态编译) | [dazitui-v1.0.20-x86_64-unknown-linux-musl.tar.gz](https://github.com/JackTheMico/dazitui/releases/latest) | 零动态库依赖，全发行版及 Alpine 通用 |
-| 🐧 **Linux** | ARM64 / aarch64 | [dazitui-v1.0.20-aarch64-unknown-linux-gnu.tar.gz](https://github.com/JackTheMico/dazitui/releases/latest) | 树莓派 / ARM 架构 Linux 设备 |
-| 🍎 **macOS** | Apple Silicon (M1/M2/M3/M4) | [dazitui-v1.0.20-aarch64-apple-darwin.tar.gz](https://github.com/JackTheMico/dazitui/releases/latest) | 原生 ARM64 极致性能 |
-| 🍎 **macOS** | Intel x86_64 | [dazitui-v1.0.20-x86_64-apple-darwin.tar.gz](https://github.com/JackTheMico/dazitui/releases/latest) | 兼容 Intel 处理器 Mac |
-| 🪟 **Windows** | x86_64 (MSVC) | [dazitui-v1.0.20-x86_64-pc-windows-msvc.zip](https://github.com/JackTheMico/dazitui/releases/latest) | 解压即用 `dazitui.exe`（推荐 Windows Terminal） |
+| 🐧 **Linux** | x86_64 (glibc) | [dazitui-v1.0.21-x86_64-unknown-linux-gnu.tar.gz](https://github.com/JackTheMico/dazitui/releases/latest) | 推荐 Ubuntu / Debian / Fedora / Arch |
+| 🐧 **Linux** | x86_64 (musl 静态编译) | [dazitui-v1.0.21-x86_64-unknown-linux-musl.tar.gz](https://github.com/JackTheMico/dazitui/releases/latest) | 零动态库依赖，全发行版及 Alpine 通用 |
+| 🐧 **Linux** | ARM64 / aarch64 | [dazitui-v1.0.21-aarch64-unknown-linux-gnu.tar.gz](https://github.com/JackTheMico/dazitui/releases/latest) | 树莓派 / ARM 架构 Linux 设备 |
+| 🍎 **macOS** | Apple Silicon (M1/M2/M3/M4) | [dazitui-v1.0.21-aarch64-apple-darwin.tar.gz](https://github.com/JackTheMico/dazitui/releases/latest) | 原生 ARM64 极致性能 |
+| 🍎 **macOS** | Intel x86_64 | [dazitui-v1.0.21-x86_64-apple-darwin.tar.gz](https://github.com/JackTheMico/dazitui/releases/latest) | 兼容 Intel 处理器 Mac |
+| 🪟 **Windows** | x86_64 (MSVC) | [dazitui-v1.0.21-x86_64-pc-windows-msvc.zip](https://github.com/JackTheMico/dazitui/releases/latest) | 解压即用 `dazitui.exe`（推荐 Windows Terminal） |
 
 ### ⚡ Linux & macOS 一键快速下载运行
 
@@ -79,7 +79,7 @@ cargo build --release --bin dazitui
 
 ### 📚 2. 全方位赛文载入系统
 - **📁 本地文件载入**：支持命令行直接传参（`dazitui article.txt`）或在 TUI 内使用交互式文件浏览器（按 `f`）浏览载入。
-- **📖 6 套精选内置赛文**：编译期嵌入「常用单字前/中/后五百」与「常用词组前/中/后五百」，支持顺序练习与随机乱序模式（按 `s` 打乱）。
+- **📖 8 套精选内置赛文**：编译期嵌入「常用单字前/中/后五百」与「常用词组前/中/后五百」，并新增空明码「一击字（455 字）」与「一击词（765 词）」专项练习，支持顺序练习与随机乱序模式（按 `s` 打乱）。
 - **🚪 智能组边界门槛**：内置赛文每 10 字/词为一组，当前组全对后方可自动推进到下一组，强化学员单组盲打准确率。
 - **🎯 单字目标门槛（击键 / 速度）**：内置单字赛文可设目标门槛，每组按「`KPS ≥ 目标击键` **或** `WPM ≥ 目标速度`」判定（二者取或），未达标即时提示并可直接重打本组。支持任意数值自定义（如 `4.3` 击/秒、`115.5` WPM），`0` 表示关闭该门槛。词组赛文不设门槛。
 - **✍️ 自由发文**：内置多行文本编辑弹窗（按 `i`），支持自由输入、修改标题与正文，并可一键持久化保存到本地文件。
@@ -100,6 +100,7 @@ cargo build --release --bin dazitui
 - **📈 速度演进趋势图 (WPM / KPS)**：支持近 30 场、近 100 场与全历史范围，采用 LTTB（最大三角形三桶）高保真降采样算法绘制 Braille 折线图，叠加 10 场滚动平滑均线。
 - **🔥 键位热力图**：采用对数平滑归一化算法（Logarithmic Normalization）阶梯着色，支持「方案反查投射」与「物理按键捕获」双视角切换。
 - **❌ 高频错字 / 错词排行榜 Top 50**：结合内置赛文原生词边界与轻量 `jieba-rs` 中文分词引擎，精准定位高频失误词汇与薄弱单字。
+- **🕘 赛文历史回看**：统计视图新增第 4 个子 Tab，可按日期筛选、按时间/速度/时长排序、分页浏览并查看赛文原文；早期未保存原文的记录会给出明确提示。
 
 ### 🎨 6. 现代化主题与高度可定制 UI
 - **🌈 11 款内置经典主题**：
@@ -187,14 +188,18 @@ dazitui --version
 
 | 快捷键 | 功能说明 |
 | :--- | :--- |
-| `1` / `2` / `3` | 切换 **速度趋势图** / **按键热力图** / **错字错词排行榜** |
+| `1` / `2` / `3` / `4` | 切换 **速度趋势图** / **按键热力图** / **错字错词排行榜** / **赛文历史** |
 | `Tab` / `Shift+Tab` | 循环切换子 Tab |
-| `r` / `s` | 切换趋势图指标（WPM 词速 ↔ KPS 击速） |
-| `v` | 切换趋势图时间跨度（近 30 场 ↔ 近 100 场 ↔ 全部历史） |
+| `r` | 切换趋势图时间跨度（近 30 场 ↔ 近 100 场 ↔ 全部历史） |
+| `v` / `s` | 切换趋势图指标（WPM 词速 ↔ KPS 击速） |
 | `L` | 切换键位热力图布局（标准斜列 ANSI ↔ 直列矩阵 Planck） |
 | `m` | 切换热力图视角（方案反查投射 ↔ 纯物理击键） |
 | `t` | 切换排行榜焦点（高频错字榜 ↔ 高频错词榜） |
 | `j` / `k` / `PgUp` / `PgDn` | 滚动查看排行榜列表 |
+| `f` | 赛文历史：循环筛选日期（全部 / 今天 / 昨天 / 本周 / 上周 / 本月 / 上月） |
+| `s` | 赛文历史：循环排序（时间 / 速度 / 时长，升序或降序） |
+| `j` / `k` / `PgUp` / `PgDn` | 赛文历史：选择记录 / 翻页；详情视图中滚动赛文原文 |
+| `Enter` | 赛文历史：查看选中赛文原文；详情中再按 `Enter` / `Esc` / `q` 返回列表 |
 | `Esc` / `q` | 退出统计视图返回主界面 |
 
 ### ⚙️ 设置视图

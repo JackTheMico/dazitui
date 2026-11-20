@@ -11,19 +11,20 @@ use dazitui_core::ThemePreset;
 use dazitui_core::normalize_online_content;
 use dazitui_core::{
     ApiClient, ApiError, AuthSession, BUILTIN_SETS, BookCatalog, BuiltinProgress, BuiltinSet,
-    ChapterProgress, CharStatus, CodeHint, CompetitionRank, CompetitionRankRow,
-    CompetitionType, DbTask, DbWorker, ErrorRecordItem, ErrorType, HeatmapLayout,
-    HintCell, HintHand, KeyboardMode, KeypressRecordItem, LoadError, LoadOptions, RankColumnConfig,
-    RankColumnId, Rgb, SchemeDict, SchemeInfo, Session, SessionRecord, Settings, SettingsStore, Stats,
-    StatsDb, Text, TextSource, Theme, TokenStore, detect_and_parse_book,
-    discover_schemes_default, env_credentials, format_stats_share_text, format_time, hand_of_code,
-    hint_cell_widths, is_auth_failure, key_accuracy_pct, kongming_1hit_hint, kongming_1hit_word_hint, layout_code_hint_line,
+    ChapterProgress, CharStatus, CodeHint, CompetitionRank, CompetitionRankRow, CompetitionType,
+    DbTask, DbWorker, ErrorRecordItem, ErrorType, HandPrefixStyle, HeatmapLayout, HintCell,
+    HintHand, KeyboardMode, KeypressRecordItem, LoadError, LoadOptions, OxCupClient,
+    OxCupScoreEntry, RankColumnConfig, RankColumnId, Rgb, SchemeDict, SchemeInfo, Session,
+    SessionHistorySort, SessionRecord, Settings, SettingsStore, Stats, StatsDb, Text, TextSource,
+    Theme, TigerCupClient, TigerDraft, TigerDraftStore, TigerLeaderboardEntry, TokenStore,
+    build_tiger_payload, detect_and_parse_book, discover_schemes_default, env_credentials,
+    format_ox_share_text, format_stats_share_text, format_tiger_share_text, format_time,
+    hand_of_code_with, hint_cell_widths, hint_cell_widths_with, is_auth_failure, key_accuracy_pct,
+    kongming_1hit_hint, kongming_1hit_word_hint, layout_code_hint_line, layout_code_hint_line_with,
     load_builtin_text, load_builtin_text_shuffled, load_text_from_clipboard, load_text_from_file,
     load_text_from_string, lttb_downsample, normalize_scheme_to_id, osc52_clipboard,
     pack_words_by_width, prewarm_segmenter, resolve_scheme_path_via_discovery, save_text_to_file,
-    today_ymd, word_ratio_pct, TigerCupClient, TigerDraft, TigerDraftStore, TigerLeaderboardEntry,
-    build_tiger_payload, format_tiger_share_text, OxCupClient, OxCupScoreEntry,
-    format_ox_share_text,
+    today_ymd, utc_days_now, utc_ymd_from_days, word_ratio_pct,
 };
 use dazitui_core::font16::{glyph_for_char_or_fallback, render_glyph_braille};
 
@@ -57,6 +58,7 @@ enum StatsTab {
     WpmTrend,
     Heatmap,
     ErrorRanking,
+    SessionHistory,
 }
 
 /// 速度趋势图的时间跨度范围。
@@ -166,6 +168,134 @@ impl ErrorRankingFocus {
     }
 }
 
+/// 会话历史筛选条件。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum SessionFilter {
+    #[default]
+    All,
+    Today,
+    Yesterday,
+    ThisWeek,
+    LastWeek,
+    ThisMonth,
+    LastMonth,
+}
+
+impl SessionFilter {
+    fn next(self) -> Self {
+        match self {
+            Self::All => Self::Today,
+            Self::Today => Self::Yesterday,
+            Self::Yesterday => Self::ThisWeek,
+            Self::ThisWeek => Self::LastWeek,
+            Self::LastWeek => Self::ThisMonth,
+            Self::ThisMonth => Self::LastMonth,
+            Self::LastMonth => Self::All,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "全部",
+            Self::Today => "今天",
+            Self::Yesterday => "昨天",
+            Self::ThisWeek => "本周",
+            Self::LastWeek => "上周",
+            Self::ThisMonth => "本月",
+            Self::LastMonth => "上月",
+        }
+    }
+
+    /// 筛选对应的 UTC 日期区间 `[start, end)`，与 `sessions.created_at` 同口径。
+    /// 日期串可直接用于字典序比较；`None` 表示该侧无边界。
+    fn bounds(self) -> (Option<String>, Option<String>) {
+        if self == Self::All {
+            return (None, None);
+        }
+        let today = utc_days_now();
+        let (start, end) = match self {
+            Self::All => unreachable!(),
+            Self::Today => (today, today + 1),
+            Self::Yesterday => (today.saturating_sub(1), today),
+            Self::ThisWeek | Self::LastWeek => {
+                // 1970-01-01 为周四，故 (days + 3) % 7 == 0 对应周一。
+                let monday = today.saturating_sub(((today + 3) % 7) as u64);
+                if self == Self::ThisWeek {
+                    (monday, monday + 7)
+                } else {
+                    (monday.saturating_sub(7), monday)
+                }
+            }
+            Self::ThisMonth | Self::LastMonth => {
+                let today_str = utc_ymd_from_days(today);
+                let mut parts = today_str.split('-');
+                let year: i32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(1970);
+                let month: i32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(1);
+                let (sy, sm) = if self == Self::ThisMonth {
+                    (year, month)
+                } else if month == 1 {
+                    (year - 1, 12)
+                } else {
+                    (year, month - 1)
+                };
+                let (ey, em) = if sm == 12 { (sy + 1, 1) } else { (sy, sm + 1) };
+                return (
+                    Some(format!("{sy:04}-{sm:02}-01")),
+                    Some(format!("{ey:04}-{em:02}-01")),
+                );
+            }
+        };
+        (Some(utc_ymd_from_days(start)), Some(utc_ymd_from_days(end)))
+    }
+}
+
+/// 会话历史排序方式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum SessionSortBy {
+    #[default]
+    DateDesc,   // 日期降序（最新在前）
+    DateAsc,    // 日期升序（最早在前）
+    WpmDesc,    // 速度降序（最快在前）
+    WpmAsc,     // 速度升序（最慢在前）
+    DurationDesc, // 时长降序（最长在前）
+    DurationAsc, // 时长升序（最短在前）
+}
+
+impl SessionSortBy {
+    fn next(self) -> Self {
+        match self {
+            Self::DateDesc => Self::DateAsc,
+            Self::DateAsc => Self::WpmDesc,
+            Self::WpmDesc => Self::WpmAsc,
+            Self::WpmAsc => Self::DurationDesc,
+            Self::DurationDesc => Self::DurationAsc,
+            Self::DurationAsc => Self::DateDesc,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::DateDesc => "时间▼",
+            Self::DateAsc => "时间▲",
+            Self::WpmDesc => "速度▼",
+            Self::WpmAsc => "速度▲",
+            Self::DurationDesc => "时长▼",
+            Self::DurationAsc => "时长▲",
+        }
+    }
+
+    fn into_core(self) -> SessionHistorySort {
+        match self {
+            Self::DateDesc => SessionHistorySort::NewestFirst,
+            Self::DateAsc => SessionHistorySort::OldestFirst,
+            Self::WpmDesc => SessionHistorySort::WpmDesc,
+            Self::WpmAsc => SessionHistorySort::WpmAsc,
+            Self::DurationDesc => SessionHistorySort::DurationDesc,
+            Self::DurationAsc => SessionHistorySort::DurationAsc,
+        }
+    }
+}
+
 /// 统计视图状态。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct StatsViewState {
@@ -179,6 +309,14 @@ struct StatsViewState {
     word_scroll: usize,
     char_selected: usize,
     word_selected: usize,
+    // 会话历史标签页状态
+    session_selected: usize,
+    session_page_size: usize,
+    session_filter: SessionFilter,
+    session_sort_by: SessionSortBy,
+    // 历史赛文查看状态
+    viewing_session: Option<usize>, // Some = 详情视图，存进入详情时的列表下标
+    detail_scroll: u16,             // 详情原文滚动行数
     status_msg: Option<String>,
 }
 
@@ -195,9 +333,104 @@ impl StatsViewState {
             word_scroll: 0,
             char_selected: 0,
             word_selected: 0,
+            // 会话历史初始化
+            session_selected: 0,
+            session_page_size: 10,
+            session_filter: SessionFilter::default(),
+            session_sort_by: SessionSortBy::default(),
+            viewing_session: None,
+            detail_scroll: 0,
             status_msg: None,
         }
     }
+}
+
+/// 当前筛选条件下命中的历史会话总数。
+fn session_history_count(stats: &StatsViewState) -> usize {
+    let (start, end) = stats.session_filter.bounds();
+    StatsDb::with_default_path()
+        .ok()
+        .and_then(|db| {
+            db.count_sessions_between(start.as_deref(), end.as_deref())
+                .ok()
+        })
+        .unwrap_or(0)
+}
+
+/// 赛文历史 Tab 的专属按键处理；返回 `true` 表示按键已被消费。
+/// 列表态的 `session_selected` 是过滤/排序后列表中的绝对下标；详情态复用同一选中项。
+fn handle_session_history_input(stats: &mut StatsViewState, key: KeyEvent) -> bool {
+    handle_session_history_input_with(stats, key, session_history_count)
+}
+
+/// 同上，但由调用方提供命中数，便于在测试中脱离真实数据库验证边界行为。
+fn handle_session_history_input_with<F>(stats: &mut StatsViewState, key: KeyEvent, count: F) -> bool
+where
+    F: Fn(&StatsViewState) -> usize,
+{
+    if stats.tab != StatsTab::SessionHistory {
+        return false;
+    }
+    let page_size = stats.session_page_size.max(1);
+    if stats.viewing_session.is_some() {
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                stats.detail_scroll = stats.detail_scroll.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                stats.detail_scroll = stats.detail_scroll.saturating_add(1);
+            }
+            KeyCode::PageUp => {
+                stats.detail_scroll = stats.detail_scroll.saturating_sub(10);
+            }
+            KeyCode::PageDown => {
+                stats.detail_scroll = stats.detail_scroll.saturating_add(10);
+            }
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
+                stats.viewing_session = None;
+                stats.detail_scroll = 0;
+            }
+            _ => return false,
+        }
+        return true;
+    }
+
+    match key.code {
+        KeyCode::Char('f') | KeyCode::Char('F') => {
+            stats.session_filter = stats.session_filter.next();
+            stats.session_selected = 0;
+        }
+        KeyCode::Char('s') | KeyCode::Char('S') => {
+            stats.session_sort_by = stats.session_sort_by.next();
+            stats.session_selected = 0;
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            stats.session_selected = stats.session_selected.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            let count = count(stats);
+            if count > 0 {
+                stats.session_selected = (stats.session_selected + 1).min(count - 1);
+            }
+        }
+        KeyCode::PageUp => {
+            stats.session_selected = stats.session_selected.saturating_sub(page_size);
+        }
+        KeyCode::PageDown => {
+            let count = count(stats);
+            if count > 0 {
+                stats.session_selected = (stats.session_selected + page_size).min(count - 1);
+            }
+        }
+        KeyCode::Enter => {
+            if count(stats) > 0 {
+                stats.viewing_session = Some(stats.session_selected);
+                stats.detail_scroll = 0;
+            }
+        }
+        _ => return false,
+    }
+    true
 }
 
 /// 将 core 的 ThemePreset 映射为 ratatui_themes 的 ThemePalette。
@@ -2175,6 +2408,25 @@ impl App {
         self.login_form = None;
     }
 
+    /// 处理全局登录类快捷键（u 登录 / g 虎码杯登录），返回是否已消费。
+    ///
+    /// 浏览类视图里 g/G 与 u 另有语义（首/末、分组大小、翻页），
+    /// 必须让位给视图自身的按键绑定，否则 `g` 会被虎码杯登录截胡。
+    fn handle_global_login_shortcut(&mut self, key: KeyEvent) -> bool {
+        if !login_shortcut_priority(&self.state) {
+            return false;
+        }
+        if is_open_login(key) {
+            self.open_login();
+            return true;
+        }
+        if is_open_tiger_login(key) {
+            self.open_tiger_login();
+            return true;
+        }
+        false
+    }
+
     /// 打开自由发文模态框。
     fn open_free_input(&mut self) {
         self.free_input_modal = Some(FreeInputModal::new());
@@ -2448,6 +2700,7 @@ impl App {
                 &stats,
                 elapsed,
                 &self.text.title,
+                &self.text.content,
                 self.effective_upload_input_method(),
             );
             let session_id = session_record.id.clone();
@@ -2655,18 +2908,35 @@ impl App {
         self.settings.group_size = Settings::next_group_size_preset(self.settings.group_size);
         let _ = self.settings_store.save(&self.settings);
         self.refresh_builtin_preview();
-        if self.text.source.is_builtin()
-            && self.session.is_empty()
-            && self.session.completed_groups() == 0
-        {
-            let wb = self.text.session_word_boundaries();
-            self.session = Session::new_gated_with_words_and_size(
-                &self.text.content,
-                true,
-                &wb,
-                self.settings.group_size as usize,
-            );
+        self.rebuild_builtin_session_for_group_size();
+    }
+
+    /// 分组大小变化后按新设置重建内置赛文会话，保持已完成的字符/词位置。
+    ///
+    /// 仅在没有新增上屏输入时重建（就绪态或续打态），避免丢弃正在跟打的进度。
+    fn rebuild_builtin_session_for_group_size(&mut self) {
+        let TextSource::Builtin { set } = self.text.source else {
+            return;
+        };
+        if !self.session.is_empty() {
+            return;
         }
+        let group_size = (self.settings.group_size as usize).max(1);
+        let completed_units = self.session.completed_groups() * self.session.group_size();
+        let completed = completed_units / group_size;
+        let wb = self.text.session_word_boundaries();
+        let mut session = Session::new_gated_with_words_and_size(
+            &self.text.content,
+            true,
+            &wb,
+            group_size,
+        );
+        if !set.is_words() {
+            session.set_targets(self.settings.target_kps, self.settings.target_wpm);
+            session.set_retry_shuffle(self.settings.retry_shuffle);
+        }
+        session.set_completed_groups(completed);
+        self.session = session;
     }
 
     /// 循环切换单字目标击键（KPS）档位并即时持久化。
@@ -2747,9 +3017,10 @@ impl App {
             return;
         };
         if let Some(p) = self.builtin_progress_for(set) {
-            if p.completed_groups > 0 {
-                let total = self.builtin_total_groups(set, p.group_size as usize);
-                self.resume_prompt = Some((set, p.completed_groups as usize, total));
+            let completed = self.resume_groups_for(p);
+            if completed > 0 {
+                let total = self.builtin_total_groups(set, self.settings.group_size as usize);
+                self.resume_prompt = Some((set, completed, total));
                 return;
             }
         }
@@ -2763,12 +3034,10 @@ impl App {
 
     /// 从指定已完成组数开始某个内置赛文跟打。
     ///
-    /// 若该赛文有存档，还原其「每赛文单独记」的分组大小；清空计时与暂停态，
+    /// 分组大小始终以设置为准（存档里的 `group_size` 只用于换算存档组数，
+    /// 不能反过来覆盖用户刚改过的设置）；清空计时与暂停态，
     /// 并用 `set_completed_groups` 把会话跳到对应组。
     fn start_builtin_set(&mut self, set: BuiltinSet, completed_groups: usize) {
-        if let Some(p) = self.builtin_progress_for(set) {
-            self.settings.group_size = p.group_size;
-        }
         self.text = if self.builtin_shuffle {
             load_builtin_text_shuffled(set)
         } else {
@@ -2800,6 +3069,15 @@ impl App {
     /// 读取某内置赛文的已存进度。
     fn builtin_progress_for(&self, set: BuiltinSet) -> Option<BuiltinProgress> {
         self.settings.builtin_progress.get(set.name()).copied()
+    }
+
+    /// 把存档的已完成组数换算到当前设置的分组大小下的组数。
+    ///
+    /// 存档组数以 `p.group_size` 为单位（字或词），先还原成已完成单位数，
+    /// 再按设置里的新分组大小重新分组；不足一组的余数留在当前组重打。
+    fn resume_groups_for(&self, p: BuiltinProgress) -> usize {
+        let saved_units = p.completed_groups as usize * (p.group_size as usize).max(1);
+        saved_units / (self.settings.group_size as usize).max(1)
     }
 
     /// 计算某内置赛文在指定分组大小下的总组数（用于续打弹窗与进度展示）。
@@ -3377,12 +3655,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                     }
                     continue;
                 }
-                if is_open_login(key) {
-                    app.open_login();
-                    continue;
-                }
-                if is_open_tiger_login(key) {
-                    app.open_tiger_login();
+                if app.handle_global_login_shortcut(key) {
                     continue;
                 }
                 let mut key = key;
@@ -3889,21 +4162,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                                     };
                                     app.settings.group_size = next;
                                     let _ = app.settings_store.save(&app.settings);
-                                    if app.text.source.is_builtin()
-                                        && app.session.is_empty()
-                                        && app.session.completed_groups() == 0
-                                    {
-                                        let wb = app.text.session_word_boundaries();
-                                        app.session = Session::new_gated_with_words_and_size(
-                                            &app.text.content,
-                                            true,
-                                            &wb,
-                                            app.settings.group_size as usize,
-                                        );
-                                        if let TextSource::Builtin { set } = app.text.source && !set.is_words() {
-                                            app.session.set_targets(app.settings.target_kps, app.settings.target_wpm);
-                                        }
-                                    }
+                                    app.rebuild_builtin_session_for_group_size();
                                 }
                                 FOCUS_TARGET_KPS => {
                                     let curr = app.settings.target_kps;
@@ -3971,22 +4230,31 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                             app.enter_settings();
                             continue;
                         }
+                        // 赛文历史的专属按键先分发；未消费的键继续走通用统计快捷键。
+                        if stats_state.tab == StatsTab::SessionHistory
+                            && handle_session_history_input(stats_state, key)
+                        {
+                            continue;
+                        }
                         match key.code {
                             KeyCode::Char('1') => stats_state.tab = StatsTab::WpmTrend,
                             KeyCode::Char('2') => stats_state.tab = StatsTab::Heatmap,
                             KeyCode::Char('3') => stats_state.tab = StatsTab::ErrorRanking,
+                            KeyCode::Char('4') => stats_state.tab = StatsTab::SessionHistory,
                             KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
                                 stats_state.tab = match stats_state.tab {
                                     StatsTab::WpmTrend => StatsTab::Heatmap,
                                     StatsTab::Heatmap => StatsTab::ErrorRanking,
-                                    StatsTab::ErrorRanking => StatsTab::WpmTrend,
+                                    StatsTab::ErrorRanking => StatsTab::SessionHistory,
+                                    StatsTab::SessionHistory => StatsTab::WpmTrend,
                                 };
                             }
                             KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
                                 stats_state.tab = match stats_state.tab {
-                                    StatsTab::WpmTrend => StatsTab::ErrorRanking,
+                                    StatsTab::WpmTrend => StatsTab::SessionHistory,
                                     StatsTab::Heatmap => StatsTab::WpmTrend,
                                     StatsTab::ErrorRanking => StatsTab::Heatmap,
+                                    StatsTab::SessionHistory => StatsTab::ErrorRanking,
                                 };
                             }
                             KeyCode::Char('r') | KeyCode::Char('R') => {
@@ -4206,7 +4474,10 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Resu
                                     }
                                 }
                             }
-                            KeyCode::Esc | KeyCode::Char('q') => app.state = AppState::Typing,
+                            // Esc/q 退出统计视图；赛文历史详情态的返回已由前置分发处理。
+                            KeyCode::Esc | KeyCode::Char('q') => {
+                                app.state = AppState::Typing;
+                            }
                             _ => {}
                         }
                     }
@@ -4478,7 +4749,7 @@ fn hint_text(
     if browsing {
         " Tab 侧栏 | jk 选择 | Enter 载入 | g/G 首尾 | Esc/q 取消 | o 设置 | Ctrl-Q 退出"
     } else if browsing_builtin {
-        " Tab 侧栏 | jk 选择 | Enter 载入 | s 乱序 | c 词提 | g/G 首尾 | Esc/q 取消 | o 设置 | Ctrl-Q 退出"
+        " Tab 侧栏 | jk 选择 | Enter 载入 | s 乱序 | g 分组 | c 词提 | Esc/q 取消 | o 设置 | Ctrl-Q 退出"
     } else if paused {
         " Tab 侧栏 | jk 菜单导航 | l 执行 | i/Esc 恢复跟打 | d 提前结算 | r 重打 | c 词提 | s 统计 | o 设置 | Ctrl-Q 退出"
     } else if is_ready {
@@ -4822,10 +5093,6 @@ fn handle_finished_key(app: &mut App, key: KeyEvent) -> bool {
         app.open_login();
         return true;
     }
-    if is_open_tiger_login(key) {
-        app.open_tiger_login();
-        return true;
-    }
     if is_open_rank(key) {
         let _ = app.open_online_rank();
         return true;
@@ -4956,6 +5223,17 @@ fn is_quit(key: KeyEvent) -> bool {
     let is_ctrl_q = key.modifiers.contains(KeyModifiers::CONTROL)
         && (key.code == KeyCode::Char('q') || key.code == KeyCode::Char('Q'));
     is_ctrl_q || is_ctrl_c
+}
+
+/// 全局登录类快捷键（u / g）是否应优先于当前视图自身的按键绑定。
+///
+/// 浏览类视图里 g/G 与 u 另有语义（首/末、分组大小、翻页），
+/// 由视图自身处理，不能被登录快捷键截胡。
+fn login_shortcut_priority(state: &AppState) -> bool {
+    !matches!(
+        state,
+        AppState::Browsing | AppState::BrowsingBuiltin | AppState::ChapterCatalog
+    )
 }
 
 /// 打开登录模态框快捷键：u / U（User login）。
@@ -7185,6 +7463,21 @@ fn render_stats_view(frame: &mut Frame, app: &App, stats_state: &StatsViewState)
                 Style::default().fg(palette.muted).bg(palette.bg),
             )
         },
+        Span::raw("  "),
+        if stats_state.tab == StatsTab::SessionHistory {
+            Span::styled(
+                " ◖ 4. 赛文历史 ◗ ",
+                Style::default()
+                    .fg(palette.accent)
+                    .bg(palette.selection)
+                    .bold(),
+            )
+        } else {
+            Span::styled(
+                "   4. 赛文历史   ",
+                Style::default().fg(palette.muted).bg(palette.bg),
+            )
+        },
     ];
 
     let header_title = Line::from(vec![Span::styled(
@@ -7228,18 +7521,69 @@ fn render_stats_view(frame: &mut Frame, app: &App, stats_state: &StatsViewState)
             stats_state.status_msg.as_deref(),
             &palette,
         ),
+        StatsTab::SessionHistory => {
+            let page_size = stats_state.session_page_size.max(1);
+            let selected = stats_state.session_selected;
+            let page = selected / page_size;
+            let (start, end) = stats_state.session_filter.bounds();
+            let (sessions, total) = StatsDb::with_default_path()
+                .ok()
+                .and_then(|db| {
+                    db.get_session_history_page(
+                        start.as_deref(),
+                        end.as_deref(),
+                        stats_state.session_sort_by.into_core(),
+                        page,
+                        page_size,
+                    )
+                    .ok()
+                })
+                .unwrap_or_default();
+            let selected_on_page = selected % page_size;
+            if stats_state.viewing_session.is_some() {
+                if let Some(session) = sessions.get(selected_on_page) {
+                    render_session_detail_view(
+                        frame,
+                        session,
+                        stats_state.detail_scroll,
+                        &palette,
+                        body_area,
+                    );
+                }
+            } else {
+                render_session_history_list(
+                    frame,
+                    &sessions,
+                    total,
+                    page,
+                    page_size,
+                    selected,
+                    stats_state.session_filter,
+                    stats_state.session_sort_by,
+                    &palette,
+                    body_area,
+                );
+            }
+        }
     }
 
     // 3. 底部快捷键提示
     let hint_str = match stats_state.tab {
         StatsTab::WpmTrend => {
-            " 1/2/3 Tab | hl 左右 | r 范围 | v/s 切换指标(速度/KPS) | Esc/q 返回 | o 设置 | Ctrl-Q 退出 "
+            " 1/2/3/4 Tab | hl 左右 | r 范围 | v/s 切换指标(速度/KPS) | Esc/q 返回 | o 设置 | Ctrl-Q 退出 "
         }
         StatsTab::Heatmap => {
-            " 1/2/3 Tab | hl 左右 | L 键盘布局 | m 视角 | Esc/q 返回 | o 设置 | Ctrl-Q 退出 "
+            " 1/2/3/4 Tab | hl 左右 | L 键盘布局 | m 视角 | Esc/q 返回 | o 设置 | Ctrl-Q 退出 "
         }
         StatsTab::ErrorRanking => {
-            " 1/2/3 Tab | t 字/词焦点 | jk 选择 | PgUp/PgDn 翻页 | d/x 删除 | Esc/q 返回 | o 设置 | Ctrl-Q 退出 "
+            " 1/2/3/4 Tab | t 字/词焦点 | jk 选择 | PgUp/PgDn 翻页 | d/x 删除 | Esc/q 返回 | o 设置 | Ctrl-Q 退出 "
+        }
+        StatsTab::SessionHistory => {
+            if stats_state.viewing_session.is_some() {
+                " jk/PgUp/PgDn 滚动原文 | Enter/Esc/q 返回列表 | o 设置 | Ctrl-Q 退出 "
+            } else {
+                " 1/2/3/4 Tab | f 筛选 | s 排序 | jk 选择 | Enter 查看原文 | PgUp/PgDn 翻页 | Esc/q 返回 | o 设置 | Ctrl-Q 退出 "
+            }
         }
     };
     let hint_title = Line::from(vec![Span::styled(
@@ -8136,6 +8480,293 @@ fn render_error_ranking_tab(
         Paragraph::new(word_lines).block(themed_block(palette, is_word_focused).title(word_title)),
         right_col,
     );
+}
+
+/// 按终端显示宽度截断（中文按 2 列计），避免按字节切片把汉字截成半个。
+fn truncate_display_width(s: &str, max_width: usize) -> String {
+    let mut out = String::new();
+    let mut width = 0usize;
+    for c in s.chars() {
+        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+        if width + w > max_width {
+            break;
+        }
+        out.push(c);
+        width += w;
+    }
+    out
+}
+
+/// 按终端显示宽度右补空格到指定列数。
+fn pad_display_width(s: &str, width: usize) -> String {
+    let current = UnicodeWidthStr::width(s);
+    if current >= width {
+        s.to_string()
+    } else {
+        format!("{}{}", s, " ".repeat(width - current))
+    }
+}
+
+/// Tab 4: 赛文历史列表 - 查看过滤/排序后的某一页跟打会话。
+#[allow(clippy::too_many_arguments)]
+fn render_session_history_list(
+    frame: &mut Frame,
+    sessions: &[SessionRecord],
+    total_count: usize,
+    page: usize,
+    page_size: usize,
+    selected: usize,
+    filter: SessionFilter,
+    sort_by: SessionSortBy,
+    palette: &ThemePalette,
+    area: Rect,
+) {
+    let [info_area, table_area] =
+        Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).areas(area);
+
+    // 1. 顶部信息栏
+    let filter_label = filter.label();
+    let sort_label = sort_by.label();
+    let info_line = Line::from(vec![
+        Span::styled(" ▶ 筛选: ", Style::default().bold().fg(palette.muted)),
+        Span::styled(filter_label, Style::default().bold().fg(palette.accent)),
+        Span::raw("    "),
+        Span::styled("排序: ", Style::default().bold().fg(palette.muted)),
+        Span::styled(sort_label, Style::default().bold().fg(palette.accent)),
+        Span::raw("    "),
+        Span::styled("总数: ", Style::default().bold().fg(palette.muted)),
+        Span::styled(
+            format!("{} 场", total_count),
+            Style::default().bold().fg(palette.success),
+        ),
+        Span::raw("    "),
+        Span::styled("页码: ", Style::default().bold().fg(palette.muted)),
+        Span::styled(
+            format!(
+                "{}/{}",
+                page + 1,
+                total_count.div_ceil(page_size.max(1)).max(1)
+            ),
+            Style::default().bold().fg(palette.accent),
+        ),
+    ]);
+
+    frame.render_widget(
+        Paragraph::new(info_line).block(themed_block(palette, false)),
+        info_area,
+    );
+
+    // 2. 会话列表表格
+    let table_title = Line::from(vec![Span::styled(
+        " 赛文历史列表 (F 筛选, S 排序, JK 选择, Enter 查看原文, PgUp/PgDn 翻页) ",
+        Style::default().bold().fg(palette.accent),
+    )]);
+
+    let mut table_lines = Vec::new();
+
+    // 表头
+    table_lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled("时间", Style::default().bold().fg(palette.muted)),
+        Span::raw("    "),
+        Span::styled("赛文", Style::default().bold().fg(palette.muted)),
+        Span::raw("    "),
+        Span::styled("速度", Style::default().bold().fg(palette.muted)),
+        Span::raw("    "),
+        Span::styled("准确率", Style::default().bold().fg(palette.muted)),
+        Span::raw("    "),
+        Span::styled("时长", Style::default().bold().fg(palette.muted)),
+        Span::raw("    "),
+        Span::styled("字数", Style::default().bold().fg(palette.muted)),
+    ]));
+
+    // 分隔线
+    table_lines.push(Line::from(vec![Span::styled(
+        "─".repeat(area.width as usize),
+        Style::default().fg(palette.muted),
+    )]));
+
+    // 会话行
+    for (i, session) in sessions.iter().enumerate() {
+        let row_index = page * page_size + i;
+        let is_selected = row_index == selected;
+        let row_style = if is_selected {
+            Style::default()
+                .bg(palette.selection)
+                .fg(palette.accent)
+                .bold()
+        } else {
+            Style::default().fg(palette.fg)
+        };
+
+        // 简化时间显示
+        let time_str = if session.created_at.len() >= 16 {
+            &session.created_at[5..16] // 显示 MM-DD HH:MM
+        } else {
+            &session.created_at
+        };
+
+        // 限制赛文标题长度（按显示宽度，中文不会被截成半个字符）
+        let title = truncate_display_width(&session.text_title, 20);
+        let title = if UnicodeWidthStr::width(session.text_title.as_str()) > 20 {
+            format!("{title}…")
+        } else {
+            title
+        };
+
+        // 格式化数值
+        let wpm_str = format!("{:.1}", session.wpm);
+        let accuracy_str = format!("{:.1}%", session.accuracy * 100.0);
+        let duration_str = format!("{:.1}s", session.duration_secs);
+        let chars_str = format!("{}", session.typed_chars);
+
+        let selection_marker = if is_selected { "▶ " } else { "  " };
+
+        table_lines.push(
+            Line::from(vec![
+                Span::styled(selection_marker, Style::default().fg(palette.accent)),
+                Span::styled(
+                    format!("{:^12} ", time_str),
+                    if is_selected {
+                        Style::default().bold().fg(palette.accent)
+                    } else {
+                        Style::default().fg(palette.fg)
+                    },
+                ),
+                Span::styled(
+                    format!("{} ", pad_display_width(&title, 24)),
+                    if is_selected {
+                        Style::default().bold().fg(palette.accent)
+                    } else {
+                        Style::default().fg(palette.muted)
+                    },
+                ),
+                Span::styled(
+                    format!("{:>6} ", wpm_str),
+                    if is_selected {
+                        Style::default().bold().fg(palette.success)
+                    } else {
+                        Style::default().fg(palette.success)
+                    },
+                ),
+                Span::styled(
+                    format!("{:>7} ", accuracy_str),
+                    if is_selected {
+                        Style::default().bold().fg(if session.accuracy >= 0.95 {
+                            palette.success
+                        } else if session.accuracy >= 0.85 {
+                            palette.warning
+                        } else {
+                            palette.error
+                        })
+                    } else {
+                        Style::default().fg(if session.accuracy >= 0.95 {
+                            palette.success
+                        } else if session.accuracy >= 0.85 {
+                            palette.warning
+                        } else {
+                            palette.error
+                        })
+                    },
+                ),
+                Span::styled(
+                    format!("{:>7} ", duration_str),
+                    if is_selected {
+                        Style::default().bold().fg(palette.fg)
+                    } else {
+                        Style::default().fg(palette.fg)
+                    },
+                ),
+                Span::styled(
+                    format!("{:>5} ", chars_str),
+                    if is_selected {
+                        Style::default().bold().fg(palette.fg)
+                    } else {
+                        Style::default().fg(palette.fg)
+                    },
+                ),
+            ])
+            .style(row_style),
+        );
+    }
+
+    // 如果没有会话数据
+    if sessions.is_empty() {
+        table_lines.push(Line::from(vec![Span::styled(
+            "  暂无历史赛文记录",
+            Style::default().fg(palette.muted),
+        )]));
+    }
+
+    frame.render_widget(
+        Paragraph::new(table_lines).block(themed_block(palette, true).title(table_title)),
+        table_area,
+    );
+}
+
+/// 渲染赛文详情视图（用于查看历史赛文原文）。
+fn render_session_detail_view(
+    frame: &mut Frame,
+    session: &SessionRecord,
+    scroll: u16,
+    palette: &ThemePalette,
+    area: Rect,
+) {
+    let detail_title = Line::from(vec![
+        Span::styled(" 赛文详情 - ", Style::default().bold().fg(palette.accent)),
+        Span::styled(
+            truncate_display_width(&session.text_title, 60),
+            Style::default().bold().fg(palette.fg),
+        ),
+    ]);
+    let block = themed_block(palette, true).title(detail_title);
+
+    // 时间信息行
+    let time_line = Line::from(vec![
+        Span::styled("时间: ", Style::default().bold().fg(palette.muted)),
+        Span::styled(&session.created_at, Style::default().fg(palette.fg)),
+        Span::raw("    "),
+        Span::styled("速度: ", Style::default().bold().fg(palette.muted)),
+        Span::styled(
+            format!("{:.1} WPM", session.wpm),
+            Style::default().fg(palette.success),
+        ),
+        Span::raw("    "),
+        Span::styled("准确率: ", Style::default().bold().fg(palette.muted)),
+        Span::styled(
+            format!("{:.1}%", session.accuracy * 100.0),
+            Style::default().fg(palette.fg),
+        ),
+        Span::raw("    "),
+        Span::styled("时长: ", Style::default().bold().fg(palette.muted)),
+        Span::styled(
+            format!("{:.1}s", session.duration_secs),
+            Style::default().fg(palette.fg),
+        ),
+    ]);
+
+    // 赛文内容区域：换行并按行滚动，长赛文也能通读。
+    // 旧版本写入的记录没有原文，给出明确提示而不是空白页。
+    let content: TextLines = if session.text_content.is_empty() {
+        TextLines::from(Line::from(Span::styled(
+            " 该历史记录未保存赛文原文（升级前产生的记录）。",
+            Style::default().fg(palette.muted),
+        )))
+    } else {
+        TextLines::from(session.text_content.as_str())
+    };
+    let content_paragraph = Paragraph::new(content)
+        .block(block)
+        .style(Style::default().fg(palette.fg))
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0));
+
+    // 布局：顶部信息栏 + 内容区域
+    let [info_area, content_area] =
+        Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).areas(area);
+
+    frame.render_widget(content_paragraph, content_area);
+    frame.render_widget(time_line, info_area);
 }
 
 /// 设置视图：焦点行 + 左右调整（主题/占比/粗体/实时键盘/反查方案/上传名称）。
@@ -9285,7 +9916,10 @@ fn builtin_page_start(session: &Session) -> usize {
     session.completed_groups() * session.group_size()
 }
 
-/// 单字提示编码提取与前缀去皮（与编码提示保持同一口径）。
+/// 单字提示编码提取与手区前缀去皮（与编码提示保持同一口径）。
+///
+/// 前缀是否剥除取决于方案语义（`HandPrefixStyle`）：yoyo-pure 类 `_d` 是手区修饰符，
+/// 剥掉只留 `d`；空明码类 `_E` 里的 `_` 是需要打出的码元，必须原样保留。
 fn single_char_hint(
     c: char,
     set: BuiltinSet,
@@ -9299,13 +9933,21 @@ fn single_char_hint(
         let words = [c.to_string()];
         let hints = dict.build_code_hints(&words);
         if let Some(h) = hints.first().filter(|h| !h.is_oov && !h.code.is_empty()) {
+            let style = dict.hand_prefix_style();
             let hand = if dict.is_pure_chord() {
-                kongming_1hit_hint(c).map(|(_, h)| h).unwrap_or_else(|| hand_of_code(&h.code))
+                kongming_1hit_hint(c)
+                    .map(|(_, h)| h)
+                    .unwrap_or_else(|| hand_of_code_with(&h.code, style))
             } else {
-                hand_of_code(&h.code)
+                hand_of_code_with(&h.code, style)
             };
             let raw_code = h.code.strip_prefix('%').unwrap_or(&h.code);
-            let clean = raw_code.strip_prefix(['_', '+', '-']).unwrap_or(raw_code);
+            let clean = match style {
+                HandPrefixStyle::Modifier => {
+                    raw_code.strip_prefix(['_', '+', '-']).unwrap_or(raw_code)
+                }
+                HandPrefixStyle::Literal => raw_code,
+            };
             return Some((clean.to_string(), hand));
         }
     }
@@ -9816,7 +10458,8 @@ fn code_hint_overlay_line(
                     let prefix = match hand {
                         HintHand::Left => "_",
                         HintHand::Right => "+",
-                        _ => "-",
+                        HintHand::Other => "-",
+                        HintHand::TwoHand | HintHand::None => "",
                     };
                     CodeHint {
                         word: c.to_string(),
@@ -9887,7 +10530,14 @@ fn code_hint_overlay_line(
                 })
                 .collect()
         };
-        let cells = layout_code_hint_line(&words, &hints, &typed_mask);
+        let cells = layout_code_hint_line_with(
+            &words,
+            &hints,
+            &typed_mask,
+            scheme_dict
+                .map(|d| d.hand_prefix_style())
+                .unwrap_or_default(),
+        );
         return Some(code_hint_line_from_cells(&cells, theme));
     }
     // 内置单字赛文（常用单字前/中/后五百）：逐字以方案词典反查编码提示。
@@ -9906,7 +10556,8 @@ fn code_hint_overlay_line(
             .map(|(_, s)| *s == Some(CharStatus::Correct))
             .collect();
         let hints: Vec<CodeHint> = dict.build_code_hints(&words);
-        let cells = layout_code_hint_line(&words, &hints, &typed_mask);
+        let cells =
+            layout_code_hint_line_with(&words, &hints, &typed_mask, dict.hand_prefix_style());
         return Some(code_hint_line_from_cells(&cells, theme));
     }
     if !set.is_words() {
@@ -9936,7 +10587,7 @@ fn code_hint_overlay_line(
         typed_mask.push(all_correct);
     }
     let hints: Vec<CodeHint> = dict.build_code_hints(&words);
-    let cells = layout_code_hint_line(&words, &hints, &typed_mask);
+    let cells = layout_code_hint_line_with(&words, &hints, &typed_mask, dict.hand_prefix_style());
     Some(code_hint_line_from_cells(&cells, theme))
 }
 
@@ -9952,6 +10603,16 @@ fn code_hint_overlay_line(
 const MAX_PHRASE_WORDS: usize = 6;
 
 /// 同时合并 `word_ranges` 与 `typed_mask`，使提示行、正文行的索引与合并后的词单元锁步。
+///
+/// 用动态规划求**全文最优**的词单元切分：`dp[i]` 表示从第 i 个词到末尾的
+/// `(最少总击数, 空格数)`，每一步可把相邻的 `k`（≤ `MAX_PHRASE_WORDS`）个词合成一个提示单元。
+/// 择优按 `(总击数, 空格数)` 字典序：先保证总击数最少，再在此前提下尽量少按空格
+/// （整句方案下 4 码段可无空格续打，合并后一整串只保留必要的空格）。
+/// 只有拼接后确实命中词典（`get_primary_code` 非空）才值得试合并，因此复杂度仍是 O(n × MAX_PHRASE_WORDS)。
+/// 合并单元内部的最短切分由 `build_code_hints` 自身的子词 DP 保证，二者叠加即全文最优。
+///
+/// 复杂度说明：拼接长度上限为 `MAX_PHRASE_WORDS`，且逐词增量拼接、不每次从零 `concat`，
+/// 避免原先无界 + 全量重建的 O(n³)（长文下每帧重建词格耗时数百毫秒）。
 fn merge_phrase_hints(
     words: &[String],
     typed_mask: &[bool],
@@ -9959,37 +10620,54 @@ fn merge_phrase_hints(
     dict: &SchemeDict,
 ) -> (Vec<String>, Vec<bool>, Vec<(usize, usize)>) {
     let n = words.len();
+    if n == 0 {
+        return (Vec::new(), Vec::new(), Vec::new());
+    }
+
+    // dp[i] = (从第 i 个词到末尾的最少总击数, 空格数, 下一个单元的起点)
+    let mut dp: Vec<(u32, u32, usize)> = vec![(0, 0, n); n + 1];
+    for i in (0..n).rev() {
+        let mut best = (u32::MAX, u32::MAX, i + 1);
+        let mut candidate = String::new();
+        for k in 1..=MAX_PHRASE_WORDS.min(n - i) {
+            candidate.push_str(&words[i + k - 1]);
+            // 合并只在命中词典整词时可能更省；否则留给 k = 1 的逐词提示。
+            if k > 1 && dict.get_primary_code(&candidate).is_none() {
+                continue;
+            }
+            let hint = dict.build_code_hints(std::slice::from_ref(&candidate));
+            let (strokes, spaces) = match hint.first() {
+                // 标点等未登录单元本身不上屏，代价记 0 以保持 DP 可达。
+                Some(h) if h.is_oov => {
+                    if k > 1 {
+                        continue;
+                    }
+                    (0, 0)
+                }
+                Some(h) => (h.strokes, h.code.matches('\u{2423}').count() as u32),
+                None => continue,
+            };
+            let total = strokes + dp[i + k].0;
+            let total_spaces = spaces + dp[i + k].1;
+            // 同击数、同空格数时优先合并（更贴近整词提示），不影响全局最优。
+            if (total, total_spaces) <= (best.0, best.1) {
+                best = (total, total_spaces, i + k);
+            }
+        }
+        dp[i] = best;
+    }
+
     let mut out_w: Vec<String> = Vec::new();
     let mut out_m: Vec<bool> = Vec::new();
     let mut out_r: Vec<(usize, usize)> = Vec::new();
     let mut i = 0;
     while i < n {
-        // 取最长命中词典整词码的拼接（best_k 记录最大命中词数）。
-        // 复杂度修复：拼接长度上限为 MAX_PHRASE_WORDS，且逐词增量拼接、
-        // 不再每次从零 `concat` 重建——原先无界 + 全量重建是 O(n³)，
-        // 长文下每帧重建词格耗时数百毫秒，表现为「打开编码提示后对照区滚动不及时」。
-        let mut best_k = 1usize;
-        let mut merged = words[i].clone();
-        let mut merged_range = word_ranges[i];
-        // candidate 逐词增量拼接（避免每次从零重建），但仅在命中词典时才提交为 merged；
-        // 不命中时 merged 始终保持为最初的单词（与原实现语义一致）。
-        let mut candidate = words[i].clone();
-        let upper = MAX_PHRASE_WORDS.min(n - i);
-        for k in 2..=upper {
-            let wi = i + k - 1;
-            candidate.push_str(&words[wi]);
-            let cand_range = (word_ranges[i].0, word_ranges[wi].1);
-            if dict.get_primary_code(&candidate).is_some() {
-                merged = candidate.clone();
-                best_k = k;
-                merged_range = cand_range;
-            }
-        }
-        out_w.push(merged);
+        let next = dp[i].2.max(i + 1).min(n);
+        out_w.push(words[i..next].concat());
         // 合并单元的「已正确上屏」= 所有组成词均正确。
-        out_m.push((i..i + best_k).all(|j| typed_mask.get(j).copied().unwrap_or(false)));
-        out_r.push(merged_range);
-        i += best_k;
+        out_m.push((i..next).all(|j| typed_mask.get(j).copied().unwrap_or(false)));
+        out_r.push((word_ranges[i].0, word_ranges[next - 1].1));
+        i = next;
     }
     (out_w, out_m, out_r)
 }
@@ -10025,7 +10703,8 @@ fn builtin_cell_widths(
                     let prefix = match hand {
                         HintHand::Left => "_",
                         HintHand::Right => "+",
-                        _ => "-",
+                        HintHand::Other => "-",
+                        HintHand::TwoHand | HintHand::None => "",
                     };
                     CodeHint {
                         word: c.to_string(),
@@ -10092,7 +10771,13 @@ fn builtin_cell_widths(
                 })
                 .collect()
         };
-        return Some(hint_cell_widths(&words, &hints));
+        return Some(hint_cell_widths_with(
+            &words,
+            &hints,
+            scheme_dict
+                .map(|d| d.hand_prefix_style())
+                .unwrap_or_default(),
+        ));
     }
     // 内置单字赛文（常用单字前/中/后五百）：逐字以方案词典反查编码的宽度，
     // 与 `code_hint_overlay_line` 的提示行宽度保持一致，保证对照区/跟打区/提示行三者列对齐。
@@ -10106,7 +10791,11 @@ fn builtin_cell_widths(
         let page_statuses = &statuses[page_start..page_end];
         let words: Vec<String> = page_statuses.iter().map(|(c, _)| c.to_string()).collect();
         let hints: Vec<CodeHint> = dict.build_code_hints(&words);
-        return Some(hint_cell_widths(&words, &hints));
+        return Some(hint_cell_widths_with(
+            &words,
+            &hints,
+            dict.hand_prefix_style(),
+        ));
     }
     if !set.is_words() {
         return None;
@@ -10131,7 +10820,11 @@ fn builtin_cell_widths(
         .map(|&(ws, we)| statuses[ws..we].iter().map(|(c, _)| *c).collect())
         .collect();
     let hints = dict.build_code_hints(&words);
-    Some(hint_cell_widths(&words, &hints))
+    Some(hint_cell_widths_with(
+        &words,
+        &hints,
+        dict.hand_prefix_style(),
+    ))
 }
 
 #[cfg(test)]
@@ -10284,7 +10977,9 @@ fn code_hint_grid_text(
 
     let hints: Vec<CodeHint> = dict.build_code_hints(&words);
     // 词格列宽 = max(词宽, 提示码宽)：提示码宽于词时不截断提示，而由正文补空格让位。
-    let widths: Vec<usize> = hint_cell_widths(&words, &hints);
+    // 宽度与提示文本必须共用同一手区前缀语义（空明码 `_` 占一列、yoyo-pure 不占）。
+    let style = dict.hand_prefix_style();
+    let widths: Vec<usize> = hint_cell_widths_with(&words, &hints, style);
     let rows = pack_words_by_width(&widths, max_width);
     // 计算光标所在词格的网格正文行，供对照区滚动严格跟随打字位置。
     let cursor_grid_line = grid_cursor_line(&word_ranges, session.len(), &rows).unwrap_or(0);
@@ -10295,7 +10990,7 @@ fn code_hint_grid_text(
         let row_words: Vec<String> = row.iter().map(|&i| words[i].clone()).collect();
         let row_hints: Vec<CodeHint> = row.iter().map(|&i| hints[i].clone()).collect();
         let row_typed: Vec<bool> = row.iter().map(|&i| typed_mask[i]).collect();
-        let cells = layout_code_hint_line(&row_words, &row_hints, &row_typed);
+        let cells = layout_code_hint_line_with(&row_words, &row_hints, &row_typed, style);
         text_lines.push_line(code_hint_line_from_cells(&cells, theme));
 
         // 正文行：本行词单元按跟打状态着色（每词间单空格分隔，与提示行锁步）。
@@ -11071,6 +11766,43 @@ mod tests {
         app.save_builtin_progress(app.session.total_groups());
         let done = app.builtin_progress_for(set).unwrap();
         assert_eq!(done.completed_groups as usize, app.session.total_groups());
+    }
+
+    #[test]
+    fn group_size_setting_overrides_saved_builtin_progress() {
+        let set = BUILTIN_SETS[0]; // 常用单字前五百
+        let mut app = test_app(load_builtin_text(set));
+
+        // 以 20 字/组完成前两组（共 40 字），落盘存档。
+        app.settings.group_size = 20;
+        app.start_builtin_set(set, 0);
+        let chars: Vec<char> = app.text.content.chars().collect();
+        let g1: String = chars[..20].iter().collect();
+        let g2: String = chars[20..40].iter().collect();
+        app.session.type_text(&g1);
+        app.session.type_text(&g2);
+        app.persist_builtin_progress_if_changed();
+        assert_eq!(app.builtin_progress_for(set).unwrap().group_size, 20);
+
+        // 用户在设置中改成 10 字/组后重新载入：续打弹窗的组数应按新分组换算。
+        app.settings.group_size = 10;
+        app.builtin_selection = 0;
+        app.load_selected_builtin();
+        let (_, saved, total) = app.resume_prompt.expect("有存档时应弹续打选择");
+        assert_eq!(saved, 4, "20 字/组的 2 组应换算为 10 字/组的 4 组");
+        assert_eq!(total, app.builtin_total_groups(set, 10));
+
+        // 选「重开」：必须使用设置里的 10 字/组，而不是存档里的 20。
+        app.resume_prompt = None;
+        app.start_builtin_set(set, 0);
+        assert_eq!(app.settings.group_size, 10);
+        assert_eq!(app.session.group_size(), 10);
+
+        // 选「继续」：同样使用 10 字/组，并续到同一字符位置（40 字）。
+        app.start_builtin_set(set, saved);
+        assert_eq!(app.session.group_size(), 10);
+        assert_eq!(app.session.completed_groups(), 4);
+        assert_eq!(app.session.len(), 40);
     }
 
     #[test]
@@ -12582,18 +13314,18 @@ mod tests {
         let line = code_hint_overlay_line(&session, &text, None, theme)
             .expect("空明一击字即便无词典也应生成物理指法提示行");
 
-        // 首字是「中」，在 KONGMING_1HIT_CHORDS 中物理键为 "f"，左手（HintHand::Left）
-        // 左手颜色应为 theme.hand_left
-        let left_color = color(theme.hand_left);
+        // 首字是「的」，在最新一击字表中物理键为 "d"，右手（HintHand::Right）
+        // 右手颜色应为 theme.hand_right
+        let right_color = color(theme.hand_right);
         let first_hint_span = line
             .spans
             .iter()
-            .find(|s| s.content.contains('f'))
-            .expect("首格应含 f 提示");
-        assert_eq!(first_hint_span.style.fg, Some(left_color));
+            .find(|s| s.content.trim() == "d")
+            .expect("首格应含 d 提示");
+        assert_eq!(first_hint_span.style.fg, Some(right_color));
 
         // 正确输入首字后，首格提示应隐藏（留空占位）
-        session.type_text("中");
+        session.type_text("的");
         let line_after_type = code_hint_overlay_line(&session, &text, None, theme)
             .expect("输入后仍应生成提示行");
         // 首格提示应为空格字符串
@@ -12610,8 +13342,8 @@ mod tests {
         let first_span_revived = line_after_backspace
             .spans
             .iter()
-            .find(|s| s.content.contains('f'));
-        assert!(first_span_revived.is_some(), "退格后首格 f 提示应重现");
+            .find(|s| s.content.trim() == "d");
+        assert!(first_span_revived.is_some(), "退格后首格 d 提示应重现");
     }
 
     #[test]
@@ -12664,12 +13396,12 @@ mod tests {
         let line = code_hint_overlay_line(&session, &text, None, theme)
             .expect("空明一击词即便无词典也应生成一击编码提示行");
 
-        // 首词是「可以」，在空明码一击词中编码为 "k'"
+        // 首词仍是「可以」，最新方案中一击码为 "ky"
         let first_hint_span = line
             .spans
             .iter()
-            .find(|s| s.content.contains("k'"))
-            .expect("首格应含 k' 提示");
+            .find(|s| s.content.contains("ky"))
+            .expect("首格应含 ky 提示");
         assert_eq!(first_hint_span.style.fg, Some(color(theme.hand_two)));
 
         // 2. 即便配置了其他方案（如万象虎 tiger），也必须显示空明码自身一击词提示，而非被其他方案覆盖
@@ -12677,7 +13409,7 @@ mod tests {
         let line_with_foreign = code_hint_overlay_line(&session, &text, Some(&foreign_dict), theme)
             .expect("配置外部方案时仍应生成提示行");
         assert!(
-            line_with_foreign.spans.iter().any(|s| s.content.contains("k'")),
+            line_with_foreign.spans.iter().any(|s| s.content.contains("ky")),
             "空明码一击词不应被外部方案词典覆盖"
         );
         assert!(
@@ -12711,12 +13443,13 @@ mod tests {
         let schema_content = "schema:\n  name: 空明码测试\n  schema_id: km\ntranslator:\n  dictionary: km\nchord_composer:\n  algebra:\n    - xform|a|b|\n    - xform|^\\S{3,}$||\n";
         fs::write(&schema, schema_content).unwrap();
         // 词库配置：
-        // 1. 好人 -> HRHR (2击)，但「好」(左手 h) 与「人」(右手 r) 均为一击字，转为 "h r"，左右手分色！
-        // 2. 测试 / 侧视 -> 重码 oc (1并击)，侧视 为 2 选 -> "oc2"
-        // 3. 中 -> 词库中为 "f="，应转为 "f"，单字一击字分色为左手粉色！
+        // 1. 好人 -> HRHR (2击)：完全由一击字组成，但整词码击数与逐字持平，按键最少原则下优先整词码 HRHR；
+        // 2. 中国 -> Uz (1并击一击词)：1 击词绝对优先，展示双手并击青色；
+        // 3. 测试 / 侧视 -> 重码 oc (1并击)，侧视 为 2 选 -> "oc2"
+        // 4. 中 -> 词库中为 "f="，应转为 "f"，单字一击字分色为左手粉色！
         fs::write(
             &dict,
-            "好人\tHRHR\t500\n测试\toc\t1000\n侧视\toc\t900\n中\tf=\t500\n",
+            "好人\tHRHR\t500\n中国\tUz\t1000\n测试\toc\t1000\n侧视\toc\t900\n中\tf=\t500\n",
         )
         .unwrap();
 
@@ -12724,27 +13457,36 @@ mod tests {
         assert!(loaded.is_pure_chord());
 
         // 离线赛文测试双行词格渲染
-        let text = file_text("好人 侧视 中");
+        let text = file_text("好人 中国 侧视 中");
         let session = Session::new(&text.content);
         let (text_lines, _) = code_hint_grid_text(&session, &text, Some(&loaded), theme, false, 80)
             .expect("应生成双行词格");
 
         // 提示行在第 0 行
         let hint_line = &text_lines.lines[0];
-        // 验证「好人」词格中包含粉色的 h 与黄色的 r
-        let h_span = hint_line
+        // 验证「好人」按按键最少原则优先展示整词码 HRHR（双并击、双手青色）
+        let hrhr_span = hint_line
             .spans
             .iter()
-            .find(|s| s.content == "h")
-            .expect("提示行应包含 h span");
-        assert_eq!(h_span.style.fg, Some(color(theme.hand_left)), "好(h)应为左手粉色");
+            .find(|s| s.content == "HRHR")
+            .expect("提示行应包含整词码 HRHR span");
+        assert_eq!(
+            hrhr_span.style.fg,
+            Some(color(theme.hand_two)),
+            "好人整词码应为双手并击青色"
+        );
 
-        let r_span = hint_line
+        // 验证 1 击词「中国」展示整词码 Uz，双手并击为青色
+        let uz_span = hint_line
             .spans
             .iter()
-            .find(|s| s.content == "r")
-            .expect("提示行应包含 r span");
-        assert_eq!(r_span.style.fg, Some(color(theme.hand_right)), "人(r)应为右手黄色");
+            .find(|s| s.content == "Uz")
+            .expect("提示行应包含整词码 Uz span");
+        assert_eq!(
+            uz_span.style.fg,
+            Some(color(theme.hand_two)),
+            "一击词中国整词码应为双手并击青色"
+        );
 
         // 验证「侧视」包含 2 选选重提示 oc2
         let oc2_span = hint_line
@@ -15769,6 +16511,60 @@ mod tests {
     }
 
     #[test]
+    fn session_history_date_bounds_use_utc_days() {
+        assert_eq!(SessionFilter::All.bounds(), (None, None));
+        let (start, end) = SessionFilter::Today.bounds();
+        let today = utc_ymd_from_days(utc_days_now());
+        assert_eq!(start.as_deref(), Some(today.as_str()));
+        assert!(end.as_deref().is_some_and(|e| e > today.as_str()));
+    }
+
+    #[test]
+    fn session_history_navigation_respects_bounds_and_detail_scroll() {
+        let mut s = StatsViewState::new(HeatmapLayout::Staggered);
+        s.tab = StatsTab::SessionHistory;
+        let count = |_: &StatsViewState| 3usize;
+        let press = |key: KeyCode, s: &mut StatsViewState| {
+            assert!(handle_session_history_input_with(
+                s,
+                KeyEvent::new(key, KeyModifiers::NONE),
+                count
+            ));
+        };
+
+        press(KeyCode::Char('j'), &mut s);
+        assert_eq!(s.session_selected, 1);
+        press(KeyCode::PageDown, &mut s);
+        assert_eq!(s.session_selected, 2, "翻页应钳制到最后一条");
+        press(KeyCode::Char('j'), &mut s);
+        assert_eq!(s.session_selected, 2, "末条再向下不应越界");
+
+        press(KeyCode::Char('f'), &mut s);
+        assert_eq!(s.session_filter, SessionFilter::Today);
+        assert_eq!(s.session_selected, 0);
+        press(KeyCode::Char('s'), &mut s);
+        assert_eq!(s.session_sort_by, SessionSortBy::DateAsc);
+
+        press(KeyCode::Enter, &mut s);
+        assert_eq!(s.viewing_session, Some(0));
+        press(KeyCode::Char('j'), &mut s);
+        assert_eq!(s.detail_scroll, 1);
+        press(KeyCode::PageDown, &mut s);
+        assert_eq!(s.detail_scroll, 11);
+        press(KeyCode::Esc, &mut s);
+        assert_eq!(s.viewing_session, None);
+        assert_eq!(s.detail_scroll, 0);
+    }
+
+    #[test]
+    fn session_title_truncation_is_char_safe() {
+        let title = "赛文标题很长很长很长很长";
+        let truncated = truncate_display_width(title, 8);
+        assert_eq!(truncated.chars().count(), 4);
+        assert_eq!(UnicodeWidthStr::width(truncated.as_str()), 8);
+    }
+
+    #[test]
     fn render_stats_view_tabs_and_overview() {
         let mut app = test_app(file_text("测试赛文"));
         app.state = AppState::Stats(StatsViewState {
@@ -17310,6 +18106,36 @@ mod tests {
         assert!(found_s, "功能栏应高亮显示 s 数据统计: {:?}", all_lines);
         assert!(found_o, "功能栏应高亮显示 o 设置: {:?}", all_lines);
         assert!(found_u, "功能栏应高亮显示 u 登录: {:?}", all_lines);
+    }
+
+    #[test]
+    fn login_shortcuts_do_not_shadow_browse_views() {
+        let g = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE);
+        let u = KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE);
+
+        // 浏览类视图：g/u 必须留给视图自身（首/末、分组大小、翻页）。
+        for state in [
+            AppState::Browsing,
+            AppState::BrowsingBuiltin,
+            AppState::ChapterCatalog,
+        ] {
+            let mut app = test_app(file_text("文本"));
+            app.state = state;
+            assert!(!app.handle_global_login_shortcut(g));
+            assert!(!app.handle_global_login_shortcut(u));
+            assert!(app.login_form.is_none(), "浏览类视图不应被登录快捷键截胡");
+        }
+
+        // 就绪态：g 仍打开虎码杯登录。
+        let mut app = test_app(file_text("文本"));
+        assert!(app.handle_global_login_shortcut(g));
+        assert!(app.login_form.is_some());
+
+        // 成绩视图：g 用于跳到错字时间线首条，不再打开登录。
+        let mut app = test_app(file_text("文本"));
+        app.finish_typing();
+        assert!(handle_finished_key(&mut app, g));
+        assert!(app.login_form.is_none());
     }
 
     #[test]
